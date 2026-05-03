@@ -1,0 +1,28 @@
+# Build / packaging
+build/
+*.egg-info/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Local test / coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editable-install metadata
+*.dist-info/
+
+# We DO track dist/ — the canonical wheel + sidecar are part of the release record.

@@ -1,0 +1,21 @@
+# Don't ship the downloaded binary in the published tarball — install.js
+# pulls it at install-time per-platform.
+bin/llm-speed
+bin/llm-speed.exe
+*.zip
+
+# Dev junk
+node_modules/
+.npm/
+*.log
+.DS_Store
+.idea/
+.vscode/
+test/
+__tests__/
+*.test.js
+
+# CI / source control
+.github/
+.git/
+.gitignore

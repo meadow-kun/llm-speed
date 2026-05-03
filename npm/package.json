@@ -1,0 +1,49 @@
+{
+  "name": "llm-speed",
+  "version": "0.0.1",
+  "description": "Benchmark any LLM on any hardware. Thin npm wrapper around the llm-speed binary.",
+  "license": "Apache-2.0",
+  "author": "meadow-kun",
+  "homepage": "https://llm-speed.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meadow-kun/llm-speed.git"
+  },
+  "bugs": {
+    "url": "https://github.com/meadow-kun/llm-speed/issues"
+  },
+  "keywords": [
+    "llm",
+    "benchmark",
+    "inference",
+    "tokens-per-second",
+    "ollama",
+    "llama.cpp",
+    "vllm",
+    "mlx"
+  ],
+  "bin": {
+    "llm-speed": "./bin/llm-speed.js"
+  },
+  "scripts": {
+    "postinstall": "node ./install.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin/llm-speed.js",
+    "install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}
