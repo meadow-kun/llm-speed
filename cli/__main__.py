@@ -148,6 +148,18 @@ def _build_parser() -> argparse.ArgumentParser:
     # about --------------------------------------------------------------
     sub.add_parser("about", help="show what llm-speed is + links")
 
+    # mcp ---------------------------------------------------------------
+    # Boots a Model Context Protocol stdio server so AI assistants
+    # (Claude Desktop, Cline, Cursor, etc.) can query the leaderboard
+    # inline. Requires the optional [mcp] extra:
+    #   pipx install 'llm-speed[mcp]'
+    # or on an existing install:
+    #   pipx inject llm-speed mcp cachetools
+    sub.add_parser(
+        "mcp",
+        help="boot the Model Context Protocol server (stdio transport)",
+    )
+
     return parser
 
 
@@ -241,9 +253,32 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
         return cmd_verify(args)
     if cmd == "about":
         return _cmd_about(args)
+    if cmd == "mcp":
+        return _cmd_mcp(args)
 
     parser.error(f"unknown command: {cmd}")
     return 2
+
+
+def _cmd_mcp(args) -> int:
+    """Boot the MCP server over stdio. Requires the [mcp] extra."""
+    try:
+        from .mcp.server import mcp as mcp_app
+    except ImportError as exc:
+        # The optional `mcp` SDK or `cachetools` aren't installed.
+        # Tell the user the exact install command instead of a stack trace.
+        print(
+            "error: the MCP server requires the optional [mcp] extra.\n"
+            "Install with:\n"
+            "  pipx install 'llm-speed[mcp]'\n"
+            "or, on an existing install:\n"
+            "  pipx inject llm-speed mcp cachetools\n"
+            f"\n(underlying import failure: {exc})",
+            file=sys.stderr,
+        )
+        return 1
+    mcp_app.run()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
