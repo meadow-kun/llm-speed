@@ -73,6 +73,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
+# CLI-only. Defence-in-depth — keeps any future top-level non-CLI package
+# from accidentally being shipped on every user's machine.
 include = ["cli*"]
 
 [tool.pyright]

@@ -104,6 +104,35 @@ def _no_match(reason: str) -> dict[str, Any]:
     return {"matches": [], "citation": [], "note": reason}
 
 
+# Per-tool input clamps. The longest legitimate Hugging Face model name
+# observed in the wild is ~120 chars; 1024 is generous. The `constraints`
+# dict on `recommend` accepts seven supported keys, so 32 is well past
+# legitimate usage. Both clamps exist purely to bound the cost of a
+# malicious LLM client spamming the server with megabyte-sized inputs:
+# without them, `_match_model("A" * 10_000_000)` would burn ~250 ms
+# per call slugifying the input + lowercasing it for substring search,
+# at ~30 MB peak resident per call. Local DoS only — no remote
+# escalation — but easy to harden.
+_MAX_TOOL_STR = 1024
+_MAX_CONSTRAINT_KEYS = 32
+
+
+def _clamp_str(s: Any) -> str | None:
+    """Coerce to a bounded string. Non-strings → None; over-long → truncated."""
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        return None
+    return s[:_MAX_TOOL_STR]
+
+
+def _clamp_required_str(s: Any) -> str:
+    """Same as `_clamp_str` but treats non-strings + None as empty."""
+    if not isinstance(s, str):
+        return ""
+    return s[:_MAX_TOOL_STR]
+
+
 # --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
@@ -116,6 +145,8 @@ def lookup_speed(model: str, hardware: str | None = None) -> dict[str, Any]:
     If `hardware` is None, returns every hardware result for the model.
     Each row carries a /r/<id> citation, /m/<slug> and /hw/<slug> links.
     """
+    model = _clamp_required_str(model)
+    hardware = _clamp_str(hardware)
     cells = _all_cells()
     cells = _match_model(model, cells)
     if not cells:
@@ -149,6 +180,8 @@ def compare(a: str, b: str) -> dict[str, Any]:
     (the word "on" splits the side). Returns who is faster, the delta in
     tok/s, the run backing each side, and the /vs/<slug> deeplink.
     """
+    a = _clamp_required_str(a)
+    b = _clamp_required_str(b)
     cells = _all_cells()
     side_a = _resolve_side(a, cells)
     side_b = _resolve_side(b, cells)
@@ -226,9 +259,13 @@ def recommend(constraints: dict[str, Any]) -> dict[str, Any]:
     Note: vram_gb_max / ram_gb_max are best-effort parses out of the
     accelerator_summary string. Anything we can't parse is left in.
     """
+    if not isinstance(constraints, dict) or len(constraints) > _MAX_CONSTRAINT_KEYS:
+        return _no_match(
+            f"constraints must be a dict with ≤{_MAX_CONSTRAINT_KEYS} keys"
+        )
     cells = _all_cells()
-    locality = (constraints.get("locality") or "any").lower()
-    backend = constraints.get("backend")
+    locality = _clamp_required_str(constraints.get("locality") or "any").lower()
+    backend = _clamp_str(constraints.get("backend"))
     decode_min = constraints.get("decode_tps_min")
     size_min = constraints.get("model_size_min")
     size_max = constraints.get("model_size_max")
@@ -298,6 +335,7 @@ def _parse_total_ram(label: str) -> float | None:
 @mcp.tool()
 def top_models(hardware: str, n: int = 10) -> dict[str, Any]:
     """Fastest models on a given hardware, ranked by decode_tps."""
+    hardware = _clamp_required_str(hardware)
     n = max(1, min(int(n), 25))
     cells = _match_hardware(hardware, _all_cells())
     if not cells:

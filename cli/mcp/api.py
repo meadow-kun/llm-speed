@@ -19,8 +19,10 @@ from typing import Any, cast
 import httpx
 from cachetools import TTLCache
 
-API_BASE = os.environ.get("LLM_SPEED_API_BASE", "https://api.llm-speed.com")
-SITE_BASE = os.environ.get("LLM_SPEED_SITE_BASE", "https://llm-speed.com")
+DEFAULT_API_BASE = "https://api.llm-speed.com"
+DEFAULT_SITE_BASE = "https://llm-speed.com"
+API_BASE = os.environ.get("LLM_SPEED_API_BASE", DEFAULT_API_BASE)
+SITE_BASE = os.environ.get("LLM_SPEED_SITE_BASE", DEFAULT_SITE_BASE)
 USER_AGENT = "llm-speed-mcp/0.1 (+https://llm-speed.com)"
 
 # 5-minute TTL — matches the spec. Single slot for the listing; a small
