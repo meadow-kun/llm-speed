@@ -137,12 +137,47 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def _is_safe_https_url(url: str) -> bool:
+    """Reject anything that isn't a plain http(s) URL before passing it
+    to a child process.
+
+    The fallback ``cmd /c start "" <url>`` form on Windows interprets ``&``,
+    ``^``, ``"`` in the URL argument — a malicious URL like
+    ``"https://x.com/x\\"&calc&\\""`` could fork a `calc.exe` child.
+    The realistic prerequisite is "the API server returned a hostile
+    string" (api.llm-speed.com is hardened, but defence in depth costs
+    nothing). Restrict to https-only with no embedded shell metachars.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except (ValueError, AttributeError):
+        return False
+    if parsed.scheme not in {"https", "http"}:
+        return False
+    if not parsed.netloc:
+        return False
+    # Refuse any character that's a shell metachar on cmd.exe or POSIX shells.
+    # Real URLs don't legitimately contain these — they'd be percent-encoded.
+    for ch in url:
+        if ch in '"\'`$\\&|;<>(){}[]*?!\n\r\t':
+            return False
+    return True
+
+
 def open_in_browser(url: str) -> bool:
     """Open ``url`` in the user's default browser via stdlib ``webbrowser``.
 
     Falls back to platform `open` / `xdg-open` / `start` if webbrowser is
     unable to dispatch (rare but possible on minimal Linux containers).
+
+    Refuses any URL that isn't a clean http(s) scheme with no shell
+    metacharacters — see ``_is_safe_https_url``. Returns False on reject.
     """
+    if not _is_safe_https_url(url):
+        log.debug("refusing to open unsafe URL: %r", url[:200])
+        return False
     try:
         import webbrowser
 

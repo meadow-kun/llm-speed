@@ -264,6 +264,7 @@ def _cmd_mcp(args) -> int:
     """Boot the MCP server over stdio. Requires the [mcp] extra."""
     try:
         from .mcp.server import mcp as mcp_app
+        from .mcp import api as mcp_api
     except ImportError as exc:
         # The optional `mcp` SDK or `cachetools` aren't installed.
         # Tell the user the exact install command instead of a stack trace.
@@ -277,6 +278,24 @@ def _cmd_mcp(args) -> int:
             file=sys.stderr,
         )
         return 1
+    # Warn (not block) when LLM_SPEED_API_BASE / LLM_SPEED_SITE_BASE is
+    # set to anything other than the canonical hosts. Mirrors the
+    # symmetric warning in cli.upload.warn_if_insecure_api_base. No
+    # bearer token leaks here (the MCP server is read-only / no auth),
+    # but a hostile env var would feed poisoned rows to the user's LLM
+    # client — which compounds with the I-1 sanitisation defence.
+    for var, current, default in (
+        ("LLM_SPEED_API_BASE", mcp_api.API_BASE, mcp_api.DEFAULT_API_BASE),
+        ("LLM_SPEED_SITE_BASE", mcp_api.SITE_BASE, mcp_api.DEFAULT_SITE_BASE),
+    ):
+        if current != default:
+            print(
+                f"warning: MCP server is using non-default {var}='{current}' "
+                f"(default: '{default}'). If you did not set this yourself, "
+                "abort and inspect your environment for a malicious override "
+                "— the LLM client gets fed whatever this server returns.",
+                file=sys.stderr,
+            )
     mcp_app.run()
     return 0
 
