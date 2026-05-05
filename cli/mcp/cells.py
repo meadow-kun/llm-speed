@@ -21,6 +21,42 @@ from .slugs import (
     clean_model_display_name,
 )
 
+# Strip C0 control bytes (except \t and \n), bidi-format characters, and
+# zero-width characters before any string flows into an LLM client. Mirrors
+# `CTRL_RE` / `PHISH_CAP` in `web/lib/seo.ts` + `web/lib/distribution.ts`.
+# Today the worker validates inputs at write time, but our display strings
+# come from the API verbatim — if a future API regression lets a hostile
+# string land in `top_model_name` / `accelerator_summary`, this strips the
+# prompt-injection payload before the LLM client ever sees it.
+_UNSAFE_DISPLAY_RE = re.compile(
+    "["
+    "\x00-\x08"  # C0 controls (kept: \t \n)
+    "\x0b\x0c"
+    "\x0e-\x1f"
+    "‪-‮"  # bidi formatting
+    "⁦-⁩"  # bidi isolates
+    "​-‍"  # zero-width space / ZWNJ / ZWJ
+    "﻿"        # BOM / zero-width nbsp
+    "]"
+)
+_DISPLAY_MAX_LEN = 256
+
+
+def _safe_display(s: str | None, *, max_len: int = _DISPLAY_MAX_LEN) -> str:
+    """Sanitize a free-text string before returning it to an LLM client.
+
+    LLM clients have no raw-string-vs-attribute distinction, so any control
+    or bidi character we pass through becomes a possible prompt-injection
+    surface. Strip them; clamp length so a hostile 1MB string can't
+    monopolise the context window.
+    """
+    if not s:
+        return ""
+    cleaned = _UNSAFE_DISPLAY_RE.sub("", s)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 1] + "…"
+    return cleaned
+
 # Keys defined in the API response.
 _DECODE = "top_decode_tps"
 
@@ -105,19 +141,26 @@ def best_cells(summaries: Iterable[dict[str, Any]]) -> list[Cell]:
 
 
 def cell_to_dict(c: Cell) -> dict[str, Any]:
-    """Serialize a Cell for an MCP tool response."""
+    """Serialize a Cell for an MCP tool response.
+
+    Free-text fields (`model`, `model_canonical`, `hardware`, `backend`,
+    `workload`) come from the API verbatim. They're sanitised through
+    `_safe_display` before reaching the LLM client so that a future
+    worker input-validation bypass cannot use this surface as a
+    prompt-injection vector.
+    """
     return {
-        "model": c.model_display,
-        "model_canonical": c.model_name,
-        "model_slug": c.model_slug,
-        "hardware": c.hardware_label,
-        "hardware_slug": c.hardware_slug,
-        "backend": c.backend,
+        "model": _safe_display(c.model_display),
+        "model_canonical": _safe_display(c.model_name),
+        "model_slug": _safe_display(c.model_slug, max_len=128),
+        "hardware": _safe_display(c.hardware_label),
+        "hardware_slug": _safe_display(c.hardware_slug, max_len=128),
+        "backend": _safe_display(c.backend, max_len=64),
         "decode_tps": round(c.decode_tps, 2),
-        "workload": c.workload,
-        "run_id": c.run_id,
-        "received_at": c.received_at,
-        "locality": c.locality,
+        "workload": _safe_display(c.workload, max_len=64),
+        "run_id": _safe_display(c.run_id, max_len=64),
+        "received_at": _safe_display(c.received_at, max_len=64),
+        "locality": _safe_display(c.locality, max_len=16),
         "model_size_b": _model_size_b(c.model_name),
     }
 

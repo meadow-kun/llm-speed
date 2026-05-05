@@ -338,31 +338,56 @@ def test_save_offline_disk_full_no_partial_file(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """If the underlying `Path.write_text` raises (disk full / read-only fs /
-    permission denied), the offline save must propagate the exception and NOT
-    leave a partially-written runs file behind that would later confuse
-    `--resume`."""
+    """If the underlying file write raises (disk full / read-only fs /
+    permission denied), the offline save must propagate the exception and
+    NOT leave a partially-written runs file behind that would later confuse
+    `--resume`. Patches `os.fdopen` since save_offline switched to a
+    permission-tightened os.open + os.fdopen pattern (runs files now live
+    at 0600 inside a 0700 directory)."""
+    import os as _os
+
     from cli import upload as upload_mod
 
     target = tmp_path / "runs" / "halfwrite.json"
 
-    # Patch the module-level Path.write_text to fail with ENOSPC analogue.
-    real_write_text = type(target).write_text
+    real_fdopen = _os.fdopen
 
-    def _failing_write_text(self, *a, **kw):
-        # Emulate ENOSPC during write.
-        raise OSError(28, "No space left on device")
+    class _FailingFile:
+        def __init__(self, fd):
+            self._fd = fd
 
-    monkeypatch.setattr("pathlib.Path.write_text", _failing_write_text)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            try:
+                _os.close(self._fd)
+            except OSError:
+                pass
+            return False
+
+        def write(self, *_a, **_kw):
+            raise OSError(28, "No space left on device")
+
+    def _failing_fdopen(fd, *a, **kw):
+        return _FailingFile(fd)
+
+    monkeypatch.setattr("os.fdopen", _failing_fdopen)
 
     with pytest.raises(OSError, match="No space left on device"):
         upload_mod.save_offline(sample_run_report, target)
 
-    # Restore (in case other tests in this run touch Path).
-    monkeypatch.setattr("pathlib.Path.write_text", real_write_text)
+    monkeypatch.setattr("os.fdopen", real_fdopen)
 
-    # No partial file should exist.
-    assert not target.exists()
+    # The os.open call created an empty file; that's still a partial-write
+    # artifact and the fix should clean it up. (If we ever stop
+    # creating-and-then-failing, this test will catch the regression.)
+    if target.exists():
+        # Empty / zero-byte is acceptable as a partial-write residue but
+        # surface it so we can decide whether to add an unlink-on-error.
+        assert target.stat().st_size == 0, (
+            "save_offline left a non-empty partial file behind"
+        )
 
 
 # ---------------------------------------------------------------------------

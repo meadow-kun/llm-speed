@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -88,15 +89,50 @@ def save_offline(
     strict_anon: bool = False,
     include_raw_timings: bool = True,
 ) -> Path:
-    """Sign with `include_raw_timings=True` (local artifact keeps full data) and write."""
+    """Sign with `include_raw_timings=True` (local artifact keeps full data) and write.
+
+    Run artifacts are written 0600 inside a 0700 parent directory. The local
+    file is a superset of the upload payload (it keeps raw timings the
+    upload would strip), so on a multi-user host a default-umask 0644 leaks
+    benchmark internals to every other user — including the public key
+    that ties all of this user's runs together. Tighten the modes
+    explicitly so the privacy contract holds at the filesystem boundary.
+    """
     target = path or default_offline_path(report)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Catch the case where the directory existed pre-fix at 0755.
+    try:
+        os.chmod(target.parent, 0o700)
+    except OSError:
+        # FUSE / network mounts may refuse chmod; best-effort.
+        log.debug("could not chmod %s to 0o700", target.parent)
     token = sign_report_jws(
         report,
         strict_anon=strict_anon,
         include_raw_timings=include_raw_timings,
     )
-    target.write_text(json.dumps({"jws": token}, indent=2), encoding="utf-8")
+    # Write at 0600 atomically: open with restrictive mode, then write.
+    fd = os.open(
+        str(target),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"jws": token}, indent=2))
+    except Exception:
+        # `os.fdopen` takes ownership of fd on success; on failure we close.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    # Belt-and-braces: also chmod after write in case the file existed
+    # pre-fix at 0644 (os.O_CREAT respects existing mode unless O_EXCL).
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        log.debug("could not chmod %s to 0o600", target)
     log.debug("saved offline run to %s", target)
     return target
 
