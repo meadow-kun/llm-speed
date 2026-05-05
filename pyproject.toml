@@ -56,7 +56,7 @@ exllamav2 = ["exllamav2>=0.2"]
 # `llm-speed mcp` boots a Model Context Protocol stdio server so AI
 # assistants (Claude Desktop, Cline, Cursor, etc.) can query the
 # leaderboard inline. Optional because most CLI users won't run it.
-mcp = ["mcp>=1.0", "cachetools>=5"]
+mcp = ["mcp>=1.10", "cachetools>=5"]
 test = ["pytest>=8", "pytest-cov>=5"]
 
 [project.urls]
