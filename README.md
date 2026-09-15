@@ -1,18 +1,55 @@
 # llm-speed
 
-> Benchmark any LLM on any hardware. CLI for the [llm-speed.com](https://llm-speed.com) flywheel.
+> Measure LLM inference speed and explore the results at [llm-speed.com](https://llm-speed.com/).
 
 A reproducible benchmark client for local + hosted LLM inference. One install, one command, one signed result.
 
+## Install
+
+Install the published [PyPI package](https://pypi.org/project/llm-speed/) with
+Python 3.10 or later and pipx:
+
 ```sh
-pipx install https://llm-speed.com/dist/llm_speed-0.0.1-py3-none-any.whl && llm-speed bench
+pipx install llm-speed
+llm-speed bench
 ```
 
-Or once published to PyPI:
+## Explore the results
 
-```sh
-pipx install llm-speed && llm-speed bench
-```
+- [Benchmark leaderboard](https://llm-speed.com/): find model and hardware results,
+  then open a source run to inspect its workloads and configuration.
+- [Datasets and downloads](https://llm-speed.com/data): focused studies in CSV and
+  JSON, plus a separately dated July 8, 2026 bulk snapshot of run summaries.
+- [VRAM and Mac memory calculator](https://llm-speed.com/tools/vram-fit): estimate
+  model memory requirements, including your installed Mac memory. Estimates are
+  separate from measured benchmark results.
+- [Methodology](https://llm-speed.com/methodology): understand workloads, signing
+  and the limits of comparisons between different setups.
+
+## Original RTX 5090 studies
+
+**[Qwen3.8-27B versus Gemma 4 12B](https://llm-speed.com/blog/qwen3-8-27b-vs-gemma-4-12b-rtx-5090).**
+Measured September 5, 2026: 12 workload rows from six source runs, with three
+repetitions per model. Compare latency and generation speed with the exact model
+files and runtime settings. The models use different quantizations; these speed
+results do not establish a coding-quality winner.
+[CSV](https://llm-speed.com/data/qwen-gemma-5090-chat-2026-09-05.csv) ·
+[JSON and configuration](https://llm-speed.com/data/qwen-gemma-5090-chat-2026-09-05.json).
+
+**[Gemma 4: how input length changes the wait for the first token](https://llm-speed.com/m/gemma-4-12b-it-qat#long-context).**
+Measured September 6, 2026: three repetitions at each of 23,872, 47,652 and 95,212
+actual input tokens, using Q4_0 on one RTX 5090. The study separates first-token
+latency from generation speed. It does not establish maximum supported context
+or answer quality.
+[CSV](https://llm-speed.com/data/gemma-4-5090-context-2026-09-06.csv) ·
+[JSON and configuration](https://llm-speed.com/data/gemma-4-5090-context-2026-09-06.json) ·
+[Reusable chart](https://llm-speed.com/data/gemma-4-5090-context-2026-09-06-figure.png) ·
+[Citation and limitations](https://llm-speed.com/data/gemma-4-5090-context-2026-09-06-citation.txt).
+
+Data and the chart are available under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+When reusing them, credit llm-speed, link to the specific study and license, and
+identify any changes. Retain the measurement date and configuration; the July
+bulk archive does not contain these September studies.
 
 ## What it does
 
