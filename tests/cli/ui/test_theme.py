@@ -24,9 +24,6 @@ def test_no_emoji_in_brand_strings():
 def test_brand_url_constants_match_meadow_kun_identity():
     assert theme.SITE_URL == "https://llm-speed.com"
     assert theme.REPO_URL == "https://github.com/meadow-kun/llm-speed"
-    # Personal identity, not "maintainer" or work orgs.
-    assert "maintainer" not in theme.REPO_URL.lower()
-    assert "meadow-kun" not in theme.REPO_URL.lower()
 
 
 def test_kbd_renders_a_key_label_pair():

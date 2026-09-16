@@ -144,7 +144,7 @@ brackets.
 
 ## Identity
 
-Every URL emitted by the CLI uses the `meadow-kun` GitHub identity per the
-2026-04-28 scrub. There's a unit test (`tests/cli/ui/test_theme.py`) that
-asserts no `maintainer` / `meadow-kun` substring appears in the brand URLs to
-catch regressions early.
+Every URL emitted by the CLI uses the approved project identity. The test
+`tests/cli/ui/test_theme.py` pins the exact website and pseudonymous repository
+URLs, so changing either destination fails validation without storing personal
+identifiers in the test itself.
