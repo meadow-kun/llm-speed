@@ -17,6 +17,12 @@ Or use `uv tool install llm-speed`. On a machine without Python, the [installer]
 curl -fsSL https://llm-speed.com/install.sh | sh
 ```
 
+With Homebrew (installation tested on Apple Silicon):
+
+```sh
+brew install meadow-kun/tap/llm-speed
+```
+
 Check dependencies and backend setup with `llm-speed doctor`. On an interactive terminal it offers setup steps; otherwise it prints guidance.
 
 ## Run
@@ -32,6 +38,7 @@ Supported backend integrations include Ollama, llama.cpp, MLX, vLLM, and ExLlama
 
 ## Links and license
 
+- [Changelog](CHANGELOG.md)
 - [Results and datasets](https://llm-speed.com/)
 - [Report an issue](https://github.com/meadow-kun/llm-speed/issues)
 - [Security policy](SECURITY.md)
