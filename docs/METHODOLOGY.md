@@ -318,8 +318,7 @@ The full client, the API, and this methodology are in the public repository:
 
 - Workload definitions: [`cli/workloads/`](https://github.com/meadow-kun/llm-speed/blob/main/cli/workloads)
 - Signing and canonicalisation: [`cli/signing.py`](https://github.com/meadow-kun/llm-speed/blob/main/cli/signing.py)
-- Server-side ingest is closed-source. Signatures are verifiable
-  client-side against the embedded public key (RFC 7515 / EdDSA).
+- Server ingest and verification: [`worker/src/index.ts`](https://github.com/meadow-kun/llm-speed-web/blob/main/worker/src/index.ts)
 - This document: [`docs/METHODOLOGY.md`](https://github.com/meadow-kun/llm-speed/blob/main/docs/METHODOLOGY.md)
 
 File an issue if anything in this document does not match the code.

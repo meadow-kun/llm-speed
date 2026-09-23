@@ -236,6 +236,7 @@ def _trim_workload_result(
         ident = model.get("identifier")
         if isinstance(ident, str):
             from pathlib import PurePath
+
             try:
                 base = PurePath(ident).name or ident
                 model = {**model, "identifier": base}
@@ -261,6 +262,7 @@ def _sanitize_error_string(s: str, *, max_len: int = 256) -> str:
     Catches `/Users/<user>/...` (macOS), `/home/<user>/...` (Linux),
     `C:\\Users\\<user>\\...` (Windows). The username segment is the leak."""
     import re
+
     # macOS / Linux: /Users/<u>/... or /home/<u>/...
     s = re.sub(r"/(?:Users|home)/[^/\s]+", "~", s)
     # Windows: C:\Users\<u>\... (any drive letter)
@@ -276,7 +278,13 @@ def build_uploadable_report(
     strict_anon: bool = False,
     include_raw_timings: bool = False,
 ) -> dict[str, Any]:
-    """Privacy-trimmed dict that will be the JWS payload. No signature fields here."""
+    """Privacy-trimmed dict that will be the JWS payload. No signature fields here.
+
+    V-5 replay protection: every payload carries `iat` (ms since epoch)
+    and a fresh 16-byte URL-safe `nonce`. The server enforces a 7-day
+    max-age plus a UNIQUE constraint on (public_key, nonce) — so a
+    captured JWS envelope cannot be replayed against the leaderboard.
+    """
     fp_dict = to_uploadable_dict(report.fingerprint, strict_anon=strict_anon)
     results_out: list[dict[str, Any]] = []
     for r in report.results:
@@ -284,6 +292,9 @@ def build_uploadable_report(
         results_out.append(
             _trim_workload_result(rd, include_raw_timings=include_raw_timings)
         )
+    import secrets as _secrets
+    import time as _time
+
     return {
         "suite_version": report.suite_version,
         "cli_version": report.cli_version,
@@ -291,6 +302,8 @@ def build_uploadable_report(
         "results": results_out,
         "started_at": report.started_at,
         "finished_at": report.finished_at,
+        "iat": int(_time.time() * 1000),
+        "nonce": _secrets.token_urlsafe(16),  # 22 chars → fits server's 16..64 bound
     }
 
 

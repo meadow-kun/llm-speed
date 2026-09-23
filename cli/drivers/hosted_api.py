@@ -1,10 +1,18 @@
-"""Hosted-API backend driver.
+"""Hosted-API backend driver — DISABLED BY DEFAULT.
 
-A single driver that fans out across OpenAI-compatible providers
-(OpenAI, OpenRouter, Together, Fireworks, Groq) plus a thin Anthropic adapter.
+This driver fans out across OpenAI-compatible providers plus a thin
+Anthropic adapter. As of 2026-05-07 it is gated behind the explicit
+opt-in `LLMSPEED_ENABLE_HOSTED_API=1` environment variable, AND the
+upload server refuses runs whose backend == "hosted-api".
 
-Detection is purely env-var based: at least one of {OPENAI, OPENROUTER, TOGETHER,
-FIREWORKS, GROQ, ANTHROPIC}_API_KEY must be set.
+Why: the public leaderboard surface must not republish speed
+benchmarks of hosted closed-model APIs (OpenAI / Anthropic / Google
+ToS forbid it without written consent; aggregator ToS for OpenRouter,
+Together, Fireworks etc. carry similar restrictions). Even in
+"only OSS-friendly providers" mode, the redistribution legal posture
+is shaky. Operators who want to bench their own hosted endpoints
+privately can still flip the opt-in; the orchestrator simply refuses
+to ingest the resulting runs.
 
 ModelRef.identifier is namespaced as `<provider>/<model_id>`. The provider name
 is also stored in `model.extras['provider']` so the driver can route requests
@@ -52,8 +60,22 @@ PROVIDERS: dict[str, tuple[str, str, str]] = {
 
 ANTHROPIC_VERSION = "2023-06-01"
 
+# Explicit opt-in. Without this, the driver reports unavailable and refuses
+# to run, so a fresh install of the public CLI never benchmarks hosted APIs
+# by accident. Set `LLMSPEED_ENABLE_HOSTED_API=1` to use it for your own
+# private benchmarks (uploads of hosted-api runs are still rejected by the
+# server — this is a legal posture, not a technical limitation).
+HOSTED_API_OPT_IN_ENV = "LLMSPEED_ENABLE_HOSTED_API"
+
+
+def _opt_in_enabled() -> bool:
+    val = os.environ.get(HOSTED_API_OPT_IN_ENV, "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
 
 def _enabled_providers() -> list[str]:
+    if not _opt_in_enabled():
+        return []
     return [name for name, (env, _, _) in PROVIDERS.items() if os.environ.get(env)]
 
 
@@ -89,6 +111,16 @@ class HostedApiDriver:
     # -------------------------------------------------------------------- detect
 
     def detect(self) -> BackendDetection:
+        if not _opt_in_enabled():
+            return BackendDetection(
+                available=False,
+                name=self.name,
+                notes=(
+                    "hosted-API benchmarks disabled by default. "
+                    f"Set {HOSTED_API_OPT_IN_ENV}=1 to enable for private use; "
+                    "the upload server rejects hosted-api runs regardless."
+                ),
+            )
         active = _enabled_providers()
         if not active:
             return BackendDetection(
@@ -100,7 +132,10 @@ class HostedApiDriver:
             available=True,
             name=self.name,
             version=None,
-            notes=f"providers configured: {', '.join(active)}",
+            notes=(
+                f"providers configured: {', '.join(active)} "
+                "(private use only — uploads of hosted-api runs are rejected)"
+            ),
             runtime_versions={p: PROVIDERS[p][1] for p in active},
         )
 
@@ -557,7 +592,10 @@ if __name__ == "__main__":
     det = drv.detect()
     print("detect:", det)
     if not det.available:
-        print("set one of OPENAI_API_KEY, OPENROUTER_API_KEY, ... to enable")
+        print(
+            f"set {HOSTED_API_OPT_IN_ENV}=1 plus one of "
+            "OPENAI_API_KEY, OPENROUTER_API_KEY, ... to enable"
+        )
         raise SystemExit(0)
 
     models = drv.list_models()

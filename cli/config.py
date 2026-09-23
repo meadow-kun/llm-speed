@@ -16,6 +16,10 @@ CONFIG_DIR = Path(
 DEFAULT_API_BASE = os.environ.get("LLM_SPEED_API", "https://api.llm-speed.com")
 
 # Default workloads run by `llm-speed bench` with no flags.
+# FACTORY SURFACE (per-vertical): the property factory renders this tuple per
+# vertical. Names must be a subset of the registered workloads in
+# cli.workloads._WORKLOAD_MODULES. New metrics ride workload_results.extras,
+# not this list.
 DEFAULT_WORKLOADS = (
     "chat-short",
     "chat-long",

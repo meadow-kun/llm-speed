@@ -32,7 +32,6 @@ from rich.table import Table
 from ..auto_install import (
     InstallPlan,
     confirm_and_install,
-    detect_missing,
     is_llama_cpp_installed,
     is_mlx_installed,
     is_ollama_installed,
@@ -41,7 +40,6 @@ from ..auto_install import (
 from .auto import run_auto
 from .progress import announce, info
 from .theme import (
-    C_BRAND,
     C_HINT,
     C_MUTED,
     C_OK,
@@ -167,32 +165,27 @@ def run_wizard(
     render_splash(console=cons)
     render_backends(console=cons)
 
-    missing = detect_missing()
     has_any = any(installed for _, installed, _ in _backend_status())
 
     if not has_any:
-        cons.print(
-            f"[{C_WARN}]no benchmark backend installed yet.[/] "
-            f"{C_BRAND}llm-speed[/] needs one of: llama.cpp, ollama, mlx."
-        )
-        # Offer the *first* missing backend's install plan; user can install more later.
-        for candidate in missing:
-            installed = offer_install(candidate, confirm=confirm_fn, console=cons)
-            if installed:
-                has_any = True
-                break
+        # Delegate the full non-happy-path remediation to the doctor: it offers
+        # installs, surfaces daemon-down / no-model-cached sub-states, pulls a
+        # model, and re-checks in a loop. It returns 0 only when a backend is
+        # actually ready to benchmark.
+        from ..commands.doctor import run_doctor
 
-    if not has_any:
-        cons.print()
-        cons.print(
-            Panel(
-                f"No backend is set up yet. After installing one (see {REPO_URL} for the\n"
-                f"full list), re-run [bold]llm-speed[/] and we'll pick up from here.",
-                border_style=C_WARN,
-                expand=False,
+        rc = run_doctor(api_base=api_base, confirm=confirm_fn, console=cons)
+        if rc != 0:
+            cons.print()
+            cons.print(
+                Panel(
+                    f"No backend is set up yet. After installing one (see {REPO_URL} for the\n"
+                    f"full list), re-run [bold]llm-speed[/] and we'll pick up from here.",
+                    border_style=C_WARN,
+                    expand=False,
+                )
             )
-        )
-        return 0
+            return 0
 
     # ------------------------------------------------------------------ smoke run
     cons.print()

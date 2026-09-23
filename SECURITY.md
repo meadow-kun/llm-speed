@@ -71,28 +71,25 @@ to verify the chain yourself:
 1. **Source matches binary.** Run `llm-speed verify` after install. It
    computes the sha256 of the installed wheel and compares against the
    published sidecar. If they disagree, do not run the binary.
-2. **Audit trail.** The PII/privacy audit on 2026-05-01 is at
-   [`docs/security/cli_pii_audit_2026-05-01.md`](./docs/security/cli_pii_audit_2026-05-01.md).
-   The OSS-readiness audit is at
-   [`docs/security/cli_oss_ready_2026-05-01.md`](./docs/security/cli_oss_ready_2026-05-01.md).
+2. **Audit trail.** Layered audits, newest first:
+   - 2026-05-07 — full-stack forensic audit covering the CLI, the
+     ingestion API, the orchestrator, the marketing fleet, the trust
+     chain, and identity hygiene:
+     [`docs/security/forensic_full_stack_2026-05-07.md`](./docs/security/forensic_full_stack_2026-05-07.md).
+     A short follow-up logging the F-N → fix mapping is at
+     [`docs/security/launch_fixes_2026-05-07.md`](./docs/security/launch_fixes_2026-05-07.md).
+   - 2026-05-04 — installable-CLI pentest + website-routes pentest:
+     [`docs/security/pentest_installable_2026-05-04.md`](./docs/security/pentest_installable_2026-05-04.md),
+     [`docs/security/website_routes_pentest_2026-05-04.md`](./docs/security/website_routes_pentest_2026-05-04.md).
+   - 2026-05-01 — original CLI PII audit and OSS-readiness audit:
+     [`docs/security/cli_pii_audit_2026-05-01.md`](./docs/security/cli_pii_audit_2026-05-01.md),
+     [`docs/security/cli_oss_ready_2026-05-01.md`](./docs/security/cli_oss_ready_2026-05-01.md).
 3. **Privacy contract.** Every field that leaves your machine is
    enumerated in [`docs/PRIVACY.md`](./docs/PRIVACY.md). Anything not on
    that list is a bug — file an issue.
 4. **Signed runs.** Every uploaded benchmark is JWS-signed with an
    Ed25519 keypair on your machine. The public key rides in the JWS
    header so anyone can verify it without contacting us.
-5. **Hash-pinned dependency install.** Maximum-paranoia install uses the
-   committed lockfile so every transitive sha256 is verified at install
-   time:
-   ```sh
-   curl -fsSLO https://raw.githubusercontent.com/meadow-kun/llm-speed/v1.0.2/requirements.lock
-   pip install --require-hashes -r requirements.lock
-   pip install https://llm-speed.com/dist/llm_speed-0.0.1-py3-none-any.whl
-   llm-speed verify
-   ```
-   Any sha256 mismatch in `requirements.lock` aborts the install before
-   any code runs. The lockfile is regenerated on every release with
-   `pip-compile --generate-hashes`.
 
 ## Identity and contact
 

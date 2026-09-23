@@ -6,6 +6,11 @@ Each driver module must:
 
 Driver names (canonical, must match):
     'llama.cpp', 'ollama', 'vllm', 'mlx', 'exllamav2', 'hosted-api'
+
+FACTORY SURFACE: `_DRIVER_MODULES` below is one of the per-vertical extraction
+points the property factory renders. Registered backends here should stay in
+sync with the server's accept-list (api.suite_config.BACKEND_ALLOWLIST) for the
+vertical. To add/replace backends, edit this tuple (each module self-registers).
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import logging
 
 LOG = logging.getLogger("cli.drivers")
 
+# FACTORY SURFACE (per-vertical): the set of driver modules to import+register.
 # Import every driver module; each is responsible for registering itself.
 # A driver that fails to import (missing optional dep) MUST log and continue.
 _DRIVER_MODULES = (
@@ -24,6 +30,7 @@ _DRIVER_MODULES = (
     "cli.drivers.mlx",
     "cli.drivers.vllm",
     "cli.drivers.exllamav2",
+    "cli.drivers.image_diffusers",
 )
 
 for _modname in _DRIVER_MODULES:

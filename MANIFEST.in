@@ -1,0 +1,35 @@
+# Sdist scope is INCLUSIVE-ONLY: ship exactly the CLI source + the three
+# top-level metadata files, nothing else.
+#
+# Without this manifest, setuptools' SCM-aware default sweeps in every
+# git-tracked file at the repo root — including `tests/`, `docs/`,
+# `bots/`, `tools/`, `web/`, `worker/`, etc. The 2026-05-12 doxx sweep
+# caught `tests/test_identity_scrub.py` shipping in the v0.0.1 sdist
+# with its full denylist (real name + work-domain markers) as plaintext
+# literals. This file caps the sdist's reach so that can't recur.
+#
+# To add a new top-level item to the published artifact, add it here
+# explicitly. The CI guard (tests/test_identity_scrub.py) does NOT
+# protect packages built outside this scope.
+
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include cli *.py
+prune tests
+prune docs
+prune bots
+prune tools
+prune web
+prune worker
+prune api
+prune seed
+prune Formula
+prune npm
+prune parking
+prune scripts
+prune .github
+prune .claude
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store

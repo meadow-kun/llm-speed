@@ -81,6 +81,14 @@ class InstallPlan:
     shell: bool = False
     available: bool = True
     skip_reason: str | None = None
+    # ``license`` and ``auto_installable`` gate whether the doctor may OFFER to
+    # run the command. We only auto-run installs for permissively-licensed
+    # tooling the user can redistribute/build freely; anything else is
+    # "guide-only" (we print instructions + a link, never invoke). Unknown
+    # backends default to ``auto_installable=False`` so the safe behaviour is
+    # to guide, not to run.
+    license: str | None = None
+    auto_installable: bool = False
 
 
 def plan_for(backend: str) -> InstallPlan:
@@ -99,6 +107,8 @@ def plan_for(backend: str) -> InstallPlan:
                 description="Install Ollama via Homebrew",
                 command="brew install ollama",
                 argv=["brew", "install", "ollama"],
+                license="MIT",
+                auto_installable=True,
             )
         if osname == "Linux":
             return InstallPlan(
@@ -107,6 +117,8 @@ def plan_for(backend: str) -> InstallPlan:
                 command="curl -fsSL https://ollama.com/install.sh | sh",
                 argv=["sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh"],
                 shell=True,
+                license="MIT",
+                auto_installable=True,
             )
         return InstallPlan(
             backend="ollama",
@@ -124,6 +136,8 @@ def plan_for(backend: str) -> InstallPlan:
                 description="Install llama.cpp via Homebrew",
                 command="brew install llama.cpp",
                 argv=["brew", "install", "llama.cpp"],
+                license="MIT",
+                auto_installable=True,
             )
         if osname == "Linux" and _which("apt-get"):
             return InstallPlan(
@@ -136,6 +150,8 @@ def plan_for(backend: str) -> InstallPlan:
                     "sudo apt-get update && sudo apt-get install -y llama.cpp",
                 ],
                 shell=True,
+                license="MIT",
+                auto_installable=True,
             )
         return InstallPlan(
             backend="llama.cpp",
@@ -161,6 +177,8 @@ def plan_for(backend: str) -> InstallPlan:
             description="Install mlx-lm via pip (--user)",
             command=f"{sys.executable} -m pip install --user mlx-lm",
             argv=[sys.executable, "-m", "pip", "install", "--user", "mlx-lm"],
+            license="MIT",
+            auto_installable=True,
         )
 
     return InstallPlan(
@@ -171,6 +189,159 @@ def plan_for(backend: str) -> InstallPlan:
         available=False,
         skip_reason=f"unknown backend {backend!r}",
     )
+
+
+def start_plan_for(backend: str) -> InstallPlan:
+    """Plan to START an already-installed-but-not-running backend.
+
+    Today only ``ollama`` has a daemon. On macOS+brew we can safely
+    ``brew services start ollama`` (returns immediately). Everywhere else
+    starting a server is guide-only: ``ollama serve`` blocks the terminal and
+    ``systemctl start ollama`` needs root + systemd, so we never auto-run it.
+    """
+    name = backend.lower()
+    osname = platform.system()
+    if name == "ollama":
+        if osname == "Darwin" and _which("brew"):
+            return InstallPlan(
+                backend="ollama",
+                description="Start the Ollama daemon via Homebrew services",
+                command="brew services start ollama",
+                argv=["brew", "services", "start", "ollama"],
+                license="MIT",
+                auto_installable=True,
+            )
+        return InstallPlan(
+            backend="ollama",
+            description="Start the Ollama daemon",
+            command="ollama serve   # (run in another terminal, or: systemctl start ollama)",
+            argv=[],
+            available=False,
+            skip_reason=(
+                "start the daemon yourself: run `ollama serve` in another terminal, "
+                "or `sudo systemctl start ollama` if installed as a service"
+            ),
+        )
+    return InstallPlan(
+        backend=backend,
+        description=f"Start {backend}",
+        command="(no daemon to start)",
+        argv=[],
+        available=False,
+        skip_reason=f"{backend} has no daemon to start",
+    )
+
+
+def pull_model_plan_for(backend: str, model: str | None = None) -> InstallPlan:
+    """Plan to fetch a first model for an available backend.
+
+    ``ollama pull`` is a safe, idempotent network download we can offer to run.
+    For llama.cpp / mlx the user picks a GGUF / HF model themselves, so those
+    are guide-only.
+    """
+    name = backend.lower()
+    if name == "ollama":
+        tag = model or "llama3.2:1b"
+        return InstallPlan(
+            backend="ollama",
+            description=f"Pull a small starter model ({tag})",
+            command=f"ollama pull {tag}",
+            argv=["ollama", "pull", tag],
+            license="MIT",
+            auto_installable=True,
+        )
+    if name in ("llama.cpp", "llama_cpp", "llamacpp"):
+        return InstallPlan(
+            backend="llama.cpp",
+            description="Download a GGUF model",
+            command="(download a .gguf, e.g. from https://huggingface.co/models?library=gguf)",
+            argv=[],
+            available=False,
+            skip_reason=(
+                "llama.cpp needs a local .gguf file. Download one (e.g. from "
+                "huggingface.co) and pass it with --model /path/to/model.gguf"
+            ),
+        )
+    if name in ("mlx", "mlx_lm"):
+        return InstallPlan(
+            backend="mlx",
+            description="Download an MLX model",
+            command="(models resolve from the HuggingFace cache, e.g. mlx-community/*)",
+            argv=[],
+            available=False,
+            skip_reason=(
+                "MLX loads from the HuggingFace cache; pass --model "
+                "mlx-community/<repo> and it will be fetched on first run"
+            ),
+        )
+    return InstallPlan(
+        backend=backend,
+        description=f"Fetch a model for {backend}",
+        command="(no automated model fetch)",
+        argv=[],
+        available=False,
+        skip_reason=f"no automated model fetch for {backend}",
+    )
+
+
+# Optional Python extras → the pip package that provides them.
+_EXTRA_PACKAGES = {
+    "mlx": "mlx-lm",
+    "mlx_lm": "mlx-lm",
+    "vllm": "vllm",
+    "exllamav2": "exllamav2",
+}
+
+
+def extra_plan_for(extra: str) -> InstallPlan:
+    """Plan to ``pip install`` an optional accelerator extra (mlx-lm/vllm/...).
+
+    All in-scope extras are permissively licensed, so we offer them. vLLM /
+    ExLlamaV2 only make sense with an NVIDIA GPU + CUDA; we still offer the pip
+    install and let the package's own wheels/checks complain if the GPU is
+    absent.
+    """
+    pkg = _EXTRA_PACKAGES.get(extra.lower())
+    if pkg is None:
+        return InstallPlan(
+            backend=extra,
+            description=f"Install {extra}",
+            command="(unknown extra)",
+            argv=[],
+            available=False,
+            skip_reason=f"unknown extra {extra!r}",
+        )
+    return InstallPlan(
+        backend=extra,
+        description=f"Install {pkg} via pip (--user)",
+        command=f"{sys.executable} -m pip install --user {pkg}",
+        argv=[sys.executable, "-m", "pip", "install", "--user", pkg],
+        license="Apache-2.0/MIT",
+        auto_installable=True,
+    )
+
+
+# Manual-instruction text for guide-only situations (no safe auto-install).
+_GUIDES = {
+    "corporate-ca": (
+        "Behind a TLS-intercepting proxy? Point the CLI at your corporate root "
+        "CA bundle: export SSL_CERT_FILE=/path/to/ca.pem (or REQUESTS_CA_BUNDLE). "
+        "We never disable certificate verification for you."
+    ),
+    "vllm": (
+        "vLLM needs an NVIDIA GPU + CUDA. See https://docs.vllm.ai for the "
+        "install matrix, then `pip install 'llm-speed[vllm]'`."
+    ),
+    "gguf": (
+        "llama.cpp benchmarks a local .gguf file. Grab one from "
+        "https://huggingface.co/models?library=gguf and pass --model /path.gguf."
+    ),
+}
+
+
+def guide_for(topic: str) -> str | None:
+    """Return human-readable manual guidance for a guide-only topic, or None."""
+    return _GUIDES.get(topic.lower())
 
 
 # ---------------------------------------------------------------------------

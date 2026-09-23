@@ -60,7 +60,7 @@ _BUILD_FLAG_PATTERNS = (
 
 # Quant suffix in GGUF filenames: foo-Q4_K_M.gguf, foo.IQ3_XXS.gguf, etc.
 _QUANT_RE = re.compile(
-    r"[-._](Q[0-9][^.\-_/]*|IQ[0-9][^.\-_/]*|F16|F32|BF16|FP8)\b",
+    r"[-._](Q[0-9][^.\-/]*|IQ[0-9][^.\-/]*|F16|F32|BF16|FP8)\b",
     re.IGNORECASE,
 )
 
@@ -281,6 +281,8 @@ class LlamaCppDriver:
             "max_tokens": max_output_tokens,
             "stream": bool(stream),
         }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
         # Bubble up generation knobs that callers may want.
         for k in ("temperature", "top_p", "top_k", "seed", "stop"):
             if k in extras:

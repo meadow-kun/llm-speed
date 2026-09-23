@@ -240,7 +240,15 @@ class OllamaDriver:
 
                     now = now_ms()
                     msg = evt.get("message") or {}
-                    chunk_text = msg.get("content") or ""
+                    # Reasoning models (Qwen3-Thinking, DeepSeek-R1, etc.) emit
+                    # chain-of-thought under `thinking`, separate from the
+                    # visible `content`. Both are real GPU-generated tokens;
+                    # counting only `content` under-reports decode tps and, when
+                    # the whole token budget is spent thinking, yields an
+                    # all-dashes row with no error.
+                    chunk_text = (msg.get("content") or "") + (
+                        msg.get("thinking") or ""
+                    )
                     if chunk_text:
                         if ttft_ms is None:
                             ttft_ms = now - t_start
@@ -306,7 +314,9 @@ class OllamaDriver:
             return _failed_outcome(f"bad JSON: {exc}")
 
         msg = data.get("message") or {}
-        text = msg.get("content") or ""
+        # Include `thinking` (reasoning-model chain-of-thought) alongside
+        # `content` — both are generated tokens. See streaming path above.
+        text = (msg.get("content") or "") + (msg.get("thinking") or "")
         backend_extras = {
             "eval_duration_ns": data.get("eval_duration"),
             "prompt_eval_duration_ns": data.get("prompt_eval_duration"),

@@ -225,15 +225,23 @@ def cmd_bench(args) -> int:
     if not backend_name:
         registered = all_driver_names()
         if not registered:
-            print_error(
-                "no backends registered. install a driver dependency or check `llm-speed detect`."
-            )
+            print_warning("no backends registered yet - let's check what's needed.")
         else:
+            print_warning("no backend is ready on this machine yet - let's set one up.")
+        # Hand off to the doctor: interactive install on a TTY, structured
+        # guidance + non-zero exit on a non-TTY. If it makes the host ready,
+        # re-pick and continue the benchmark.
+        from .doctor import run_doctor
+
+        rc = run_doctor(api_base=api_base)
+        if rc != 0:
+            return rc
+        backend_name = _pick_backend(explicit_backend)
+        if not backend_name:
             print_error(
-                "no backend appears available on this machine. "
-                f"registered: {registered}. try --backend to force one."
+                "still no usable backend after setup. run `llm-speed detect` to inspect."
             )
-        return 1
+            return 1
 
     try:
         driver = get_driver(backend_name)
@@ -252,7 +260,22 @@ def cmd_bench(args) -> int:
     # 3. Model.
     model = _resolve_model(driver, getattr(args, "model", None))
     if model is None:
-        return 1
+        # Backend present but no usable model. Route through the doctor to
+        # offer a model pull (ollama) or print guidance, then retry once.
+        from .doctor import run_doctor
+
+        rc = run_doctor(api_base=api_base)
+        if rc != 0:
+            return rc
+        backend_name = _pick_backend(explicit_backend) or backend_name
+        try:
+            driver = get_driver(backend_name)
+        except KeyError as exc:
+            print_error(str(exc))
+            return 1
+        model = _resolve_model(driver, getattr(args, "model", None))
+        if model is None:
+            return 1
 
     # 4. Workloads.
     workload_names = _select_workloads(
@@ -355,7 +378,17 @@ def cmd_bench(args) -> int:
         # Default: always save locally.
         offline_path = save_offline(report, strict_anon=strict_anon)
 
-        if not no_upload:
+        has_measurement = any(r.error is None for r in results)
+        if not no_upload and not has_measurement:
+            # Never publish a run where every workload errored (e.g. the model
+            # failed to load): it carries no measurement and would only create an
+            # aggregation-excluded orphan on the API. The local save above keeps
+            # the failure inspectable.
+            console.print(
+                "[yellow]Skipping upload:[/yellow] every workload errored "
+                "(no measurement to publish). Saved locally for inspection."
+            )
+        elif not no_upload:
             # Consent gate. Strict-anon implicitly consents (most private option).
             consent_ok = strict_anon or has_consented()
             if not consent_ok:

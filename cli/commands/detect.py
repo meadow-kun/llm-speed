@@ -38,8 +38,10 @@ def cmd_detect(args) -> int:
 
     console.rule("[bold]Available backends[/bold]")
     driver_names = all_driver_names()
+    any_unavailable = False
     if not driver_names:
         console.print("  [dim]no drivers registered[/dim]")
+        any_unavailable = True
     else:
         table = Table(show_header=True, header_style="bold")
         table.add_column("backend")
@@ -51,11 +53,19 @@ def cmd_detect(args) -> int:
                 drv = get_driver(name)
                 det = drv.detect()
                 avail = "[green]yes[/green]" if det.available else "[red]no[/red]"
+                if not det.available:
+                    any_unavailable = True
                 table.add_row(name, avail, det.version or "-", det.notes or "")
             except Exception as exc:
                 log.debug("driver %s detect failed: %s", name, exc)
+                any_unavailable = True
                 table.add_row(name, "[red]error[/red]", "-", str(exc)[:80])
         console.print(table)
+    if any_unavailable:
+        console.print(
+            "\n  [cyan]tip:[/cyan] some backends aren't ready. Run "
+            "[bold]llm-speed doctor[/bold] to install/start what's missing."
+        )
 
     console.rule("[bold]Registered workloads[/bold]")
     workload_names = all_workload_names()

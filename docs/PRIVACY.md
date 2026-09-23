@@ -262,7 +262,7 @@ CLI version, and the trimmed `fingerprint_hash`. Delete that file to revoke.
 ## 8. Site analytics
 
 The website (llm-speed.com) uses **Cloudflare Web Analytics** to count
-pageviews. It is the only analytics product running on the site.
+pageviews. A small first-party shopping-interest counter is described below.
 
 | Aspect | Value |
 |---|---|
@@ -272,30 +272,49 @@ pageviews. It is the only analytics product running on the site.
 | Client-side fingerprinting | none |
 | Persistent client identifier | none |
 | Client IP storage | not persisted (Cloudflare aggregates at the edge; the unaltered edge-log retention applies as already documented in §4) |
-| Beacon | edge-injected by Cloudflare Pages; no `<script>` runs in your browser to count a pageview |
+| Beacon | a small, cookieless script (`static.cloudflareinsights.com/beacon.min.js`, ~1 KB) loads in your browser and reports a pageview + page-load timing. It sets no cookies and stores no identifier. (Cloudflare Pages does not auto-inject it on this project, so it is wired explicitly in `web/app/layout.tsx`.) |
 | Data fields collected | request path, response code, referring host (not full URL), country, browser family, page-load timing |
 | Data NOT collected | search query terms, full referrer URL, screen resolution, mouse movements, session replay, cross-site identity |
 | Retention | Cloudflare aggregates, ~6 months on the free tier; `docs/metrics/<iso>-analytics.json` snapshots in this repo retain 7-day aggregates indefinitely as a public log |
 | API token scope | `Account Analytics: Read`, account-scoped to llm-speed only, used by `tools/metrics_analytics.py` for the daily snapshot |
-| Opt-out | block `static.cloudflareinsights.com` (the optional RUM beacon endpoint, only active if the maintainer enables web-vitals tracking — not active today). The edge counter cannot be opted out of without blocking the entire site, but it never sees identifiable data. |
+| Opt-out | block `static.cloudflareinsights.com` (the beacon script) and/or `cloudflareinsights.com` (where it POSTs). Blocking either stops all pageview reporting; the rest of the site keeps working. The beacon never sees identifiable data. |
 
-If we ever turn on the optional RUM beacon (web vitals — LCP / CLS / INP),
+The beacon also reports basic web vitals (LCP / CLS / INP) as part of the
+same cookieless request. If we ever change what analytics the site loads,
 this document and the CSP get updated in the same commit. We don't ship
 analytics features without disclosing them here.
+
+### Shopping-interest trial
+
+The RTX 5090/M3 Ultra comparison article contains an ordinary Amazon US link.
+It has no affiliate tag and earns us no commission. We count when at least half
+of that shopping card becomes visible and when its link is activated, at most
+once each per page load. These are event counts, not unique visitors or purchases.
+
+The browser sends only an event type (`view` or `click`), a random event receipt
+and a trial/QA label to `/api/hardware-interest`. Receipts are created separately
+for each event, are not saved in cookies or browser storage, and do not identify
+you across pages. Our existing Cloudflare storage retains the UTC date, event
+type and receipt for at most 45 days. We retain daily aggregate counts for review.
+The counter does not store IP addresses, page URLs, referrers, email addresses or
+merchant activity. Existing Cloudflare platform request handling in §4 still applies.
+
+Do Not Track (`1`) and Global Privacy Control disable this counter. You can also
+block `/api/hardware-interest`; the retailer link continues to work. QA counts are
+kept separate. Visiting the retailer is your choice and its own privacy policy
+applies once you follow the link.
 
 ---
 
 ## 9. Open source
 
-Every line of code that handles your data is in the public repo. Auditable
-entry points:
+The CLI has a public source repository. Public entry points include:
 
 - Fingerprint capture and bucketing: [`cli/fingerprint.py`](https://github.com/meadow-kun/llm-speed/blob/main/cli/fingerprint.py)
 - Upload payload construction and signing: [`cli/upload.py`](https://github.com/meadow-kun/llm-speed/blob/main/cli/upload.py), [`cli/signing.py`](https://github.com/meadow-kun/llm-speed/blob/main/cli/signing.py)
-- Server-side ingest and signature verification is closed-source.
-  The CLI's JWS payload (Ed25519 over canonicalised JSON) is verifiable
-  against the public key in the JWS protected header by any
-  RFC-7515-compliant library — you don't need our server code to confirm
-  a signature.
+
+Website and API code, including the shopping-interest counter, are maintained in
+a separate internal repository. Their exact source is not currently available
+through the public CLI repository.
 
 File an issue if anything in this document doesn't match the code.

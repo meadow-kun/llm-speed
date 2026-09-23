@@ -12,8 +12,9 @@ every cell — that would be N+1 against the API.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from .slugs import (
     canonical_hardware_slug,
@@ -33,10 +34,14 @@ _UNSAFE_DISPLAY_RE = re.compile(
     "\x00-\x08"  # C0 controls (kept: \t \n)
     "\x0b\x0c"
     "\x0e-\x1f"
-    "‪-‮"  # bidi formatting
-    "⁦-⁩"  # bidi isolates
-    "​-‍"  # zero-width space / ZWNJ / ZWJ
-    "﻿"        # BOM / zero-width nbsp
+    "\x7f"  # DEL (V-10)
+    ""  # NEL — line break to many renderers (V-10)
+    "‎‏"  # LRM / RLM bidi marks outside the 202A-202E block (V-10)
+    "‪-‮"  # bidi formatting (U+202A–U+202E)
+    "⁦-⁩"  # bidi isolates (U+2066–U+2069)
+    "​-‍"  # zero-width space / ZWNJ / ZWJ (U+200B–U+200D)
+    "  "  # line / paragraph separator (V-10)
+    "﻿"  # BOM / zero-width nbsp (U+FEFF)
     "]"
 )
 _DISPLAY_MAX_LEN = 256
@@ -56,6 +61,7 @@ def _safe_display(s: str | None, *, max_len: int = _DISPLAY_MAX_LEN) -> str:
     if len(cleaned) > max_len:
         cleaned = cleaned[: max_len - 1] + "…"
     return cleaned
+
 
 # Keys defined in the API response.
 _DECODE = "top_decode_tps"
