@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from .types import RunReport
 
@@ -55,8 +56,16 @@ def print_run_summary(
             bits.append(f"({', '.join(meta)})")
         model_str = " ".join(bits)
 
-    _console.rule(f"[bold]{accel}[/bold]")
-    _console.print(f"[cyan]{backend_str}[/cyan]   [magenta]{model_str}[/magenta]")
+    _console.rule(Text(accel, style="bold"))
+    _console.print(Text.assemble((backend_str, "cyan"), "   ", (model_str, "magenta")))
+    _console.print(Text(f"Suite: {report.suite_version}"))
+    if primary is not None and not primary.error and primary.decode_tps is not None:
+        _console.print(
+            Text(
+                f"Measured decode: {_fmt(primary.decode_tps)} tok/s · {primary.workload}",
+                style="bold",
+            )
+        )
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("workload", style="bold")
@@ -69,19 +78,42 @@ def print_run_summary(
 
     for r in report.results:
         table.add_row(
-            r.workload,
+            Text(r.workload),
             _fmt(r.decode_tps),
             _fmt(r.prefill_tps),
             _fmt(r.ttft_ms),
             _fmt(r.decode_p50_latency_ms),
             _fmt(r.decode_p95_latency_ms),
-            (r.error[:60] if r.error else ""),
+            Text(r.error[:60] if r.error else ""),
         )
 
     _console.print(table)
 
+    settings = Table(title="Measured settings", show_header=True, header_style="bold")
+    for label in (
+        "workload",
+        "input tokens",
+        "output tokens",
+        "batch",
+        "context tokens",
+    ):
+        settings.add_column(label)
+    for result in report.results:
+        if not result.error:
+            settings.add_row(
+                Text(result.workload),
+                str(result.prompt_tokens),
+                str(result.output_tokens),
+                str(result.batch_size),
+                str(result.context_tokens) if result.context_tokens else "not reported",
+            )
+    if settings.row_count:
+        _console.print(settings)
+
     if result_url:
-        _console.print(f"[green]Submitted:[/green] {result_url}")
+        _console.print(
+            Text.assemble(("View and share your result: ", "green"), result_url)
+        )
     elif offline_path:
         _console.print(f"[yellow]Saved locally:[/yellow] {offline_path}")
         _console.print(

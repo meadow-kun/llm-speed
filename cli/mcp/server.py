@@ -19,7 +19,6 @@ backs the number.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -69,7 +68,9 @@ def _match_model(query: str | None, cells: list[Cell]) -> list[Cell]:
     exact = [c for c in cells if c.model_slug == target]
     if exact:
         return exact
-    prefix = [c for c in cells if c.model_slug.startswith(target) or target in c.model_slug]
+    prefix = [
+        c for c in cells if c.model_slug.startswith(target) or target in c.model_slug
+    ]
     if prefix:
         return prefix
     needle = query.lower()
@@ -197,9 +198,15 @@ def compare(a: str, b: str) -> dict[str, Any]:
     faster = "a" if delta > 0 else ("b" if delta < 0 else "tie")
     # /vs slug strategy: hw-vs-hw if same model on different rigs, else
     # model-vs-model. Mirrors the website's parseVsSlug.
-    if side_a.model_slug == side_b.model_slug and side_a.hardware_slug != side_b.hardware_slug:
+    if (
+        side_a.model_slug == side_b.model_slug
+        and side_a.hardware_slug != side_b.hardware_slug
+    ):
         vs = api.vs_url(side_a.hardware_slug, side_b.hardware_slug)
-    elif side_a.hardware_slug == side_b.hardware_slug and side_a.model_slug != side_b.model_slug:
+    elif (
+        side_a.hardware_slug == side_b.hardware_slug
+        and side_a.model_slug != side_b.model_slug
+    ):
         vs = api.vs_url(side_a.model_slug, side_b.model_slug)
     else:
         vs = api.vs_url(side_a.model_slug, side_b.model_slug)
@@ -254,7 +261,8 @@ def recommend(constraints: dict[str, Any]) -> dict[str, Any]:
       - model_size_min: float — minimum model parameter count (B)
       - model_size_max: float — maximum model parameter count (B)
       - backend: str — substring filter (e.g. "mlx", "llama.cpp")
-      - locality: "local" | "hosted" | "any" — default "any"
+      - locality: kept for back-compat; the public leaderboard is
+        local-only as of 2026-05-07, so this filter is a no-op.
 
     Note: vram_gb_max / ram_gb_max are best-effort parses out of the
     accelerator_summary string. Anything we can't parse is left in.
@@ -390,7 +398,9 @@ def state_of() -> dict[str, Any]:
         )
 
     fastest_70b = next((c for c in cells if _is_big(c) and c.locality == "local"), None)
-    fastest_coding = next((c for c in cells if _is_coder(c) and c.locality == "local"), None)
+    fastest_coding = next(
+        (c for c in cells if _is_coder(c) and c.locality == "local"), None
+    )
 
     headlines: list[dict[str, Any]] = []
     for label, cell in (
@@ -412,11 +422,7 @@ def state_of() -> dict[str, Any]:
             }
         )
 
-    cited = [
-        c
-        for c in (fastest, fastest_70b, fastest_coding)
-        if isinstance(c, Cell)
-    ]
+    cited = [c for c in (fastest, fastest_70b, fastest_coding) if isinstance(c, Cell)]
     return {
         "issue": issue,
         "issue_url": f"{api.SITE_BASE}/state-of/{issue}" if issue else None,
@@ -442,9 +448,10 @@ to ground every claim in a real benchmark run. Workflow:
    - Backend preference: llama.cpp, MLX, vLLM, ollama, exllamav2, "any".
    - Task: chat, coding, agentic loops, long-context summarisation.
 
-2. Call `recommend` with the constraints. Prefer locality="local" unless
-   the user is explicitly asking for hosted-model comparisons. Set
-   model_size_min based on quality expectations:
+2. Call `recommend` with the constraints. The leaderboard is local-only
+   (hosted-API speed benchmarks are not published — provider ToS forbid
+   third-party republication). Set model_size_min based on quality
+   expectations:
      - 7B-13B for fast assistants on consumer GPUs / Apple Silicon laptops.
      - 22B-32B for coding (Qwen2.5-Coder, Codestral, DeepSeek-Coder-V2-Lite).
      - 70B+ when the user has 64GB+ unified memory or 48GB+ VRAM.

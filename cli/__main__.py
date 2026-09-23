@@ -104,6 +104,15 @@ def _build_parser() -> argparse.ArgumentParser:
     # detect -------------------------------------------------------------
     sub.add_parser("detect", help="print fingerprint + available backends/workloads")
 
+    # doctor -------------------------------------------------------------
+    # Preflight every dependency and, on a TTY, walk the user through
+    # installing whatever is missing (license-gated). On a non-TTY it prints
+    # guidance and exits non-zero if a required dependency is absent.
+    sub.add_parser(
+        "doctor",
+        help="check dependencies + interactively install/guide what's missing",
+    )
+
     # list-models --------------------------------------------------------
     p_list = sub.add_parser("list-models", help="list models per available backend")
     p_list.add_argument(
@@ -142,6 +151,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "skip the GitHub-Releases cross-check (offline / corp firewall). "
             "Degrades the trust chain to a single distribution domain — only "
             "use this if you genuinely cannot reach github.com."
+        ),
+    )
+    p_verify.add_argument(
+        "--sigstore",
+        action="store_true",
+        help=(
+            "additionally verify the Sigstore bundle for the wheel. Requires "
+            "`pip install sigstore`; without it the flag is a no-op with a "
+            "warning. The bundle is fetched from llm-speed.com/dist/ and "
+            "verified against the Fulcio cert + Rekor inclusion proof, with "
+            "the OIDC issuer + workflow identity bound to "
+            "meadow-kun/llm-speed's release-sign.yml."
         ),
     )
 
@@ -231,6 +252,10 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
         from .commands.detect import cmd_detect
 
         return cmd_detect(args)
+    if cmd == "doctor":
+        from .commands.doctor import cmd_doctor
+
+        return cmd_doctor(args)
     if cmd == "list-models":
         from .commands.list_models import cmd_list_models
 
@@ -263,8 +288,8 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
 def _cmd_mcp(args) -> int:
     """Boot the MCP server over stdio. Requires the [mcp] extra."""
     try:
-        from .mcp.server import mcp as mcp_app
         from .mcp import api as mcp_api
+        from .mcp.server import mcp as mcp_app
     except ImportError as exc:
         # The optional `mcp` SDK or `cachetools` aren't installed.
         # Tell the user the exact install command instead of a stack trace.

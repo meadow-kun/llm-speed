@@ -161,7 +161,7 @@ def _is_safe_https_url(url: str) -> bool:
     # Refuse any character that's a shell metachar on cmd.exe or POSIX shells.
     # Real URLs don't legitimately contain these — they'd be percent-encoded.
     for ch in url:
-        if ch in '"\'`$\\&|;<>(){}[]*?!\n\r\t':
+        if ch in "\"'`$\\&|;<>(){}[]*?!\n\r\t":
             return False
     return True
 
