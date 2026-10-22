@@ -1,9 +1,9 @@
 """Memory-fit sweep for day-one launches, wrapping `llm-speed bench` (shared engine).
 
-Moved into the CLI in 0.0.8 from Launch Lab's `launches/tools/fit_sweep.py`, which is
+Moved into the CLI in 0.0.8 from a standalone `launches/tools/fit_sweep.py`, which is
 now a thin deprecated wrapper around this module; `llm-speed bench --preset ...`
-(cli/commands/preset.py) drives the same `Sweep`. Stdlib only (plus the CLI itself). Runs on Boss's own machines (RTX 5090 Linux/WSL, Apple
-Silicon Macs). It never measures speed itself: every number comes from the team
+(cli/commands/preset.py) drives the same `Sweep`. Stdlib only (plus the CLI itself). Runs on the operator's own machine (e.g. NVIDIA on Linux/WSL,
+Apple Silicon Macs). It never measures speed itself: every number comes from the
 CLI (`llm-speed bench --json ...`). This script only:
 
   * downloads one model at a time (optional), checking free disk first,

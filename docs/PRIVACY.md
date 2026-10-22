@@ -62,9 +62,12 @@ holds: preset sweep id, model slug, GGUF basename (never a path), hardware slug 
 line (path-scrubbed, max 200 characters), decode/prefill tok/s, time to first token and to
 first answer, reasoning-token estimate, total and peak GPU memory, memory in use before the
 model loaded (and by other processes at start), file size, backend + llama.cpp build/commit,
-NVIDIA driver major or macOS major, and CLI version. It is uploaded only after the same
-consent as a run, signed the same way (an ephemeral key with `--strict-anon`), to
-`/v1/fit-attempts`; until the site accepts that route the rows stay on disk.
+NVIDIA driver major or macOS major, and CLI version. A manual `llm-speed bench --preset` run
+keeps these rows on disk only (there is no public fit-attempts upload route). Only machines
+running `llm-speed agent` (enrolled with a pairing code the queue operator approves, plus a
+one-time consent) send them, inside the job result to the queue they enrolled with; the
+official queue stores fit rows only from machines it approved as its own (community runners
+are switched off).
 
 ### Provenance
 
@@ -167,6 +170,28 @@ versioned).
   possible.
 - The server has no access to anything the CLI didn't put in the payload.
   Driver builds, PCI IDs, kernel patches, etc. are physically absent.
+
+---
+
+### Assistant apps: ChatGPT app, Claude connector and Custom GPT
+
+llm-speed offers read-only lookups for AI assistants: an MCP server at
+`https://api.llm-speed.com/mcp` (used by the llm-speed app in ChatGPT and by
+Claude connectors) and the same lookups as plain web requests
+(`/v1/can-it-run`, `/v1/speed`, `/v1/vram-fit`, described at `/openapi.json`)
+for the llm-speed Custom GPT.
+
+| Aspect | Value |
+|---|---|
+| What the assistant sends us | only the tool inputs: a model name, a GPU or Mac name, and optionally a quant, a memory size, a context size and which surface is calling (`app` or `gpt`) |
+| What we never receive | your conversation, your prompt text, your name, email or account, or any OpenAI/Anthropic user identifier. The assistant decides what to send; our tools accept no other fields and reject unknown ones |
+| Accounts / sign-in | none. No OAuth, no API key, no cookies |
+| What we store | nothing. The lookups don't write to our database and we don't log tool inputs ourselves |
+| Rate limiting | the same daily-salted, in-memory hashed-IP counter as above (§4), held for one minute; the requester is normally OpenAI's or Anthropic's server, not your device |
+| Platform logs | Cloudflare logs request metadata at the edge per its privacy policy, and our Worker's platform logging samples about 1 in 10 API requests (method, path and query string, status, timing) for debugging, kept for Cloudflare's short default retention. For the web-request version the query string contains the model and hardware names you asked about. We don't export or combine these logs |
+| Links in answers | links back to llm-speed.com carry `utm_source=chatgpt-app` or `utm_source=chatgpt-gpt` so our cookieless analytics (§8) can count visits from each surface. They identify the surface, never you |
+| What the answers contain | only already-published benchmark data: measured runs (labelled as measured by llm-speed or community-submitted) and fit tests. No hardware fingerprints, public keys or file paths |
+| The assistant provider | OpenAI and Anthropic handle your conversation under their own privacy policies. We have no access to it |
 
 ---
 
