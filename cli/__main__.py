@@ -95,10 +95,87 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print the exact JSON that would be uploaded (works with or without --dry-run)",
     )
     p_bench.add_argument(
+        "--llama-args",
+        action="append",
+        default=None,
+        metavar="ARGS",
+        help=(
+            "extra llama-server args, e.g. --llama-args='-c 4096 -ngl 999 --n-cpu-moe 20'. "
+            "Applied when llm-speed starts llama-server; with LLAMA_CPP_SERVER_URL they are "
+            "only recorded (declare what the external server runs with). Also "
+            "$LLM_SPEED_LLAMA_ARGS. Allowlisted flags and values are uploaded as a label; "
+            "anything else is redacted."
+        ),
+    )
+    p_bench.add_argument(
+        "--upload-failures",
+        action="store_true",
+        help=(
+            "also upload a run where the model failed to load (out of memory, unsupported "
+            "architecture, load timeout). Off by default; consent rules still apply."
+        ),
+    )
+    p_bench.add_argument(
+        "--preset",
+        default=None,
+        metavar="NAME",
+        help=(
+            "guided launch run, e.g. --preset flint-40b: detects the GPU, picks quants that "
+            "fit, downloads (resumable), runs 4K/16K/32K, records failures, then uploads "
+            "through the normal consent flow. Rerun to resume."
+        ),
+    )
+    p_bench.add_argument(
+        "--with-control",
+        action="store_true",
+        help="--preset: also run the preset's control model",
+    )
+    p_bench.add_argument(
+        "--models-dir",
+        default=None,
+        metavar="DIR",
+        help="--preset: where to look for / download model files (default ~/.cache/llm-speed/models)",
+    )
+    p_bench.add_argument(
+        "--llama-server",
+        default=None,
+        metavar="PATH",
+        help="--preset: llama-server binary to use",
+    )
+    p_bench.add_argument(
+        "--no-download",
+        action="store_true",
+        help="--preset: never download; use files already on disk",
+    )
+    p_bench.add_argument(
+        "--keep-models",
+        action="store_true",
+        help="--preset: never delete a model this preset downloaded, even when disk is tight",
+    )
+    p_bench.add_argument(
+        "--yes",
+        action="store_true",
+        help="--preset: answer yes to the llama.cpp install prompt",
+    )
+    p_bench.add_argument(
+        "--force",
+        action="store_true",
+        help="--preset: run even if the llama.cpp build number can't be confirmed",
+    )
+    p_bench.add_argument(
         "--resume",
         default=None,
         metavar="PATH",
         help="upload a previously-saved offline run from PATH (no fresh benchmark; verifies signature first)",
+    )
+
+    # preset -------------------------------------------------------------
+    p_preset = sub.add_parser(
+        "preset", help="inspect launch presets (hash for review-then-publish)"
+    )
+    p_preset.add_argument("preset_action", choices=["hash", "show", "list"])
+    p_preset.add_argument(
+        "name", nargs="?", default=None, help="preset name, e.g. flint-40b"
     )
 
     # detect -------------------------------------------------------------
@@ -248,6 +325,10 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
         from .commands.bench import cmd_bench
 
         return cmd_bench(args)
+    if cmd == "preset":
+        from .commands.preset import cmd_preset_tool
+
+        return cmd_preset_tool(args)
     if cmd == "detect":
         from .commands.detect import cmd_detect
 

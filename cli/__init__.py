@@ -10,5 +10,5 @@ top-level commands under `cli.commands`.
 # `version` in pyproject.toml (which is what PyPI / the wheel filename
 # / `llm-speed verify --pypi-cross-check` all use). Keeping them in
 # sync is a release-checklist item; if you change one, change both.
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 SUITE_VERSION = "suite-v1"

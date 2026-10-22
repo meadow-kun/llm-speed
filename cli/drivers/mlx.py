@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ..launch_telemetry import ReasoningTracker
 from ..registry import register_driver
 from ..timing import now_ms, stopwatch
 from ..types import (
@@ -31,7 +32,8 @@ _BACKEND_NAME = "mlx"
 # Heuristic regexes for parsing names that look like 'Qwen3-Coder-Next-30B-A3B-4bit'.
 _SIZE_RE = re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*[Bb](?![A-Za-z])")
 _QUANT_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:(\d+)\s*bit|q(\d+)|fp(\d+)|bf(\d+))", re.IGNORECASE
+    r"(?<![A-Za-z0-9])(?:(\d+)\s*bit|q(\d+)|fp(\d+)|bf(\d+)|int(\d+)|(nvfp4|mxfp4))",
+    re.IGNORECASE,
 )
 
 
@@ -53,6 +55,10 @@ def _parse_name_size_quant(label: str) -> tuple[str, str | None, str | None]:
             quant = f"FP{qm.group(3)}"
         elif qm.group(4):
             quant = f"BF{qm.group(4)}"
+        elif qm.group(5):
+            quant = f"INT{qm.group(5)}"
+        elif qm.group(6):
+            quant = qm.group(6).upper()
     return base, size, quant
 
 
@@ -63,6 +69,55 @@ class MlxDriver:
 
     def __init__(self) -> None:
         self._loaded: dict[str, tuple[Any, Any]] = {}
+        self._telemetry: list[dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # launch telemetry (0.0.8): peak memory + reasoning split
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _mx_core() -> Any | None:
+        try:
+            return importlib.import_module("mlx.core")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def reset_peak_memory(self) -> None:
+        mx = self._mx_core()
+        if mx is None:
+            return
+        for owner in (mx, getattr(mx, "metal", None)):
+            fn = getattr(owner, "reset_peak_memory", None) if owner else None
+            if callable(fn):
+                try:
+                    fn()
+                    return
+                except Exception:  # noqa: BLE001
+                    continue
+
+    def peak_memory_mib(self) -> float | None:
+        """MLX's own peak allocation (bytes → MiB) since the last reset. This is
+        the Metal working set MLX allocated, not total system memory pressure."""
+        mx = self._mx_core()
+        if mx is None:
+            return None
+        for owner in (mx, getattr(mx, "metal", None)):
+            fn = getattr(owner, "get_peak_memory", None) if owner else None
+            if callable(fn):
+                try:
+                    return float(fn()) / (1024.0 * 1024.0)
+                except Exception:  # noqa: BLE001
+                    continue
+        return None
+
+    def reset_run_telemetry(self) -> None:
+        self._telemetry = []
+
+    def pop_run_telemetry(self) -> list[dict[str, Any]]:
+        out, self._telemetry = self._telemetry, []
+        return out
+
+    def run_labels(self, model: ModelRef) -> dict[str, Any]:
+        return {}
 
     # ------------------------------------------------------------------
     # detection
@@ -303,6 +358,7 @@ class MlxDriver:
             with stopwatch() as wall:
                 start = now_ms()
                 last = start
+                tracker = ReasoningTracker(start)
                 try:
                     for piece in stream_generate(
                         backend_model,
@@ -319,6 +375,7 @@ class MlxDriver:
                         last = token_ts
                         if text:
                             output_pieces.append(text)
+                            tracker.feed(token_ts, content=text)
                         output_tokens += 1
                 except Exception as exc:  # noqa: BLE001
                     return ChatRunOutcome(
@@ -331,6 +388,7 @@ class MlxDriver:
                         wall_ms=wall[0],
                         error=f"stream_generate failed: {exc}",
                     )
+            self._telemetry.append(tracker.summary())
             return ChatRunOutcome(
                 success=True,
                 output_text="".join(output_pieces),
@@ -396,6 +454,7 @@ class MlxDriver:
     def _load(self, mlx_lm: Any, identifier: str) -> tuple[Any, Any]:
         if identifier in self._loaded:
             return self._loaded[identifier]
+        _check_arch_supported(mlx_lm, identifier)
         load = mlx_lm.load
         LOG.info("mlx loading %s", identifier)
         backend_model, tokenizer = load(identifier)
@@ -429,6 +488,69 @@ class MlxDriver:
         if isinstance(token, str):
             return token
         return ""
+
+
+def _config_path_for(identifier: str) -> Path | None:
+    """config.json for a local dir or an HF id already in the local HF cache."""
+    local = Path(identifier).expanduser()
+    if local.is_dir():
+        cfg = local / "config.json"
+        return cfg if cfg.exists() else None
+    if "/" not in identifier:
+        return None
+    hub = Path(
+        os.environ.get("HF_HUB_CACHE")
+        or Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+        / "hub"
+    )
+    repo = hub / ("models--" + identifier.replace("/", "--"))
+    snaps = repo / "snapshots"
+    if not snaps.exists():
+        return None
+    for snap in sorted(snaps.iterdir()):
+        cfg = snap / "config.json"
+        if cfg.exists():
+            return cfg
+    return None
+
+
+def _check_arch_supported(mlx_lm: Any, identifier: str) -> None:
+    """Fail fast (and legibly) when the installed mlx-lm has no module for the
+    model's `model_type`, instead of a deep stack trace after a 20 GB load.
+
+    Unknown / unreadable config → no opinion (mlx_lm.load decides).
+    """
+    cfg = _config_path_for(identifier)
+    if cfg is None:
+        return
+    try:
+        model_type = json.loads(cfg.read_text()).get("model_type")
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(model_type, str) or not re.fullmatch(
+        r"[A-Za-z0-9_]+", model_type
+    ):
+        return
+    remap: dict[str, str] = {}
+    for modname in ("mlx_lm.utils", "mlx_lm.models.base"):
+        try:
+            mod = importlib.import_module(modname)
+            got = getattr(mod, "MODEL_REMAPPING", None)
+            if isinstance(got, dict):
+                remap.update(got)
+        except Exception:  # noqa: BLE001
+            continue
+    target = remap.get(model_type, model_type)
+    try:
+        found = importlib.util.find_spec(f"mlx_lm.models.{target}") is not None
+    except (ImportError, ValueError):
+        found = False
+    if not found:
+        version = getattr(mlx_lm, "__version__", "unknown")
+        raise ValueError(
+            f"Model type {model_type} not supported by mlx-lm {version} "
+            f"(no mlx_lm.models.{target}); upgrade mlx-lm or install a build that adds it"
+        )
 
 
 register_driver(_BACKEND_NAME, lambda: MlxDriver())

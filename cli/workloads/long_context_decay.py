@@ -26,6 +26,21 @@ from .prompts.fixtures import build_prompt_of_chars
 LOG = logging.getLogger("cli.workloads.long-context-decay")
 
 CONTEXT_TOKEN_TARGETS: tuple[int, ...] = (32_000, 64_000, 128_000)
+
+
+def _context_targets() -> tuple[int, ...]:
+    """$LLM_SPEED_DECAY_CTX="32768" or "131072" runs only those points (fit sweep / --preset
+    use it for one decay step per context); default is the suite's three points."""
+    import os
+
+    raw = os.environ.get("LLM_SPEED_DECAY_CTX", "").strip()
+    try:
+        pts = tuple(int(x) for x in raw.split(",") if x.strip())
+    except ValueError:
+        pts = ()
+    return tuple(p for p in pts if 1024 <= p <= 1_048_576) or CONTEXT_TOKEN_TARGETS
+
+
 OUTPUT_TOKENS = 256
 INSTRUCTION = "\n\n---\n\nBriefly summarize the document above in three sentences."
 
@@ -140,7 +155,7 @@ class LongContextDecayWorkload:
         last_wall_ms = 0.0
         first_point: dict[str, Any] | None = None
 
-        for ctx in CONTEXT_TOKEN_TARGETS:
+        for ctx in _context_targets():
             if max_ctx is not None and ctx > max_ctx:
                 LOG.info("skip ctx=%d (model max_ctx=%d)", ctx, max_ctx)
                 curve.append(
