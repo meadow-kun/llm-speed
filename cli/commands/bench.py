@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -29,6 +30,14 @@ from .. import SUITE_VERSION, __version__
 from ..config import DEFAULT_API_BASE, DEFAULT_WORKLOADS, QUICK_WORKLOADS
 from ..consent import has_consented, prompt_for_consent
 from ..fingerprint import detect_fingerprint
+from ..launch_telemetry import (
+    FAILURE_SKIPPED,
+    NvidiaVramSampler,
+    classify_failure,
+    is_load_failure,
+    parse_server_args,
+    round_mib,
+)
 from ..output import get_console, print_error, print_run_summary, print_warning
 from ..registry import all_driver_names, all_workload_names, get_driver, get_workload
 from ..signing import sign_report_jws as _sign_validate
@@ -40,6 +49,7 @@ from ..upload import (
     upload_saved_payload,
     warn_if_insecure_api_base,
 )
+from ..upload_guard import offline, upload_block_reason
 
 log = logging.getLogger("cli.commands.bench")
 
@@ -94,10 +104,9 @@ def _resolve_model(driver, explicit: str | None) -> ModelRef | None:
         for m in models:
             if explicit in (m.identifier, m.name):
                 return m
-        # Couldn't match in catalog; trust the user.
-        return ModelRef(
-            backend=getattr(driver, "name", "?"), identifier=explicit, name=explicit
-        )
+        # Couldn't match in catalog; trust the user, but never use a path as the
+        # display name (0.0.8 privacy fix: model.name used to carry the full path).
+        return _model_ref_from_path(getattr(driver, "name", "?"), explicit)
 
     try:
         models = driver.list_models()
@@ -111,6 +120,25 @@ def _resolve_model(driver, explicit: str | None) -> ModelRef | None:
         )
         return None
     return models[0]
+
+
+def _model_ref_from_path(backend: str, explicit: str) -> ModelRef:
+    from pathlib import PurePath
+
+    from ..pathscrub import looks_like_path
+
+    is_path = looks_like_path(explicit) or explicit.lower().endswith(".gguf")
+    base = PurePath(explicit.replace("\\", "/")).name if is_path else explicit
+    name, quant = base, None
+    if base.lower().endswith(".gguf"):
+        from ..drivers.llama_cpp import _quant_from_name, _strip_quant
+
+        name, quant = _strip_quant(base) or base, _quant_from_name(base)
+    elif is_path and backend == "mlx":
+        from ..drivers.mlx import _parse_name_size_quant
+
+        name, _size, quant = _parse_name_size_quant(base)
+    return ModelRef(backend=backend, identifier=explicit, name=name, quant=quant)
 
 
 def _select_workloads(arg_workload: str | None, quick: bool) -> list[str]:
@@ -134,6 +162,79 @@ def _failed_result(
     )
 
 
+def _llama_args(args) -> list[str]:
+    raw: list[str] = []
+    env = os.environ.get("LLM_SPEED_LLAMA_ARGS", "").strip()
+    if env:
+        raw.append(env)
+    raw += list(getattr(args, "llama_args", None) or [])
+    return parse_server_args(raw)
+
+
+def _start_memory_probe(driver, fp) -> NvidiaVramSampler | None:
+    """Reset the driver's own peak counter (MLX) and/or start sampling nvidia-smi."""
+    reset = getattr(driver, "reset_peak_memory", None)
+    if callable(reset):
+        try:
+            reset()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("reset_peak_memory failed: %s", exc)
+        return None
+    has_nvidia = any(getattr(g, "kind", "") == "nvidia" for g in (fp.gpus or []))
+    if has_nvidia and NvidiaVramSampler.available():
+        try:
+            return NvidiaVramSampler().start()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("vram sampler failed to start: %s", exc)
+    return None
+
+
+def _finish_memory_probe(driver, sampler: NvidiaVramSampler | None) -> dict:
+    if sampler is not None:
+        peak = sampler.stop()
+        if peak is not None:
+            return {
+                "peak_vram_mib": round_mib(peak),
+                "peak_vram_source": NvidiaVramSampler.SOURCE,
+            }
+        return {}
+    getter = getattr(driver, "peak_memory_mib", None)
+    if callable(getter):
+        try:
+            peak = getter()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("peak_memory_mib failed: %s", exc)
+            peak = None
+        if peak:
+            return {
+                "peak_vram_mib": round_mib(peak),
+                "peak_vram_source": "mlx-peak-memory",
+            }
+    return {}
+
+
+def _attach_launch_telemetry(res: WorkloadResult, driver, model, mem: dict) -> None:
+    """Fold 0.0.8 launch fields into res.extras (see launch_telemetry.UPLOADED_EXTRAS_KEYS)."""
+    extras = dict(res.extras or {})
+    extras.update(mem)
+    pop = getattr(driver, "pop_run_telemetry", None)
+    telemetry = pop() if callable(pop) else []
+    # Only single-stream workloads have one unambiguous "first answer".
+    if res.error is None and len(telemetry) == 1:
+        extras.update(telemetry[0])
+    labels = getattr(driver, "run_labels", None)
+    if callable(labels):
+        try:
+            extras.update(labels(model))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("run_labels failed: %s", exc)
+    if res.error:
+        extras["failure_kind"] = extras.get("failure_kind") or classify_failure(
+            res.error
+        )
+    res.extras = extras
+
+
 def _handle_resume(args) -> int:
     """--resume PATH: read a saved offline run, verify, upload."""
     console = get_console()
@@ -151,6 +252,14 @@ def _handle_resume(args) -> int:
     api_key = getattr(args, "api_key", None)
     anon = getattr(args, "anon", False) or getattr(args, "strict_anon", False)
 
+    blocked = (
+        "--no-upload"
+        if getattr(args, "no_upload", False)
+        else upload_block_reason(api_base)
+    )
+    if blocked:
+        print_error(f"not uploading {path.name}: {blocked}")
+        return 1
     if not anon:
         warn_if_insecure_api_base(api_base, api_key)
 
@@ -160,6 +269,7 @@ def _handle_resume(args) -> int:
             api_base=api_base,
             api_key=api_key,
             anon=anon,
+            strict_anon=getattr(args, "strict_anon", False),
         )
     except Exception as exc:
         print_error(f"resume upload failed: {exc}")
@@ -173,6 +283,17 @@ def cmd_bench(args) -> int:
     # --resume short-circuits everything else.
     if getattr(args, "resume", None):
         return _handle_resume(args)
+    # --preset NAME: guided multi-step run (cli/commands/preset.py).
+    if getattr(args, "preset", None):
+        from .preset import cmd_preset
+
+        try:
+            return cmd_preset(args)
+        except KeyboardInterrupt:
+            print_error(
+                f"interrupted; rerun `llm-speed bench --preset {args.preset}` to resume"
+            )
+            return 130
 
     console = get_console()
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -181,7 +302,12 @@ def cmd_bench(args) -> int:
     dry_run = getattr(args, "dry_run", False)
     print_payload = getattr(args, "print_payload", False)
     json_path = getattr(args, "json", None)
-    no_upload = getattr(args, "no_upload", False) or json_path is not None or dry_run
+    no_upload = (
+        getattr(args, "no_upload", False)
+        or json_path is not None
+        or dry_run
+        or offline()
+    )
     api_base = getattr(args, "api_base", None) or DEFAULT_API_BASE
     api_key = getattr(args, "api_key", None)
     # --strict-anon implies --anon for the soft headers fallback path.
@@ -249,6 +375,16 @@ def cmd_bench(args) -> int:
         print_error(str(exc))
         return 1
 
+    # llama-server passthrough args (e.g. --n-cpu-moe 20 for MoE expert offload).
+    server_args = _llama_args(args)
+    if server_args:
+        if hasattr(driver, "server_args"):
+            driver.server_args = server_args
+        else:
+            print_warning(
+                f"--llama-args ignored: backend {backend_name!r} does not take llama-server args"
+            )
+
     # Try to capture backend version from detection.
     backend_version: str | None = None
     try:
@@ -300,11 +436,34 @@ def cmd_bench(args) -> int:
     console.print(
         f"[bold]Running[/bold] {len(workload_names)} workloads on [cyan]{backend_name}[/cyan] / [magenta]{model.name or model.identifier}[/magenta]"
     )
+    load_failure: WorkloadResult | None = None
     for wname in workload_names:
         console.print(f"  - {wname} ...", end="")
+        if load_failure is not None:
+            # The model could not be loaded (OOM / unsupported arch / timeout):
+            # every later workload would fail the same way after another long
+            # load attempt. Record them as skipped instead.
+            skipped = _failed_result(
+                wname,
+                model,
+                backend_name,
+                f"skipped: model failed to load ({(load_failure.extras or {}).get('failure_kind')})",
+            )
+            skipped.extras = {"failure_kind": FAILURE_SKIPPED}
+            results.append(skipped)
+            console.print(" [yellow]skipped[/yellow] (model failed to load)")
+            continue
+        reset_tel = getattr(driver, "reset_run_telemetry", None)
+        if callable(reset_tel):
+            reset_tel()
+        sampler = _start_memory_probe(driver, fp)
         try:
             wl = get_workload(wname)
-            res = wl.run(driver, model)
+            try:
+                res = wl.run(driver, model)
+            finally:
+                mem = _finish_memory_probe(driver, sampler)
+                sampler = None
             if not isinstance(res, WorkloadResult):
                 # Defensive: a workload returned something weird.
                 res = _failed_result(
@@ -317,6 +476,9 @@ def cmd_bench(args) -> int:
             # fill it in here so summary tables and uploaded JSON show it.
             if res.backend_version is None and backend_version is not None:
                 res.backend_version = backend_version
+            _attach_launch_telemetry(res, driver, model, mem)
+            if is_load_failure((res.extras or {}).get("failure_kind")):
+                load_failure = res
             results.append(res)
             if res.error:
                 console.print(f" [red]error:[/red] {res.error[:80]}")
@@ -328,11 +490,13 @@ def cmd_bench(args) -> int:
             log.debug("workload %s raised: %s", wname, exc, exc_info=True)
             if getattr(args, "verbose", False):
                 traceback.print_exc()
-            results.append(
-                _failed_result(
-                    wname, model, backend_name, f"{type(exc).__name__}: {exc}"
-                )
+            if sampler is not None:
+                sampler.stop()
+            failed = _failed_result(
+                wname, model, backend_name, f"{type(exc).__name__}: {exc}"
             )
+            failed.extras = {"failure_kind": classify_failure(failed.error)}
+            results.append(failed)
             console.print(f" [red]exception:[/red] {exc}")
 
     finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -379,7 +543,13 @@ def cmd_bench(args) -> int:
         offline_path = save_offline(report, strict_anon=strict_anon)
 
         has_measurement = any(r.error is None for r in results)
-        if not no_upload and not has_measurement:
+        # --upload-failures (opt-in): publish a run whose only content is a
+        # classified load failure (OOM / unsupported arch / load timeout), so
+        # "does not fit" is a recorded result rather than a missing one.
+        upload_failures = getattr(args, "upload_failures", False) and any(
+            is_load_failure((r.extras or {}).get("failure_kind")) for r in results
+        )
+        if not no_upload and not has_measurement and not upload_failures:
             # Never publish a run where every workload errored (e.g. the model
             # failed to load): it carries no measurement and would only create an
             # aggregation-excluded orphan on the API. The local save above keeps
@@ -387,6 +557,10 @@ def cmd_bench(args) -> int:
             console.print(
                 "[yellow]Skipping upload:[/yellow] every workload errored "
                 "(no measurement to publish). Saved locally for inspection."
+            )
+        elif not no_upload and upload_block_reason(api_base):
+            console.print(
+                f"[yellow]Not uploading:[/yellow] {upload_block_reason(api_base)}. Result saved locally."
             )
         elif not no_upload:
             # Consent gate. Strict-anon implicitly consents (most private option).

@@ -348,6 +348,24 @@ def _detect_gpus() -> list[GpuInfo]:
 # ---------------------------------------------------------------------------
 
 
+def _windows_cpu_name() -> str | None:
+    try:
+        import winreg  # type: ignore[import-not-found]
+
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+        )
+        try:
+            val, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+        finally:
+            winreg.CloseKey(key)
+        val = str(val).strip()
+        return val or None
+    except Exception as exc:  # noqa: BLE001 - best effort, never fatal
+        log.debug("winreg CPU name read failed: %s", exc)
+        return None
+
+
 def _detect_cpu_model() -> str:
     sysname = platform.system()
     if sysname == "Linux":
@@ -364,6 +382,13 @@ def _detect_cpu_model() -> str:
         if out:
             return out.strip()
     elif sysname == "Windows":
+        # platform.processor() on Windows is the raw CPUID string
+        # ("AMD64 Family 23 Model 104 Stepping 1, AuthenticAMD"), and wmic is
+        # gone on current Windows 11, so read the marketing name from the
+        # registry first.
+        name = _windows_cpu_name()
+        if name:
+            return name
         out = _run(["wmic", "cpu", "get", "name"])
         if out:
             for line in out.splitlines():
@@ -696,13 +721,22 @@ def detect_fingerprint() -> Fingerprint:
 # ---------------------------------------------------------------------------
 
 
+def _driver_major(version: str | None) -> str | None:
+    """Major GPU driver version only ("580.65.06" -> "580"). Not part of the
+    fingerprint hash, so class-level clustering is unchanged (0.0.8)."""
+    if not version:
+        return None
+    m = re.match(r"\s*(\d{1,4})\b", str(version))
+    return m.group(1) if m else None
+
+
 def to_uploadable_dict(fp: Fingerprint, *, strict_anon: bool = False) -> dict[str, Any]:
     """Serialize a Fingerprint with only the privacy-safe subset of fields.
 
     Default mode includes:
       - os_name, os_version (major only), cpu_model, cpu_cores
       - ram_gb bucketed to nearest 8 GB
-      - per-GPU: name, kind, memory_gb (bucketed). NO driver_version, NO pci_bus_id.
+      - per-GPU: name, kind, memory_gb (bucketed), driver_major (0.0.8; e.g. "580"). NO full driver_version, NO pci_bus_id.
       - accelerator_summary
       - fingerprint_hash (class-level over the same trimmed fields)
       - extras: only `backends`. NO power, macos_version, distro, thermal.
@@ -720,7 +754,12 @@ def to_uploadable_dict(fp: Fingerprint, *, strict_anon: bool = False) -> dict[st
         "cpu_model": fp.cpu_model,
         "cpu_cores": fp.cpu_cores,
         "ram_gb": _round_ram_gb(fp.ram_gb),
-        "gpus": _trimmed_gpu_dicts(fp.gpus),
+        "gpus": [
+            {**d, "driver_major": _driver_major(g.driver_version)}
+            if _driver_major(g.driver_version)
+            else d
+            for g, d in zip(fp.gpus, _trimmed_gpu_dicts(fp.gpus), strict=True)
+        ],
         "accelerator_summary": fp.accelerator_summary,
         "extras": extras_out,
     }

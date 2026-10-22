@@ -45,6 +45,26 @@ For each workload (W1..W5):
 | `prefix_cache_hit_rate` | when backend exposes it |
 | `error`, `flags` | captured failure mode + thermal/battery flags |
 | `extras` | small backend-specific telemetry; capped at 256 chars per string field by the client-side privacy invariant (see below) |
+| `extras.failure_kind` (0.0.8) | enum describing why a workload failed (`oom`, `unsupported_arch`, ...); failure-only runs upload only with `--upload-failures` |
+| `extras.peak_vram_mib`, `extras.peak_vram_source` (0.0.8) | peak GPU / MLX memory during the workload, rounded to 16 MiB (no total VRAM, which stays bucketed) |
+| `extras.time_to_first_answer_ms`, `extras.reasoning_tokens_est`, `extras.answer_started` (0.0.8) | timing of the first non-reasoning token; no text is uploaded |
+| `extras.llama_cpp_build`, `extras.llama_cpp_commit`, `extras.llama_cpp_build_source` (0.0.8) | exact llama.cpp build the numbers came from |
+| `extras.llama_server_args` (0.0.8) | allowlisted llama-server flags and values (e.g. `-c 4096 --n-cpu-moe 20`); other flags and path-like values are redacted |
+| `extras.model_file`, `extras.model_file_bytes` (0.0.8) | GGUF file basename (already sent as `model.identifier`) and its size |
+
+### Fit attempts (`--preset` only, 0.0.8)
+
+`llm-speed bench --preset` also keeps one row per attempt (model file, quant, context)
+in `fit_attempts.json`, so failures count as evidence ("does not fit at 16K"). The row
+holds: preset sweep id, model slug, GGUF basename (never a path), hardware slug (e.g.
+`rtx-5090`, `m3-ultra-96gb`; never the hostname), GPU/chip name, quant, context, GPU layers,
+`--n-cpu-moe`, status (`ok` / `oom` / `failed` / `skipped`) and error type, a short error
+line (path-scrubbed, max 200 characters), decode/prefill tok/s, time to first token and to
+first answer, reasoning-token estimate, total and peak GPU memory, memory in use before the
+model loaded (and by other processes at start), file size, backend + llama.cpp build/commit,
+NVIDIA driver major or macOS major, and CLI version. It is uploaded only after the same
+consent as a run, signed the same way (an ephemeral key with `--strict-anon`), to
+`/v1/fit-attempts`; until the site accepts that route the rows stay on disk.
 
 ### Provenance
 
@@ -149,6 +169,40 @@ versioned).
   Driver builds, PCI IDs, kernel patches, etc. are physically absent.
 
 ---
+
+### Run requests and email updates
+
+**Run requests.** When you press "Request this run" we store the model and
+hardware you picked (and optional quantization or runtime), a vote count, and
+when the request was created and last voted on. We don't store your IP
+address: abuse limits use a short-lived, daily-salted hash of it held in
+Worker memory only, as described above. Requests may be protected by
+Cloudflare Turnstile.
+
+**Email is always optional.** You can request a run or download the dataset
+without giving one.
+
+What we collect, and why:
+
+- *"Get an email when this run is live."* If you enter an address on a
+  request, we store it with the request so we can send you one notice when that
+  run is published. After that notice is sent, the address is deleted unless
+  you also ticked the box below.
+- *"Also send me new benchmark results (about monthly, unsubscribe anytime)"*
+  on the request form, or *"Get dataset updates"* on the data page. This box
+  is unticked by default. Only if you tick it do we add your address to our
+  update list, recording that you opted in, when, and the exact wording you
+  agreed to. Nobody gets updates without that tick.
+
+Retention: notice-only addresses are deleted after the notice is sent. Update
+list addresses are kept until you unsubscribe. Every email we send carries a
+personal unsubscribe link; using it deletes your address from the list and from
+any pending request notices straight away. You can also ask for deletion at
+privacy@llm-speed.com.
+
+We never sell, rent or share your email address, and we use it for nothing
+other than the purposes above. The sending provider we use (when sending is
+switched on) processes addresses only to deliver our mail.
 
 ## 5. How to inspect what's sent
 

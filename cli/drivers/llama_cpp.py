@@ -31,6 +31,13 @@ from typing import Any
 
 import httpx
 
+from ..config import CACHE_DIR
+from ..launch_telemetry import (
+    ReasoningTracker,
+    label_server_args,
+    model_file_label,
+    parse_llama_build,
+)
 from ..registry import register_driver
 from ..timing import now_ms
 from ..types import (
@@ -42,10 +49,34 @@ from ..types import (
 LOG = logging.getLogger("cli.drivers.llama_cpp")
 
 DEFAULT_HOST = "127.0.0.1"
-SERVER_BOOT_TIMEOUT_S = 60.0
+
+
+def _boot_timeout_s() -> float:
+    """Big GGUFs (25 GB+) on slow disks need minutes to load; 60 s was too short."""
+    try:
+        return float(os.environ.get("LLM_SPEED_LLAMA_BOOT_TIMEOUT_S", "600"))
+    except ValueError:
+        return 600.0
+
+
+SERVER_BOOT_TIMEOUT_S = _boot_timeout_s()
+SERVER_LOG_TAIL_BYTES = 16 * 1024
 SERVER_HEALTH_POLL_S = 0.25
 REQUEST_TIMEOUT_S = 600.0  # generation can be long
 CHUNK_READ_TIMEOUT_S = 30.0  # but a single SSE chunk must not stall
+# llama-server sends nothing until prefill finishes, so the first read must allow
+# for the prompt: assume prefill no slower than this many tokens/s (~3.5 chars each).
+MIN_PREFILL_TPS = 50.0
+MAX_READ_TIMEOUT_S = 3600.0
+
+
+def read_timeout_for_prompt(prompt_chars: int) -> float:
+    """Per-read timeout that scales with prompt length (CLI_ISSUES #9): 30 s for
+    short prompts, ~12 min for a 128K-token prompt, capped at an hour."""
+    est_tokens = max(0, prompt_chars) / 3.5
+    return min(MAX_READ_TIMEOUT_S, CHUNK_READ_TIMEOUT_S + est_tokens / MIN_PREFILL_TPS)
+
+
 DIGEST_BYTES = 256 * 1024  # 256KB sha256 prefix
 
 _BUILD_FLAG_PATTERNS = (
@@ -60,7 +91,7 @@ _BUILD_FLAG_PATTERNS = (
 
 # Quant suffix in GGUF filenames: foo-Q4_K_M.gguf, foo.IQ3_XXS.gguf, etc.
 _QUANT_RE = re.compile(
-    r"[-._](Q[0-9][^.\-/]*|IQ[0-9][^.\-/]*|F16|F32|BF16|FP8)\b",
+    r"[-._]((?:UD-)?(?:Q[0-9][^.\-/]*|IQ[0-9][^.\-/]*)|F16|F32|BF16|FP8|NVFP4|MXFP4)\b",
     re.IGNORECASE,
 )
 
@@ -93,7 +124,7 @@ def _parse_version_output(text: str) -> tuple[str | None, list[str]]:
     if m:
         version = m.group(1).strip()
     else:
-        m2 = re.search(r"\b(b\d{3,5}|\d+\.\d+(?:\.\d+)?)\b", text)
+        m2 = re.search(r"\b(b\d{3,}|\d+\.\d+(?:\.\d+)?)\b", text)
         if m2:
             version = m2.group(1)
 
@@ -155,6 +186,39 @@ class _ServerHandle:
     port: int
     base_url: str
     model_path: str
+    log_path: Path | None = None
+
+
+# Lines in llama-server's log that explain why it died, most specific first.
+_SERVER_ERROR_HINTS = re.compile(
+    r"out of memory|cudaMalloc failed|failed to allocate|unable to allocate|"
+    r"alloc_buffer|unknown model architecture|failed to load model|"
+    r"error loading model|exception|error:",
+    re.IGNORECASE,
+)
+
+
+def _server_log_reason(log_path: Path | None) -> str | None:
+    """Best single line from the tail of the llama-server log, or None."""
+    if log_path is None:
+        return None
+    try:
+        with log_path.open("rb") as fp:
+            fp.seek(0, os.SEEK_END)
+            size = fp.tell()
+            fp.seek(max(0, size - SERVER_LOG_TAIL_BYTES))
+            tail = fp.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    hits = [ln for ln in lines if _SERVER_ERROR_HINTS.search(ln)]
+    if not hits:
+        return None
+    # Prefer a memory / architecture line over the generic final error.
+    for ln in hits:
+        if re.search(r"memory|alloc|architecture", ln, re.IGNORECASE):
+            return ln[:200]
+    return hits[-1][:200]
 
 
 class LlamaCppDriver:
@@ -163,6 +227,15 @@ class LlamaCppDriver:
     def __init__(self) -> None:
         self._server: _ServerHandle | None = None
         self._client: httpx.Client | None = None
+        # Extra llama-server args from `llm-speed bench --llama-args` /
+        # $LLM_SPEED_LLAMA_ARGS. Applied when we spawn the server; recorded as a
+        # declared label when reusing an external server (LLAMA_CPP_SERVER_URL).
+        self.server_args: list[str] = []
+        self._version_text: str | None = None
+        self._props_build_info: str | None = None
+        self._props_n_ctx: int | None = None
+        self._props_fetched = False
+        self._telemetry: list[dict[str, Any]] = []
         # Make sure we always tear down on interpreter exit.
         atexit.register(self.close)
 
@@ -198,6 +271,8 @@ class LlamaCppDriver:
                 )
                 blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
                 v, f = _parse_version_output(blob)
+                if v and self._version_text is None:
+                    self._version_text = blob
                 version = version or v
                 for flag in f:
                     if flag not in flags:
@@ -311,13 +386,22 @@ class LlamaCppDriver:
 
         t_start = now_ms()
         last_chunk_ms = t_start
+        tracker = ReasoningTracker(t_start)
 
         try:
             with self._client.stream(
                 "POST",
                 url,
                 json=payload,
-                timeout=httpx.Timeout(REQUEST_TIMEOUT_S, read=CHUNK_READ_TIMEOUT_S),
+                timeout=httpx.Timeout(
+                    REQUEST_TIMEOUT_S,
+                    read=read_timeout_for_prompt(
+                        sum(
+                            len(str(m.get("content") or ""))
+                            for m in payload.get("messages") or []
+                        )
+                    ),
+                ),
             ) as resp:
                 if resp.status_code != 200:
                     body = resp.read().decode("utf-8", errors="replace")
@@ -351,9 +435,11 @@ class LlamaCppDriver:
                         # before the visible `content`. Both are real
                         # GPU-generated tokens; counting only one
                         # under-reports decode tps.
-                        delta_text = (delta.get("content") or "") + (
-                            delta.get("reasoning_content") or ""
-                        )
+                        content = delta.get("content") or ""
+                        reasoning = delta.get("reasoning_content") or ""
+                        delta_text = content + reasoning
+                        if delta_text:
+                            tracker.feed(now, content=content, reasoning=reasoning)
                     if delta_text:
                         if ttft_ms is None:
                             ttft_ms = now - t_start
@@ -373,6 +459,7 @@ class LlamaCppDriver:
 
         wall_ms = now_ms() - t_start
         text = "".join(out_text_parts)
+        self._telemetry.append(tracker.summary())
         if not output_tokens:
             # token_times is len-of-output minus 1 (the first token's wait is ttft).
             output_tokens = (len(token_times) + 1) if ttft_ms is not None else 0
@@ -444,6 +531,7 @@ class LlamaCppDriver:
                 proc=None, port=0, base_url=base_url, model_path=model_path
             )
             self._client = httpx.Client(timeout=REQUEST_TIMEOUT_S)
+            self._fetch_props(base_url)
             return
 
         if self._server is not None and self._server.model_path == model_path:
@@ -472,7 +560,6 @@ class LlamaCppDriver:
             DEFAULT_HOST,
             "--port",
             str(port),
-            "--log-disable",
         ]
 
         # Configurable extras → CLI flags.
@@ -484,27 +571,116 @@ class LlamaCppDriver:
             cmd += ["--n-gpu-layers", str(int(extras["n_gpu_layers"]))]
         if extras.get("flash_attn"):
             cmd += ["--flash-attn"]
+        cmd += list(self.server_args)
+
+        # Keep the server log (local only, never uploaded) so a load / OOM failure
+        # is recorded with its reason instead of a bare exit code.
+        log_path: Path | None = None
+        log_fp = None
+        try:
+            log_dir = CACHE_DIR / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            log_path = log_dir / "llama-server-last.log"
+            log_fp = log_path.open("wb")
+        except OSError as exc:
+            LOG.debug("could not open llama-server log: %s", exc)
+            log_path, log_fp = None, None
 
         LOG.info("starting llama-server: %s", " ".join(cmd))
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_fp or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if log_fp else subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            if log_fp is not None:
+                log_fp.close()
         try:
             self._wait_ready(base_url, proc)
-        except Exception:
+        except Exception as exc:
             try:
                 proc.terminate()
             except OSError:
                 pass
+            reason = _server_log_reason(log_path)
+            if reason:
+                raise RuntimeError(f"{exc}: {reason}") from exc
             raise
 
         self._server = _ServerHandle(
-            proc=proc, port=port, base_url=base_url, model_path=model_path
+            proc=proc,
+            port=port,
+            base_url=base_url,
+            model_path=model_path,
+            log_path=log_path,
         )
         self._client = httpx.Client(timeout=REQUEST_TIMEOUT_S)
+        self._fetch_props(base_url)
+
+    # ---------------------------------------------------------- labels/telemetry
+
+    def _fetch_props(self, base_url: str) -> None:
+        """`GET /props` carries `build_info` ("b11803-abc1234") for the server that
+        is actually answering, which beats the local binary's --version when the
+        server is external."""
+        if self._props_fetched:
+            return
+        self._props_fetched = True
+        try:
+            r = httpx.get(f"{base_url}/props", timeout=5.0)
+            if r.status_code == 200:
+                props = r.json()
+                info = props.get("build_info")
+                if isinstance(info, str) and info:
+                    self._props_build_info = info[:80]
+                gs = props.get("default_generation_settings") or {}
+                n_ctx = gs.get("n_ctx") or props.get("n_ctx")
+                if isinstance(n_ctx, int) and n_ctx > 0:
+                    self._props_n_ctx = n_ctx
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            LOG.debug("/props probe failed: %s", exc)
+
+    def reset_run_telemetry(self) -> None:
+        self._telemetry = []
+
+    def pop_run_telemetry(self) -> list[dict[str, Any]]:
+        out, self._telemetry = self._telemetry, []
+        return out
+
+    def run_labels(self, model: ModelRef) -> dict[str, Any]:
+        """Publishable labels for this run: exact build, passthrough args, GGUF file."""
+        labels: dict[str, Any] = {}
+        build = parse_llama_build(self._props_build_info)
+        source = "server-props"
+        if not build["commit"] and not build["build"]:
+            build = parse_llama_build(self._version_text)
+            source = "llama-server --version"
+        if build["build"] or build["commit"]:
+            labels["llama_cpp_build"] = build["build"]
+            labels["llama_cpp_commit"] = build["commit"]
+            labels["llama_cpp_build_source"] = source
+        if self._props_n_ctx:
+            labels["server_n_ctx"] = self._props_n_ctx
+        args_label = label_server_args(self.server_args)
+        if args_label:
+            external = bool(os.environ.get("LLAMA_CPP_SERVER_URL", "").strip())
+            labels["llama_server_args"] = (
+                f"declared: {args_label}" if external else args_label
+            )
+        fname = model_file_label(model.identifier)
+        if fname:
+            labels["model_file"] = fname
+            size = (model.extras or {}).get("size_bytes")
+            if not isinstance(size, int):
+                try:
+                    size = Path(model.identifier).stat().st_size
+                except OSError:
+                    size = None
+            if isinstance(size, int):
+                labels["model_file_bytes"] = size
+        return labels
 
     def _wait_ready(self, base_url: str, proc: subprocess.Popen) -> None:
         deadline = time.monotonic() + SERVER_BOOT_TIMEOUT_S
@@ -524,7 +700,10 @@ class LlamaCppDriver:
                     except httpx.HTTPError:
                         pass
                 time.sleep(SERVER_HEALTH_POLL_S)
-        raise RuntimeError("llama-server did not become ready in time")
+        raise RuntimeError(
+            f"llama-server did not become ready in time ({SERVER_BOOT_TIMEOUT_S:.0f}s; "
+            "raise LLM_SPEED_LLAMA_BOOT_TIMEOUT_S for very large models)"
+        )
 
     def close(self) -> None:
         if self._client is not None:

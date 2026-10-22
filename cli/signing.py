@@ -33,6 +33,7 @@ from joserfc.jwk import OKPKey
 
 from .config import CONFIG_DIR
 from .fingerprint import to_uploadable_dict
+from .pathscrub import scrub_payload
 from .types import RunReport
 
 log = logging.getLogger("cli.signing")
@@ -263,6 +264,10 @@ def _sanitize_error_string(s: str, *, max_len: int = 256) -> str:
     `C:\\Users\\<user>\\...` (Windows). The username segment is the leak."""
     import re
 
+    from .pathscrub import scrub_paths
+
+    # 0.0.8: any path (home or not) collapses to its basename first.
+    s = scrub_paths(s)
     # macOS / Linux: /Users/<u>/... or /home/<u>/...
     s = re.sub(r"/(?:Users|home)/[^/\s]+", "~", s)
     # Windows: C:\Users\<u>\... (any drive letter)
@@ -295,16 +300,24 @@ def build_uploadable_report(
     import secrets as _secrets
     import time as _time
 
-    return {
-        "suite_version": report.suite_version,
-        "cli_version": report.cli_version,
-        "fingerprint": fp_dict,
-        "results": results_out,
-        "started_at": report.started_at,
-        "finished_at": report.finished_at,
-        "iat": int(_time.time() * 1000),
-        "nonce": _secrets.token_urlsafe(16),  # 22 chars → fits server's 16..64 bound
-    }
+    # 0.0.8 (release-blocking privacy fix): no filesystem path may leave the
+    # machine in any field, including the local-save copy (which is built here
+    # too). Paths collapse to their basename; home dirs/usernames never survive.
+    payload = scrub_payload(
+        {
+            "suite_version": report.suite_version,
+            "cli_version": report.cli_version,
+            "fingerprint": fp_dict,
+            "results": results_out,
+            "started_at": report.started_at,
+            "finished_at": report.finished_at,
+        }
+    )
+    payload["iat"] = int(_time.time() * 1000)
+    payload["nonce"] = _secrets.token_urlsafe(
+        16
+    )  # 22 chars → fits server's 16..64 bound
+    return payload
 
 
 # ---------------------------------------------------------------------------

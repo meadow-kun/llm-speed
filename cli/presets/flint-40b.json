@@ -1,0 +1,211 @@
+{
+  "schema": "llm-speed-preset/1",
+  "preset": "flint-40b",
+  "version": 1,
+  "title": "Flint 40B-A2.5B (MoE, 2.5B active)",
+  "launch": "flint-40b-a2-5b",
+  "_source": "Repos, pinned revisions, sizes and sha256 copied from Launch Lab's launches/flint-40b-a2-5b/plan-rtx5090.json and plan-mac.json (2026-10-22). Edit names here; no code change needed.",
+  "min_llama_build": 11803,
+  "min_llama_build_why": "Flint support (and NVFP4 CUDA kernels) landed in llama.cpp release b11803",
+  "contexts": [
+    4096,
+    16384,
+    32768
+  ],
+  "workloads_by_ctx": {
+    "0": "chat-short",
+    "16384": "chat-short,chat-long"
+  },
+  "server_args": [
+    "--parallel",
+    "1",
+    "--no-cache-prompt",
+    "--cache-ram",
+    "0",
+    "--temp",
+    "0",
+    "--seed",
+    "42"
+  ],
+  "health_timeout_s": 900,
+  "bench_timeout_s": 3600,
+  "disk_margin_gb": 3,
+  "memory_headroom_mib": {
+    "nvidia": 1536,
+    "apple": 4096
+  },
+  "apple_gpu_memory_fraction": 0.75,
+  "models": {
+    "flint-nvfp4": {
+      "model": "flint-40b-a2-5b",
+      "backend": "llama.cpp",
+      "quant": "NVFP4",
+      "repo": "RecursiveSI/flint-nvfp4-gguf",
+      "revision": "6ec43e19b565fc8d560e2d04985d7724f20673bf",
+      "file": "flint-nvfp4.gguf",
+      "bytes": 22863084160,
+      "sha256": "97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde",
+      "requires_gpu_regex": "RTX 50\\d\\d|RTX PRO \\d+ Blackwell|\\bB\\d{3}\\b|\\bGB\\d{2,3}\\b",
+      "requires_gpu_why": "NVFP4 is a Blackwell (RTX 50xx) format"
+    },
+    "flint-UD-Q4_K_XL": {
+      "model": "flint-40b-a2-5b",
+      "backend": "llama.cpp",
+      "quant": "UD-Q4_K_XL",
+      "repo": "unsloth/flint-GGUF",
+      "revision": "20468edfc38ab43d6914cc88b08cbecb05d0fc62",
+      "file": "flint-UD-Q4_K_XL.gguf",
+      "bytes": 25054688704,
+      "sha256": "63c2ecc461ca545134b670c660e76fa20f47240f8d39b6510bfd21c4dd6e072f"
+    },
+    "flint-UD-Q3_K_XL": {
+      "model": "flint-40b-a2-5b",
+      "backend": "llama.cpp",
+      "quant": "UD-Q3_K_XL",
+      "repo": "unsloth/flint-GGUF",
+      "revision": "20468edfc38ab43d6914cc88b08cbecb05d0fc62",
+      "file": "flint-UD-Q3_K_XL.gguf",
+      "bytes": 18494977472,
+      "sha256": "91b8d85ab6ff7fb095d9a972f9afa6f3fa2b9acb642867a079f3e013ea3c350c"
+    },
+    "flint-int4-mlx": {
+      "model": "flint-40b-a2-5b",
+      "backend": "mlx",
+      "quant": "MLX-INT4",
+      "repo": "RecursiveSI/flint-int4",
+      "revision": "3b93f9053b530488405ae9fca51d4900d6ce21f0",
+      "dir": "flint-int4",
+      "bytes": 22580274020,
+      "contexts": [
+        {
+          "ctx": 4096,
+          "workloads": "chat-short"
+        },
+        {
+          "ctx": 8192,
+          "workloads": "chat-long"
+        },
+        {
+          "ctx": 32768,
+          "workloads": "long-context-decay",
+          "env": {
+            "LLM_SPEED_DECAY_CTX": "32000"
+          }
+        },
+        {
+          "ctx": 131072,
+          "workloads": "long-context-decay",
+          "env": {
+            "LLM_SPEED_DECAY_CTX": "128000"
+          },
+          "min_ram_gb": 64
+        }
+      ],
+      "_note": "MLX runs in-process (no preallocated context): 4K = chat-short, 8K = chat-long (~5.1K tokens), 32K and 131K = one long-context-decay point each (32,000 and 128,000 prompt tokens, the suite's points, so prompt + output fits the step). The recorded context is the tokens actually processed. Needs an mlx-lm with the 'flint' architecture (KFM-021)."
+    },
+    "flint-int4-q4_1": {
+      "model": "flint-40b-a2-5b",
+      "backend": "llama.cpp",
+      "quant": "Q4_1",
+      "repo": "RecursiveSI/flint-int4-gguf",
+      "revision": "9c47151036bc2c34331142dda04488bceab2bc9f",
+      "file": "flint-int4-q4_1.gguf",
+      "bytes": 25992966976,
+      "sha256": "43c07baccdba42eb7528a9630ee15699b1942c297291dc1b39a061f508ee1a4b"
+    },
+    "control-qwen3.8-27b-Q4_K_M": {
+      "model": "qwen3-8-27b",
+      "backend": "llama.cpp",
+      "quant": "Q4_K_M",
+      "control": true,
+      "repo": "ggml-org/Qwen3.8-27B-GGUF",
+      "revision": "0669b98607d47046c7c2b3f801011d54a08cfccf",
+      "file": "Qwen3.8-27B-Q4_K_M.gguf",
+      "bytes": 18973870432,
+      "sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
+      "contexts": [
+        4096
+      ],
+      "reasoning": "off",
+      "_note": "Same file+revision as the published 2026-09-05 RTX 5090 run (thinking off). Only with --with-control."
+    },
+    "flint-Q8_0": {
+      "model": "flint-40b-a2-5b",
+      "backend": "llama.cpp",
+      "quant": "Q8_0",
+      "repo": "unsloth/flint-GGUF",
+      "revision": "20468edfc38ab43d6914cc88b08cbecb05d0fc62",
+      "file": "flint-Q8_0.gguf",
+      "bytes": 42301076928,
+      "sha256": "5df42b56859c7b5142228005d7d63c327ec9e34c99c72548016d805309a0d284",
+      "min_free_disk_gb": 45,
+      "_note": "Disk-gated: needs ~45 GB free (file 42.3 GB + margin); recorded as skipped (insufficient_disk) otherwise, without downloading."
+    }
+  },
+  "profiles": {
+    "nvidia": {
+      "entries": [
+        "flint-nvfp4",
+        "flint-UD-Q4_K_XL"
+      ],
+      "fallback": [
+        "flint-UD-Q3_K_XL"
+      ],
+      "offload_probe": {
+        "entry": "flint-UD-Q4_K_XL",
+        "n_cpu_moe": 24,
+        "contexts": [
+          4096
+        ]
+      },
+      "control": [
+        "control-qwen3.8-27b-Q4_K_M"
+      ],
+      "contexts": {
+        "flint-nvfp4": [
+          4096,
+          16384,
+          32768,
+          65536,
+          131072,
+          262144
+        ],
+        "flint-UD-Q4_K_XL": [
+          4096,
+          16384,
+          32768,
+          65536,
+          131072,
+          262144
+        ]
+      }
+    },
+    "apple": {
+      "entries": [
+        "flint-int4-mlx",
+        "flint-int4-q4_1",
+        "flint-Q8_0"
+      ],
+      "fallback": [],
+      "control": [
+        "control-qwen3.8-27b-Q4_K_M"
+      ],
+      "contexts": {
+        "flint-int4-q4_1": [
+          4096,
+          16384,
+          32768,
+          {
+            "ctx": 131072,
+            "min_ram_gb": 64
+          },
+          {
+            "ctx": 262144,
+            "min_ram_gb": 64
+          }
+        ]
+      }
+    }
+  },
+  "_contexts": "Default ladder 4K/16K/32K; profiles.<kind>.contexts overrides it per model. Steps run low -> high and stop after the first failure. A step with min_ram_gb is recorded as skipped_ram on smaller machines. Workloads that would not fit a step's context (chat-long needs ~5.4K) are not run in it, and the recorded context is what llama-server reported (n_ctx) or MLX processed."
+}

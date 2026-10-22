@@ -74,7 +74,7 @@ def print_run_summary(
     table.add_column("ttft ms", justify="right")
     table.add_column("p50 ms", justify="right")
     table.add_column("p95 ms", justify="right")
-    table.add_column("error?", style="red")
+    table.add_column("error?", style="red", overflow="fold")
 
     for r in report.results:
         table.add_row(
@@ -88,6 +88,11 @@ def print_run_summary(
         )
 
     _console.print(table)
+    # Print errors in full below the table: the error column is truncated or
+    # wrapped on narrow terminals, which would hide the reason a workload failed.
+    for r in report.results:
+        if r.error:
+            _console.print(Text.assemble((f"{r.workload} error: ", "red"), r.error))
 
     settings = Table(title="Measured settings", show_header=True, header_style="bold")
     for label in (
