@@ -1,6 +1,8 @@
 # CLI changelog
 
-## 0.0.8 — unreleased
+## 0.0.8 — 2026-10-22
+
+[Published release](https://github.com/meadow-kun/llm-speed/releases/tag/v0.0.8) · [PyPI](https://pypi.org/project/llm-speed/0.0.8/)
 
 Launch-readiness for day-one runs of large MoE models (first target: Recursive Flint 40B-A2.5B on RTX 3090/4090/5090 and Apple Silicon).
 
