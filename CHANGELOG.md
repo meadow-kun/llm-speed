@@ -1,8 +1,16 @@
 # CLI changelog
 
-## 0.0.8 — 2026-10-22
+## 0.0.9 — unreleased
 
-[Published release](https://github.com/meadow-kun/llm-speed/releases/tag/v0.0.8) · [PyPI](https://pypi.org/project/llm-speed/0.0.8/)
+- **`llm-speed agent`**: runner mode: a machine takes preset jobs from a queue. `pipx install -U llm-speed && llm-speed agent install` pairs the machine (prints a code for the queue admin to approve), asks for consent once, stores the per-machine token (macOS Keychain / 0600 file) and installs a launchd / systemd user service. The service claims jobs from the queue (`ops/AGENT_QUEUE_API.md`; default `https://api.llm-speed.com`, or a self-hosted one via the documented `--api-base URL`, remembered at enroll; the token only goes to that server), runs only reviewed packaged presets whose `(name, version, sha256)` matches the install, through the normal `llm-speed bench --preset` path, always `--strict-anon`, and reports status + fit_attempts rows. Gates: pause file, quiet hours, busy GPU (other processes' VRAM / util), low unified memory, low disk. `pause [--now]`, `resume`, `status`, `presets`, `approve`/`decline`, `config`, `uninstall [--forget]`. Built-in `selftest` preset. Design: `docs/cli_v2_design.md` part 2.
+- **Shared preset schema** `cli/schemas/llm-speed-preset-1.schema.json` (CLI + Worker); `cli/preset_schema.py` validates packaged presets with it.
+- Phase 2 signed presets (pinned Worker key `llm-speed-presets-2026-10`, selected by the envelope `key_id`; canonical bundle bytes required; signed revocations, monotonic versions) behind the `remote_presets` agent setting, off by default.
+- Agent matches GM's live queue contract: pairing 202 pending / 200 token once / 410 used / 404 unknown (stops at once); `partial` results when a crash or the runtime cap comes after some measured cells; claims with `attempt` outside 1-3 are rejected.
+- `llm-speed bench --preset` no longer tries `POST /v1/fit-attempts` (the route does not exist); fit_attempts rows stay local unless an agent job reports them.
+- No team-only switches: `--api-base` is visible and documented (docs/CLI.md), `cost_class` is accepted and ignored (classification is server-side), comments use neutral wording, agent env vars documented.
+- `worker/migrations/0010_fit_attempts_flint.sql`: the Flint fit_attempts columns (ttfa_ms, n_cpu_moe, context_requested, ...) and `n_cpu_moe` in the dedupe key (table rebuild, ids kept, re-run refused). The queue's result route accepts them (applied 2026-10-22), so agent job results now include them (`SEND_FLINT_FIT_COLUMNS`).
+
+## 0.0.8 — unreleased
 
 Launch-readiness for day-one runs of large MoE models (first target: Recursive Flint 40B-A2.5B on RTX 3090/4090/5090 and Apple Silicon).
 

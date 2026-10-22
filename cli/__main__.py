@@ -244,6 +244,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # about --------------------------------------------------------------
+    from .agent.command import add_parser as _add_agent_parser
+
+    _add_agent_parser(sub)
     sub.add_parser("about", help="show what llm-speed is + links")
 
     # mcp ---------------------------------------------------------------
@@ -361,6 +364,10 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
         return _cmd_about(args)
     if cmd == "mcp":
         return _cmd_mcp(args)
+    if cmd == "agent":
+        from .agent.command import dispatch as _agent_dispatch
+
+        return _agent_dispatch(args)
 
     parser.error(f"unknown command: {cmd}")
     return 2

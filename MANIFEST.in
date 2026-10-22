@@ -18,6 +18,7 @@ include LICENSE
 include pyproject.toml
 recursive-include cli *.py
 recursive-include cli/presets *.json
+recursive-include cli/schemas *.json
 prune tests
 prune docs
 prune bots

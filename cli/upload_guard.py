@@ -2,7 +2,7 @@
 offline switch.
 
 `check_upload_allowed(api_base)` is called right before every network upload
-(cli.upload._post_with_retries, cli.fit_attempts.upload_fit_attempts). It raises
+(cli.upload._post_with_retries). It raises
 `UploadBlocked` when:
 
   * LLM_SPEED_OFFLINE=1 (or true/yes) is set - honoured by every upload path; or

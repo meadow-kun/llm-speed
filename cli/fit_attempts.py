@@ -2,17 +2,17 @@
 
 The shape is the D1 table `fit_attempts` (worker/migrations/0007_fit_attempts.sql,
 read via GET /v1/fit-attempts), extended only with the Flint launch columns listed in
-`FLINT_COLUMNS` (proposed in docs/fit_attempts_payload.md; the worker ignores unknown
-keys until a migration adds them).
+`FLINT_COLUMNS` (worker/migrations/0010_fit_attempts_flint.sql; the agent result route
+refuses them until the server's route accepts them, so `cli.agent.runner` strips them).
 
 Shared by:
   * the operator pod sweep (tools/fit_sweep.py, llama-bench lines -> `classify`)
   * the CLI fit sweep / `llm-speed bench --preset` (sweep attempts -> `from_sweep_attempt`)
 
 Every string column passes through `cli.pathscrub.scrub_paths`, so no row (saved or
-uploaded) carries a filesystem path. There is no write route yet: `upload_fit_attempts`
-POSTs to /v1/fit-attempts and treats 404/405/501 as "route not deployed": the rows stay
-in the local file and nothing else changes.
+uploaded) carries a filesystem path. There is no public write route (no POST
+/v1/fit-attempts): rows reach D1 only inside an `llm-speed agent` job result
+(POST /v1/agent/jobs/:job_id/result, ops/AGENT_QUEUE_API.md section 5).
 """
 
 from __future__ import annotations
@@ -403,84 +403,3 @@ def from_sweep_attempt(
         "source": f"llm-speed-cli/{cli_version}" if cli_version else "llm-speed-cli",
     }
     return sanitize_row(row)
-
-
-# --- upload (feature-checked) -------------------------------------------------------------
-
-
-class RouteUnavailable(RuntimeError):
-    """POST /v1/fit-attempts is not deployed (404/405/501)."""
-
-
-def build_fit_payload(
-    rows: list[dict[str, Any]],
-    *,
-    cli_version: str,
-    sweep_id: str,
-    preset: str | None,
-    preset_version: int | None = None,
-    preset_sha256: str | None = None,
-) -> dict[str, Any]:
-    return {
-        "schema": PAYLOAD_SCHEMA,
-        "cli_version": cli_version,
-        "sweep_id": scrub_paths(sweep_id),
-        "preset": preset,
-        "preset_version": preset_version,
-        "preset_sha256": preset_sha256,
-        "attempts": [sanitize_row(r) for r in rows],
-    }
-
-
-def upload_fit_attempts(
-    rows: list[dict[str, Any]],
-    *,
-    api_base: str,
-    cli_version: str,
-    sweep_id: str,
-    preset: str | None = None,
-    preset_version: int | None = None,
-    preset_sha256: str | None = None,
-    strict_anon: bool = False,
-    timeout: float = 30.0,
-    client: Any = None,
-) -> dict[str, Any]:
-    """POST the rows as one signed JWS. Raises RouteUnavailable when the route is
-    missing, so callers keep the rows local and carry on."""
-    import httpx
-
-    from .signing import sign_payload_jws
-    from .upload_guard import check_upload_allowed
-
-    if not rows:
-        return {"stored": 0}
-    check_upload_allowed(api_base)
-    payload = build_fit_payload(
-        rows,
-        cli_version=cli_version,
-        sweep_id=sweep_id,
-        preset=preset,
-        preset_version=preset_version,
-        preset_sha256=preset_sha256,
-    )
-    token = sign_payload_jws(payload, strict_anon=strict_anon)
-    headers = {"Content-Type": "application/json"}
-    if not strict_anon:
-        headers["User-Agent"] = f"llm-speed-cli/{cli_version}"
-    url = f"{api_base.rstrip('/')}/v1/fit-attempts"
-    c = client or httpx.Client(timeout=timeout)
-    try:
-        resp = c.post(url, json={"jws": token}, headers=headers)
-    finally:
-        if client is None:
-            c.close()
-    if resp.status_code in (404, 405, 501):
-        raise RouteUnavailable(f"{url} returned {resp.status_code}")
-    if not 200 <= resp.status_code < 300:
-        raise RuntimeError(
-            f"fit-attempts upload rejected: {resp.status_code} {resp.text[:200]}"
-        )
-    try:
-        return resp.json()
-    except ValueError:
-        return {}

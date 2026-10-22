@@ -17,8 +17,8 @@ Stages:
                 preset downloaded it AND the next one needs the space.
   4. results    fit_attempts rows (cli/fit_attempts.py) saved locally, summary table,
                 upload through the normal consent flow (--strict-anon honoured):
-                successful runs to /v1/results; fit_attempts to /v1/fit-attempts when
-                that route exists (404 -> kept locally).
+                successful runs to /v1/results. fit_attempts rows stay local: the only
+                write path is an `llm-speed agent` job result (no POST /v1/fit-attempts).
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from typing import Any
 from .. import __version__
 from .. import fit_sweep as fs
 from ..config import CACHE_DIR, DEFAULT_API_BASE
-from ..fit_attempts import RouteUnavailable, from_sweep_attempt, upload_fit_attempts
+from ..fit_attempts import from_sweep_attempt
 
 PRESET_DIR = Path(__file__).resolve().parent.parent / "presets"
 MIB = 1024 * 1024
@@ -448,24 +448,12 @@ def upload_stage(
                 f"  upload failed for {a['entry_id']} ctx {a.get('ctx')}: {exc} (kept locally; rerun to retry)"
             )
     fs.atomic_write_json(up_path, done)
-    try:
-        upload_fit_attempts(
-            latest_per_cell(rows),
-            api_base=api_base,
-            cli_version=__version__,
-            sweep_id=sweep_id,
-            preset=preset_name,
-            strict_anon=strict,
-            preset_version=(preset or {}).get("version"),
-            preset_sha256=preset_sha256(preset) if preset else None,
-        )
-        say(f"  fit attempts submitted ({len(rows)} rows)")
-    except RouteUnavailable:
-        say(
-            "  fit attempts: the site does not accept them yet; kept locally in fit_attempts.json"
-        )
-    except Exception as exc:  # noqa: BLE001
-        say(f"  fit attempts upload failed ({exc}); kept locally in fit_attempts.json")
+    # There is no public fit_attempts write route (ops/AGENT_QUEUE_API.md section 5):
+    # rows reach D1 only in an `llm-speed agent` job result. A manual run keeps them local.
+    say(
+        f"  fit attempts: {len(rows)} rows kept locally in fit_attempts.json "
+        "(the site takes them only from `llm-speed agent` job results)"
+    )
 
 
 # ----------------------------------------------------------------- command
