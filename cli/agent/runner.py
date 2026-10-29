@@ -22,9 +22,11 @@ from pathlib import Path
 from typing import Any
 
 from .. import __version__, preset_schema
+from .. import agent_job as _agent_job
+from ..api_host import ALLOW_TOKEN_HOST_ENV, display_host, is_canonical_api_base
 from ..config import CACHE_DIR
 from . import gates
-from .allowlist import JobRejected, advertised, build_argv, validate_job
+from .allowlist import JobRejected, advertised, build_argv, job_context, validate_job
 from .settings import (
     Settings,
     atomic_write_json,
@@ -42,9 +44,23 @@ try:
 except ImportError:  # pragma: no cover (Windows later)
     fcntl = None  # type: ignore[assignment]
 
+# Exit code of `bench --preset` when the queue refused the job's signed agent_job (400
+# "invalid agent_job"); same value as cli/commands/preset.py AGENT_JOB_REFUSED_RC.
+AGENT_JOB_REFUSED_RC = 86
+# Logged once per uploading job whose claim had no upload_nonce (spec rev 3, section 1.1).
+# Neutral wording only: how the server labels or classifies runs is decided server-side and
+# never described by the CLI (guarded by tests/cli/test_agent_nonce.py). Never the value.
+NO_NONCE_NOTE = (
+    "this job had no upload nonce from the queue; its results upload without one"
+)
+BAD_NONCE_NOTE = "the queue's upload nonce for this job could not be used; its results upload without one"
+
 log = logging.getLogger("cli.agent")
 
 IDLE_POLL_S = 60
+# After a claimed job is handed back because this machine lacks the free VRAM / memory /
+# disk it needs, wait longer before claiming again (the queue may offer the same job).
+RESOURCE_RETRY_S = 300
 MAX_BACKOFF_S = 900
 CANCEL_GRACE_S = 30
 KEEP_JOB_LOGS = 20
@@ -149,9 +165,7 @@ def capabilities(settings: Settings, *, facts: dict | None = None) -> dict[str, 
         )
         caps["backends"] = ["llama.cpp", "mlx"]
     try:
-        caps["disk_free_gb"] = round(
-            gates.disk_low(settings)[1].get("free_disk_gb") or 0
-        )
+        caps["disk_free_gb"] = round(gates.free_disk_gb(settings))
     except OSError:
         caps["disk_free_gb"] = None
     caps["presets"] = advertised(settings)
@@ -231,9 +245,28 @@ def stop_child(proc: subprocess.Popen, grace: float = CANCEL_GRACE_S) -> None:
         proc.wait()
 
 
-def child_env() -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("LLM_SPEED_AGENT_")}
+def child_env(api_base: str | None = None) -> dict[str, str]:
+    """Environment of the preset child. `api_base` is the queue this agent is enrolled
+    with: the child's result uploads (`llm-speed bench --preset` reads $LLM_SPEED_API)
+    go to that same server, never to a different default.
+
+    N-5: enrolling was the explicit choice of that server, so a self-hosted queue gets
+    the token opt-in ($LLM_SPEED_ALLOW_TOKEN_HOST) for exactly its host. Any opt-in
+    inherited from the agent's own environment is dropped, so the environment can't
+    point the child at a different host. (The child runs --strict-anon and sends no
+    bearer today; this keeps it that way if that ever changes.)"""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("LLM_SPEED_AGENT_")
+        and k not in (ALLOW_TOKEN_HOST_ENV, "LLM_SPEED_ENROLMENT_TOKEN")
+    }
     env["PYTHONUNBUFFERED"] = "1"
+    if api_base:
+        base = api_base.rstrip("/")
+        env["LLM_SPEED_API"] = base
+        if not is_canonical_api_base(base):
+            env[ALLOW_TOKEN_HOST_ENV] = display_host(base)
     return env
 
 
@@ -241,20 +274,46 @@ def preset_results_dir(name: str) -> Path:
     return CACHE_DIR / "presets" / name
 
 
-Launcher = Callable[[list[str], Path], subprocess.Popen]
+Launcher = Callable[..., subprocess.Popen]  # (argv, logfile, *, env) -> Popen
 
 
-def default_launcher(argv: list[str], logfile: Path) -> subprocess.Popen:
-    with open(logfile, "ab") as f:
-        return subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=child_env(),
-            shell=False,
-        )
+def default_launcher(
+    argv: list[str],
+    logfile: Path,
+    *,
+    env: dict[str, str] | None = None,
+    agent_job: dict[str, str] | None = None,
+) -> subprocess.Popen:
+    """Start the preset child. `agent_job` (R-9 upload nonce context) reaches the child
+    only through an inherited pipe whose fd number is in $LLM_SPEED_AGENT_JOB_FD: never
+    argv, never the environment, never a file, never the job log."""
+    env = dict(env if env is not None else child_env())
+    env.pop(_agent_job.FD_ENV, None)
+    rfd = None
+    pass_fds: tuple[int, ...] = ()
+    if agent_job is not None and os.name == "posix":
+        rfd, wfd = os.pipe()
+        try:
+            os.write(wfd, _agent_job.encode(agent_job))  # < 1 KiB: fits any pipe buffer
+        finally:
+            os.close(wfd)
+        env[_agent_job.FD_ENV] = str(rfd)
+        pass_fds = (rfd,)
+    try:
+        with open(logfile, "ab") as f:
+            return subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=env,
+                shell=False,
+                pass_fds=pass_fds,
+            )
+    finally:
+        if rfd is not None:
+            os.close(rfd)
 
 
 def fit_optional_columns() -> tuple[str, ...]:
@@ -332,6 +391,11 @@ def status_for_exit(rc: int) -> tuple[str, str | None]:
         return "cancelled", "interrupted"
     if rc == 2:
         return "failed", "preflight_failed"
+    if rc == AGENT_JOB_REFUSED_RC:
+        return (
+            "failed",
+            "agent_job_refused",
+        )  # 400 invalid agent_job: never re-sent bare
     return "failed", f"exit_{rc}"
 
 
@@ -357,6 +421,7 @@ class Runner:
         self.preset_keys, self.flags, self.facts = preset_keys, flags, facts
         self.preset_loader = preset_loader or preset_schema.packaged_preset
         self.backoff = 5.0
+        self.next_wait: float | None = None  # set by handle() when a job is handed back
         self.stopped_reason: str | None = None
         self.server_requires_approval = False
         ensure_dirs()
@@ -468,7 +533,7 @@ class Runner:
             self.refresh_status()
             if self.stopped_reason:
                 return 3600.0
-        g = gates.check(self.settings, runner=self.gate_runner)
+        g = gates.check(self.settings, runner=self.gate_runner, sleep=self.sleep)
         write_status(gates={"open": g.open, "reasons": g.reasons, "facts": g.facts})
         if not g.open:
             write_status(state="waiting", reason="; ".join(g.reasons))
@@ -487,8 +552,10 @@ class Runner:
                 reason=None,
             )
             return self.poll_after(claim.control)
+        self.next_wait = None
         self.handle(claim.job, claim.lease or {})
-        return 1.0
+        wait, self.next_wait = self.next_wait, None
+        return wait if wait is not None else 1.0
 
     def _on_error(self, e: QueueError) -> float:
         if e.status == 401:
@@ -544,9 +611,21 @@ class Runner:
         )
         if needs_ok and not self._wait_approval(job, lease):
             return
-        g = gates.check(self.settings, runner=self.gate_runner)
+        needs = gates.preset_needs(preset, overrides, self.settings, self._facts())
+        g = gates.check(
+            self.settings,
+            runner=self.gate_runner,
+            sleep=self.sleep,
+            needs=needs,
+            sample_busy=needs_ok,  # sampled just before the claim unless we waited
+        )
         if not g.open:
-            self._release(job, lease, "gate_closed")
+            reason = "; ".join(g.reasons)
+            log.info("job %s handed back: %s", job_id, reason)
+            write_status(gates={"open": False, "reasons": g.reasons, "facts": g.facts})
+            self._release(job, lease, "gate_closed", detail=reason)
+            if any(r.startswith("not enough free") for r in g.reasons):
+                self.next_wait = RESOURCE_RETRY_S * random.uniform(0.8, 1.2)
             return
         if preset.get("preset") == "selftest":
             self._selftest(job, lease, overrides)
@@ -576,12 +655,26 @@ class Runner:
                 f"preset_verification_failed:{reason_code(str(e))}"[:80]
             ) from None
 
-    def _release(self, job: dict, lease: dict, reason: str) -> None:
+    def _facts(self) -> dict:
+        if self.facts is not None:
+            return self.facts
+        from .. import fit_sweep
+
+        return fit_sweep.machine_facts(0)
+
+    def _release(
+        self, job: dict, lease: dict, reason: str, detail: str | None = None
+    ) -> None:
+        """`reason` is the queue's release code; `detail` (local status only) says why."""
         try:
             self.client.release(str(job.get("job_id")), lease.get("lease_id"), reason)
         except QueueError as e:
             log.info("release failed (%s); the lease will expire", e.code)
-        write_status(state="released", current_job=None, reason=reason)
+        write_status(
+            state="released",
+            current_job=None,
+            reason=f"{reason}: {detail}" if detail else reason,
+        )
 
     def _heartbeat(
         self, job: dict, lease: dict, phase: str, progress: dict | None = None
@@ -699,7 +792,23 @@ class Runner:
         logfile = logs_dir() / f"job-{job_id}.log"
         uploads_before = _load_json(preset_results_dir(name) / "uploads.json") or {}
         started = utcnow()
-        proc = self.launcher(argv, logfile)
+        # R-9: the claim's upload nonce goes to the child in memory only (a pipe), and only
+        # when this job uploads. No nonce from the server = run exactly as before.
+        ctx = (
+            job_context(job, self.client.api_base)
+            if upload and self.settings.upload
+            else None
+        )
+        launch_kw: dict[str, Any] = {"env": child_env(self.client.api_base)}
+        if ctx is not None:
+            launch_kw["agent_job"] = ctx
+        elif upload and self.settings.upload:
+            # No nonce (older server, or a queue that didn't see this build's feature), or one
+            # this build can't use. Once per job, no values.
+            log.info(
+                NO_NONCE_NOTE if job.get("upload_nonce") is None else BAD_NONCE_NOTE
+            )
+        proc = self.launcher(argv, logfile, **launch_kw)
         atomic_write_json(
             _state_path(),
             {
@@ -756,6 +865,7 @@ class Runner:
         if (
             status == "failed"
             and reason != "preflight_failed"  # preflight runs no cell; rows are older
+            and reason != "agent_job_refused"  # the queue refused the job's uploads
             and (extra.get("summary") or {}).get("ok")
         ):
             status = "partial"  # some cells measured before the crash / runtime cap

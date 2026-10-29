@@ -24,6 +24,8 @@ from typing import Any
 import httpx
 
 from ..registry import register_driver
+from ..sampling import DRIVER_SUPPORT as SAMPLING_DRIVER_SUPPORT
+from ..sampling import split as split_sampling
 from ..timing import now_ms, stopwatch
 from ..types import (
     BackendDetection,
@@ -57,6 +59,12 @@ class VllmDriver:
     def __init__(self) -> None:
         self._embedded_engine: Any | None = None
         self._embedded_model_id: str | None = None
+        # Sampling sent with every request (cli/sampling.py; set by `bench`).
+        self.sampling: dict[str, Any] = {}
+
+    def sampling_supported(self, model: ModelRef | None = None) -> tuple[str, ...]:
+        """Sampling keys this driver sends per request (cli/sampling.py)."""
+        return SAMPLING_DRIVER_SUPPORT["vllm"]
 
     # ------------------------------------------------------------------
     # detection
@@ -182,6 +190,10 @@ class VllmDriver:
         if stream:
             # vLLM honours these options on streaming responses.
             body["stream_options"] = {"include_usage": True}
+        # 0.0.10: sampling from the bench command line / preset. vLLM's OpenAI server
+        # takes top_k / min_p as extra sampling params next to the standard fields.
+        sent, _ignored = split_sampling(self.sampling, self.sampling_supported(model))
+        body.update(sent)
         if extras:
             for key, value in extras.items():
                 body.setdefault(key, value)
@@ -392,7 +404,8 @@ class VllmDriver:
             )
 
         sampling_cls = vllm.SamplingParams
-        sampling = sampling_cls(max_tokens=max_output_tokens)
+        sent, _ignored = split_sampling(self.sampling, self.sampling_supported(model))
+        sampling = sampling_cls(max_tokens=max_output_tokens, **sent)
 
         flags: list[str] = []
         decode_times: list[float] = []

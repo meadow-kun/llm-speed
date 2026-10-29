@@ -39,6 +39,8 @@ from ..launch_telemetry import (
     parse_llama_build,
 )
 from ..registry import register_driver
+from ..sampling import DRIVER_SUPPORT as SAMPLING_DRIVER_SUPPORT
+from ..sampling import split as split_sampling
 from ..timing import now_ms
 from ..types import (
     BackendDetection,
@@ -231,6 +233,8 @@ class LlamaCppDriver:
         # $LLM_SPEED_LLAMA_ARGS. Applied when we spawn the server; recorded as a
         # declared label when reusing an external server (LLAMA_CPP_SERVER_URL).
         self.server_args: list[str] = []
+        # Sampling sent with every request (cli/sampling.py; set by `bench`).
+        self.sampling: dict[str, Any] = {}
         self._version_text: str | None = None
         self._props_build_info: str | None = None
         self._props_n_ctx: int | None = None
@@ -358,8 +362,12 @@ class LlamaCppDriver:
         }
         if stream:
             payload["stream_options"] = {"include_usage": True}
-        # Bubble up generation knobs that callers may want.
-        for k in ("temperature", "top_p", "top_k", "seed", "stop"):
+        # 0.0.10: sampling requested on the bench command line / preset. llama-server's
+        # OpenAI-compatible endpoint takes all five as request fields.
+        sent, _ignored = split_sampling(self.sampling, self.sampling_supported(model))
+        payload.update(sent)
+        # Bubble up generation knobs that callers may want (per call; wins).
+        for k in ("temperature", "top_p", "top_k", "min_p", "seed", "stop"):
             if k in extras:
                 payload[k] = extras[k]
 
@@ -648,6 +656,9 @@ class LlamaCppDriver:
     def pop_run_telemetry(self) -> list[dict[str, Any]]:
         out, self._telemetry = self._telemetry, []
         return out
+
+    def sampling_supported(self, model: ModelRef | None = None) -> tuple[str, ...]:
+        return SAMPLING_DRIVER_SUPPORT["llama.cpp"]
 
     def run_labels(self, model: ModelRef) -> dict[str, Any]:
         """Publishable labels for this run: exact build, passthrough args, GGUF file."""

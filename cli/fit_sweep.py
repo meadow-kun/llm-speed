@@ -74,6 +74,11 @@ DEFAULT_SERVER_ARGS = [
     "42",
 ]
 
+# Sent with every request by the CLI when a preset has no "sampling" field (0.0.10);
+# the same values DEFAULT_SERVER_ARGS pins on llama-server, now also on the wire for
+# MLX steps and recorded in the run as extras.sampling.
+DEFAULT_SAMPLING = {"temperature": 0, "seed": 42}
+
 # Server-log classification. Order matters: first match wins.
 FAIL_PATTERNS = [
     (
@@ -117,6 +122,19 @@ LOG_SIGNAL_RE = re.compile(
 
 
 # ----------------------------------------------------------------- helpers
+
+
+def _sampling_mod():
+    """cli/sampling.py, also when this file runs as a plain script."""
+    try:
+        from . import sampling
+    except ImportError:  # executed as `python fit_sweep.py ...`
+        from cli import sampling  # type: ignore[no-redef]
+    return sampling
+
+
+def sampling_flags(sampling: dict | None) -> list[str]:
+    return _sampling_mod().to_cli_flags(sampling)
 
 
 def now_utc() -> str:
@@ -499,6 +517,36 @@ def expected_bytes_offline(entry: dict) -> int | None:
     return int(entry["bytes"]) if entry.get("bytes") else None
 
 
+def hf_cache_hit(entry: dict) -> Path | None:
+    """A complete copy already in the Hugging Face cache (pre-existing, never deleted)."""
+    if not entry.get("repo") or not entry.get("revision"):
+        return None
+    hub = Path(
+        os.environ.get("HF_HUB_CACHE")
+        or Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface")
+        / "hub"
+    )
+    snap = (
+        hub
+        / ("models--" + entry["repo"].replace("/", "--"))
+        / "snapshots"
+        / entry["revision"]
+    )
+    exp = expected_bytes_offline(entry)
+    if entry.get("backend") == "mlx":
+        if (
+            snap.is_dir()
+            and (snap / "config.json").exists()
+            and (exp is None or path_bytes(snap) >= exp)
+        ):
+            return snap
+        return None
+    f = snap / entry.get("file", "")
+    if f.is_file() and (exp is None or f.stat().st_size >= exp):
+        return f
+    return None
+
+
 def download_cmd(entry: dict, dest_dir: Path) -> list[str]:
     cli = _hf_cli() or ["hf", "download"]
     cmd = cli + [entry["repo"]]
@@ -768,10 +816,22 @@ class Sweep:
                 str(artifact),
             ]
             + list(self.plan.get("cli_args", []))
+            + sampling_flags(self.sampling_for(entry))
         )
         if self.strict_anon and "--strict-anon" not in cmd:
             cmd.append("--strict-anon")
         return cmd
+
+    def sampling_for(self, entry: dict) -> dict:
+        """Preset-wide sampling, then the model entry's, then bench flags (0.0.10).
+        Plans without a "sampling" key (older plan.json files) send nothing."""
+        if "sampling" not in self.plan and not self.plan.get("cli_sampling"):
+            return {}
+        return _sampling_mod().merge(
+            self.plan.get("sampling"),
+            entry.get("sampling"),
+            self.plan.get("cli_sampling"),
+        )
 
     @staticmethod
     def declared_server_args(cmd: list[str]) -> str:
@@ -834,6 +894,7 @@ class Sweep:
             else None,
             "n_cpu_moe": entry.get("n_cpu_moe"),
             "reasoning": entry.get("reasoning"),
+            "sampling": self.sampling_for(entry) or None,
             "status": status,
             "fits": None,
             "started_at": now_utc(),
@@ -1159,32 +1220,7 @@ class Sweep:
     # ---- download / cleanup
     def hf_cache_hit(self, entry: dict) -> Path | None:
         """A complete copy already in the Hugging Face cache (pre-existing, never deleted)."""
-        if not entry.get("repo") or not entry.get("revision"):
-            return None
-        hub = Path(
-            os.environ.get("HF_HUB_CACHE")
-            or Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface")
-            / "hub"
-        )
-        snap = (
-            hub
-            / ("models--" + entry["repo"].replace("/", "--"))
-            / "snapshots"
-            / entry["revision"]
-        )
-        exp = expected_bytes_offline(entry)
-        if entry.get("backend") == "mlx":
-            if (
-                snap.is_dir()
-                and (snap / "config.json").exists()
-                and (exp is None or path_bytes(snap) >= exp)
-            ):
-                return snap
-            return None
-        f = snap / entry.get("file", "")
-        if f.is_file() and (exp is None or f.stat().st_size >= exp):
-            return f
-        return None
+        return hf_cache_hit(entry)
 
     def disk_need(self, entry: dict) -> int:
         exp = expected_bytes_offline(entry) or 0

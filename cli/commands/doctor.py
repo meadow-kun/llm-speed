@@ -90,6 +90,33 @@ def _final_line(checks: list[Check], *, console: Console) -> None:
         )
 
 
+def agent_token_checks() -> list[Check]:
+    """If this machine is enrolled as an agent: which store holds its token, and
+    whether it can be read (never the token). Not required for `bench`."""
+    try:
+        from ..agent.settings import Settings
+        from ..agent.tokens import describe_store, load_token
+
+        s = Settings.load()
+    except (OSError, ValueError, TypeError):  # unreadable agent config: nothing to say
+        return []
+    if not s.machine_id:
+        return []
+    where = describe_store(s.token_store)
+    if load_token(s.machine_id, s.token_store):
+        return [Check(id="agent.token", title="agent token", status=OK, detail=where)]
+    return [
+        Check(
+            id="agent.token",
+            title="agent token",
+            status=WARN,
+            detail=f"enrolled as {s.machine_id} but no token found ({where})",
+            remediation="ask your queue admin to revoke this machine, then run "
+            "`llm-speed agent install --force` to pair again",
+        )
+    ]
+
+
 def run_doctor(
     *,
     api_base: str | None = None,
@@ -101,7 +128,9 @@ def run_doctor(
 ) -> int:
     """Run the doctor flow. Returns an exit code (0 ready, 1 not ready)."""
     cons = console or get_console()
-    do_checks = run_checks_fn or (lambda: run_checks(api_base=api_base))
+    do_checks = run_checks_fn or (
+        lambda: run_checks(api_base=api_base) + agent_token_checks()
+    )
     confirm_fn = confirm or _default_confirm
     if interactive is None:
         interactive = sys.stdin.isatty() and sys.stdout.isatty()

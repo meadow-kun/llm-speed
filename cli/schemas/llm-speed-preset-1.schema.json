@@ -59,6 +59,9 @@
     "mlx_args": {
       "$ref": "#/$defs/mlx_args"
     },
+    "sampling": {
+      "$ref": "#/$defs/sampling"
+    },
     "health_timeout_s": {
       "type": "integer",
       "minimum": 10,
@@ -175,6 +178,37 @@
         "pattern": "^(--max-kv-size|--temp|--seed|--top-p|--max-tokens|--kv-bits|--kv-group-size|--quantized-kv-start|-?[0-9]{1,7}(\\.[0-9]{1,4})?)$"
       }
     },
+    "sampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "top_k": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "top_p": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "min_p": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
     "model": {
       "type": "object",
       "additionalProperties": false,
@@ -265,6 +299,9 @@
         },
         "mlx_args": {
           "$ref": "#/$defs/mlx_args"
+        },
+        "sampling": {
+          "$ref": "#/$defs/sampling"
         },
         "min_free_disk_gb": {
           "type": "number",

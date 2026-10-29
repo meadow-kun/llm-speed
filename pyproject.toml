@@ -1,6 +1,6 @@
 [project]
 name = "llm-speed"
-version = "0.0.9"
+version = "0.0.10"
 description = "Benchmark any LLM on any hardware. CLI for the llm-speed.com flywheel."
 requires-python = ">=3.10"
 authors = [{name = "meadow-kun", email = "2424351+meadow-kun@users.noreply.github.com"}]
@@ -41,11 +41,18 @@ dependencies = [
     # cryptography 44.0.1 ships the fix for CVE-2024-12797 (OpenSSL); rich
     # 13.7 hardens terminal-escape handling. Upper bounds are kept loose so
     # Dependabot can bump.
+    # R-69 (2026-10-29): cryptography 50.0.0 (GHSA-537c-gmf6-5ccf, bundled
+    # OpenSSL), joserfc 1.6.8 (HS* empty-key verify), and the transitive
+    # certifi 2026.10.19 (GHSA-6q48-6c7w-9gw2, compromised emSign
+    # intermediates) and idna 3.15 floors, declared here so installs without
+    # the lock also get them.
     "httpx>=0.27,<0.30",
     "psutil>=5.9",
     "rich>=13.7",
-    "cryptography>=44.0.1",
-    "joserfc>=1.0",
+    "cryptography>=50.0.0",
+    "joserfc>=1.6.8",
+    "certifi>=2026.10.19",
+    "idna>=3.15",
 ]
 
 [project.optional-dependencies]

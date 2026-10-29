@@ -49,7 +49,8 @@ For each workload (W1..W5):
 | `extras.peak_vram_mib`, `extras.peak_vram_source` (0.0.8) | peak GPU / MLX memory during the workload, rounded to 16 MiB (no total VRAM, which stays bucketed) |
 | `extras.time_to_first_answer_ms`, `extras.reasoning_tokens_est`, `extras.answer_started` (0.0.8) | timing of the first non-reasoning token; no text is uploaded |
 | `extras.llama_cpp_build`, `extras.llama_cpp_commit`, `extras.llama_cpp_build_source` (0.0.8) | exact llama.cpp build the numbers came from |
-| `extras.llama_server_args` (0.0.8) | allowlisted llama-server flags and values (e.g. `-c 4096 --n-cpu-moe 20`); other flags and path-like values are redacted |
+| `extras.llama_server_args` (0.0.8; 0.0.10 adds `--no-cache-prompt`, `--cache-prompt`, `--cache-ram`, `--temp`, `--seed`, `--top-k`, `--top-p`, `--min-p`, `--reasoning`, `--kv-unified`) | allowlisted llama-server flags and values (e.g. `-c 4096 --n-cpu-moe 20 --temp 0 --seed 42 --reasoning off`); the 0.0.10 flags keep only numeric or on/off/auto values; other flags and path-like or free-text values are redacted |
+| `extras.sampling`, `extras.sampling_ignored` (0.0.10) | sampling settings the CLI sent with each request (`temperature`, `seed`, `top_k`, `top_p`, `min_p`; numbers only) and the names of requested keys the backend could not take; absent when none were set (presets default to temperature 0, seed 42) |
 | `extras.model_file`, `extras.model_file_bytes` (0.0.8) | GGUF file basename (already sent as `model.identifier`) and its size |
 
 ### Fit attempts (`--preset` only, 0.0.8)
@@ -77,6 +78,64 @@ are switched off).
 | `started_at`, `finished_at` | run-duration sanity check |
 | `signature` (ed25519) | proves the bytes weren't edited after signing |
 | `public_key` (ed25519, base64 32B raw) | server verifies signature with this; persistent in default mode, ephemeral per run in `--strict-anon` |
+
+### Contributor credit (opt-in, off by default)
+
+If you choose to, you can add your X or Reddit handle to the runs you upload. Nothing is
+collected unless you type it in yourself.
+
+| Field | Example | Why |
+|---|---|---|
+| `credit.platform` | `x` or `reddit` | which site the handle belongs to |
+| `credit.handle` | `name` (from `@name` or `u/name`) | shown next to your uploaded runs so you get credit |
+
+- **It is public.** The handle is shown on llm-speed.com next to each run you upload with it,
+  and anyone can see it.
+- **It is unverified.** We don't check that the account is yours, so the site labels it
+  "unverified". A credited run is still a community report, never one of our own measured
+  results.
+- **It links your runs.** Every run that carries the same handle can be grouped together by
+  anyone, including runs from different machines.
+- **How you give it.** The CLI asks once, right after you agree to uploads, and only at an
+  interactive terminal. Press Enter to stay anonymous. You can also set it with
+  `llm-speed config credit @name` (or `u/name`), or for a single run with `--credit`. The CLI
+  never reads it from git, your hostname, your username, environment variables or anywhere
+  else.
+- **When it is never sent.** Never with `--strict-anon` or `--anon`, never from
+  `llm-speed agent` jobs, and never with `--no-credit`.
+- **Where it is stored.** On your machine in `~/.config/llm-speed/config.json` (mode 0600). It
+  is sent in the upload request next to the signed run; it is not added to the signed run or to
+  your local run files.
+- **How to change or remove it.** `llm-speed config credit u/name` changes it for future
+  uploads, and `llm-speed config credit --clear` removes it, so future uploads are anonymous.
+  Runs you already uploaded keep the handle until you ask us to remove it: email
+  privacy@llm-speed.com with the handle (and, if you have them, the run ids) and we remove it
+  from those runs within 7 days.
+
+### Agent job uploads only: the job's upload nonce
+
+Only runs uploaded by an `llm-speed agent` job (a machine you enrolled with a queue and
+consented for) carry one more field inside the signed run:
+
+| Field | Example | Why |
+|---|---|---|
+| `agent_job.assignment_id` | `asg_0123456789abcdef` | the queue's id for this job assignment |
+| `agent_job.upload_nonce` | `lsn_` + 32 hex characters | a random value the queue gave the machine for this one job |
+
+- **What it links.** It lets the queue match an uploaded run to the job it gave out. The queue
+  already knows which machine took that job and receives the run ids in the job result, so it
+  adds no new identity; it does mean an agent job's `--strict-anon` run is tied to that job
+  on the server. It contains nothing about your machine or you.
+- **It is private.** The server stores it privately (`runs.agent_nonce`) and never shows it on
+  the site, in an API response or in a dataset export.
+- **When it is sent.** Only by agent jobs whose queue issued a nonce, only to that queue, and
+  only while that job runs. Never by `llm-speed bench` run by hand, `bench --resume`, or any
+  other upload. There is no setting for it.
+- **Asking for it.** The agent's job claims say it can use the nonce, with the fixed value
+  `"features": ["upload_nonce"]` (the same for every install of this version; nothing about
+  your machine). `llm-speed bench` sends no claim.
+- **On your machine.** Kept in memory for the job only: not in the job log, run files, status
+  files or the job result, and never printed.
 
 ---
 
@@ -123,6 +182,7 @@ non-whitelisted string field exceeds 256 characters. The whitelist:
 | `X-LLM-Speed-Anon: 1` header | no | yes | no (would be a beacon) |
 | Server-side IP logging | not persisted | not persisted | not persisted |
 | Cross-run correlation by the server | possible via `public_key` and `fingerprint_hash` | possible via `public_key` | **not possible** |
+| Contributor credit handle (opt-in) | if you set one | **never sent** | **never sent** |
 
 ### `--anon` vs `--strict-anon`
 
@@ -168,6 +228,15 @@ versioned).
   a value that rotates daily and is held in memory only — never written to
   storage, never returned in any response. Cross-day correlation by IP is not
   possible.
+- **Agent pairing keeps a keyed IP hash for about 70 minutes.** Only for
+  `POST /v1/agent/pair` (machines enrolling with a queue): to cap open pairings per
+  address, the pairing row stores HMACs of your IP (IPv6 reduced to its /64, /56 and /48) under
+  a key that changes every UTC day and is derived from a server secret. Never the IP
+  itself, never returned in any response. It is deleted with the pairing row, which
+  is removed by the first pairing or queue request after it is an hour past its
+  10-minute lifetime (there is no background job, so on a quiet day it can sit a
+  little longer; the daily key change stops it matching any later request).
+  Pairings made with an operator-issued enrolment token store no IP hash at all.
 - The server has no access to anything the CLI didn't put in the payload.
   Driver builds, PCI IDs, kernel patches, etc. are physically absent.
 
@@ -255,6 +324,9 @@ from canonical hashing). The server verifies against the same canonicalization.
 
 - **Self-serve consent revocation:** `rm ~/.config/llm-speed/consent.json`
   — the next upload will re-prompt.
+- **Contributor credit:** `llm-speed config credit --clear` stops sending your handle. To
+  remove it from runs you already uploaded, email privacy@llm-speed.com with the handle; we
+  remove it within 7 days.
 - **Email** privacy@llm-speed.com with the `id` (the `r_xxxxxxxx` slug) of any
   result you want removed. We remove it within 7 days.
 - **Public dispute thread:** every result page has a dispute link. File a
@@ -293,6 +365,8 @@ For visitors and submitters in the EU, EEA, and UK:
     we do not export, query, or retain those logs ourselves.
   - **Rate-limit hashed-IP counter:** in-memory only, dropped after one
     minute; daily salt rotated and never persisted (see §4).
+  - **Agent pairing IP hash:** keyed, daily-rotating HMAC on the pairing row,
+    deleted with the pairing row, normally about 70 minutes after pairing (see §4).
   - **Site analytics** (Cloudflare Web Analytics, see §8): aggregated
     pageview counts, no per-visitor identifiers, no cookies.
 
@@ -335,6 +409,12 @@ will upload (i.e. not `--no-upload`, not `--dry-run`, not `--json`, not
 option), the CLI prints the consent text and asks `[Y/n]`. The choice is saved
 to `~/.config/llm-speed/consent.json` (mode 0600) along with a timestamp, the
 CLI version, and the trimmed `fingerprint_hash`. Delete that file to revoke.
+
+Right after a yes, the CLI asks one optional question: whether you want credit by X or Reddit
+handle (see "Contributor credit" in section 1). Press Enter to stay anonymous. It is asked
+once (people who agreed with an earlier version are asked once on their next interactive
+upload), only at an interactive terminal, and never in CI, with `--yes`, `--strict-anon` or
+`--anon`, or in `llm-speed agent` jobs.
 
 ---
 

@@ -1,6 +1,6 @@
 """`llm-speed bench --preset <name>`: one pasteable command per machine.
 
-    pipx install -U llm-speed && llm-speed bench --preset flint-40b
+    curl -fsSL https://llm-speed.com/install.sh | sh && llm-speed bench --preset flint-40b
 
 Stages:
   1. hardware   detect NVIDIA (nvidia-smi) or Apple Silicon; pick the backend(s) and
@@ -38,6 +38,7 @@ from typing import Any
 
 from .. import __version__
 from .. import fit_sweep as fs
+from .. import sampling as sampling_mod
 from ..config import CACHE_DIR, DEFAULT_API_BASE
 from ..fit_attempts import from_sweep_attempt
 
@@ -209,6 +210,9 @@ def build_plan(
         "bench_timeout_s": preset.get("bench_timeout_s", 3600),
         "disk_margin_gb": preset.get("disk_margin_gb", 3),
         "server_args": preset.get("server_args", fs.DEFAULT_SERVER_ARGS),
+        # 0.0.10: sent with every request by each step's `llm-speed bench`
+        # (per-model "sampling" and --temperature/... flags override key by key).
+        "sampling": sampling_mod.merge(preset.get("sampling", fs.DEFAULT_SAMPLING)),
         "workloads_by_ctx": preset.get("workloads_by_ctx", fs.DEFAULT_WORKLOADS_BY_CTX),
         "entries": entries,
     }
@@ -386,6 +390,32 @@ def _uploads_path(rdir: Path) -> Path:
     return rdir / "uploads.json"
 
 
+def _upload_api_base(args) -> str:
+    # Read $LLM_SPEED_API now, not at import time, so a test/staging override always wins.
+    return (
+        getattr(args, "api_base", None)
+        or os.environ.get("LLM_SPEED_API")
+        or DEFAULT_API_BASE
+    )
+
+
+def _upload_api_base_source(args) -> str:
+    from ..api_host import api_base_source
+
+    return api_base_source(args)
+
+
+# Security Desk fix 3 (R-9): a 400 "invalid agent_job" fails the agent job. The preset
+# exits with this code (the agent reports `failed` / `agent_job_refused`) and the runs are
+# marked in uploads.json so no later run, by hand or by the agent, sends them without it.
+AGENT_JOB_REFUSED_RC = 86
+AGENT_JOB_REFUSED_MARK = "not uploaded: the queue refused this agent job's upload"
+
+
+def _redact_nonce(s: str) -> str:
+    return re.sub(r"lsn_[0-9A-Za-z]+", "lsn_[redacted]", s)
+
+
 def upload_stage(
     args,
     attempts,
@@ -394,21 +424,23 @@ def upload_stage(
     preset_name: str,
     sweep_id: str,
     preset: dict[str, Any] | None = None,
-) -> None:
+) -> int | None:
+    from ..api_host import (
+        InsecureApiBase,
+        display_host,
+        guard_api_base,
+        token_allowed,
+        token_opt_in_hint,
+    )
     from ..consent import has_consented, prompt_for_consent
-    from ..upload import upload_saved_payload, warn_if_insecure_api_base
+    from ..upload import upload_saved_payload
 
     if getattr(args, "no_upload", False) or getattr(args, "dry_run", False):
         say("Not uploading (--no-upload). Everything is saved locally.")
         return
     strict = bool(getattr(args, "strict_anon", False))
     anon = bool(getattr(args, "anon", False)) or strict
-    # Read $LLM_SPEED_API now, not at import time, so a test/staging override always wins.
-    api_base = (
-        getattr(args, "api_base", None)
-        or os.environ.get("LLM_SPEED_API")
-        or DEFAULT_API_BASE
-    )
+    api_base = _upload_api_base(args)
     from ..upload_guard import upload_block_reason
 
     synthetic = next((a.get("synthetic") for a in attempts if a.get("synthetic")), None)
@@ -424,30 +456,86 @@ def upload_stage(
     if not consent_ok:
         say("Skipping upload (no consent). Results are saved locally.")
         return
-    if not anon:
-        warn_if_insecure_api_base(api_base, getattr(args, "api_key", None))
+    from ..credit import effective_credit, maybe_ask
+
+    maybe_ask(args)
+    credit = None if anon else effective_credit(args)
+    # L-1: plain http off loopback is refused (cmd_preset already refused it before
+    # the run; this is the last check before any POST). Any non-canonical host gets
+    # one stderr line naming it; in an agent child that is the enrolled queue.
+    # N-5: the API key only goes to api.llm-speed.com or a host the user opted in to
+    # (--allow-token-to-host / $LLM_SPEED_ALLOW_TOKEN_HOST); otherwise upload without it.
+    api_key = getattr(args, "api_key", None)
+    if api_key and not anon and not token_allowed(api_base, args):
+        say(
+            f"  not sending your API key to {display_host(api_base)} (not "
+            f"api.llm-speed.com); uploading without it. To send it there, pass "
+            f"{token_opt_in_hint(api_base)}."
+        )
+        api_key = None
+    try:
+        guard_api_base(
+            api_base,
+            source=_upload_api_base_source(args),
+            bearer=bool(api_key) and not anon,
+        )
+    except InsecureApiBase as exc:
+        say(f"Not uploading: {exc}. Everything is saved locally.")
+        return
+    # R-9: inside an `llm-speed agent` job, each upload carries the job's nonce in its signed
+    # payload, only to the queue that issued it. Never for a hand-run preset.
+    from ..agent_job import for_upload
+
+    aj = for_upload(api_base, strict_anon=strict)
     up_path = _uploads_path(rdir)
     done = json.loads(up_path.read_text()) if up_path.exists() else {}
+    from ..upload import UploadRejected
+
+    refused = False
     for a in attempts:
         art = a.get("artifact")
         if a.get("status") not in ("ok", "partial") or not art or art in done:
+            continue
+        if refused:
+            # Security Desk fix 3: this job's runs are never sent without its nonce, so the
+            # rest are marked and kept local only (summarize() ignores non-URL values).
+            done[art] = AGENT_JOB_REFUSED_MARK
             continue
         try:
             saved = json.loads(Path(art).read_text(encoding="utf-8"))
             url = upload_saved_payload(
                 saved,
                 api_base=api_base,
-                api_key=getattr(args, "api_key", None),
+                api_key=api_key,
                 anon=anon,
                 strict_anon=strict,
+                credit=credit,
+                agent_job=aj,
             )
             done[art] = url
             say(f"  submitted {a['entry_id']} ctx {a.get('ctx')}: {url}")
+        except UploadRejected as exc:
+            if aj is not None and exc.agent_job_refused:
+                refused = True
+                done[art] = AGENT_JOB_REFUSED_MARK
+                say(
+                    f"  the queue refused this job's upload of {a['entry_id']} ctx "
+                    f"{a.get('ctx')} (invalid agent_job); the job fails and its runs stay "
+                    "local only (never uploaded without the job's nonce)"
+                )
+                continue
+            say(
+                f"  upload failed for {a['entry_id']} ctx {a.get('ctx')}: "
+                f"{_redact_nonce(str(exc))} (kept locally; rerun to retry)"
+            )
         except Exception as exc:  # noqa: BLE001
             say(
-                f"  upload failed for {a['entry_id']} ctx {a.get('ctx')}: {exc} (kept locally; rerun to retry)"
+                f"  upload failed for {a['entry_id']} ctx {a.get('ctx')}: "
+                f"{_redact_nonce(str(exc))} (kept locally; rerun to retry)"
             )
     fs.atomic_write_json(up_path, done)
+    if refused:
+        return AGENT_JOB_REFUSED_RC
     # There is no public fit_attempts write route (ops/AGENT_QUEUE_API.md section 5):
     # rows reach D1 only in an `llm-speed agent` job result. A manual run keeps them local.
     say(
@@ -460,6 +548,11 @@ def upload_stage(
 
 
 def cmd_preset(args) -> int:
+    from ..agent_job import take_from_env
+
+    # R-9: an agent child gets its job's upload nonce once through an inherited pipe; read
+    # it now (memory only) so the per-cell children never inherit the fd or its number.
+    take_from_env()
     name = args.preset
     preset = load_preset(name)
     rdir = results_dir(name)
@@ -475,6 +568,19 @@ def cmd_preset(args) -> int:
         f"llm-speed {__version__}: preset {name} v{preset.get('version')} - {preset.get('title', '')}"
     )
     say(f"  preset sha256 {preset_sha256(preset)}")
+    if not (getattr(args, "no_upload", False) or getattr(args, "dry_run", False)):
+        # L-1: refuse a plain-http upload target up front, not after an hour of runs.
+        from ..api_host import InsecureApiBase, check_api_base
+
+        try:
+            check_api_base(_upload_api_base(args))
+        except InsecureApiBase as exc:
+            print(
+                f"error: {exc} (from {_upload_api_base_source(args)}). "
+                "Fix the URL or pass --no-upload.",
+                file=sys.stderr,
+            )
+            return 2
 
     stage(1, total, "Hardware")
     facts = fs.machine_facts(0)
@@ -494,6 +600,10 @@ def cmd_preset(args) -> int:
         models_dir=models_dir,
         mlx_dir=models_dir / "mlx",
         llama_server=None,
+    )
+    plan["cli_sampling"] = sampling_mod.from_args(args)
+    say(
+        f"  sampling: {sampling_mod.describe(sampling_mod.merge(plan['sampling'], plan['cli_sampling']))}"
     )
     for n in notes:
         say(f"  note: {n}")
@@ -627,5 +737,8 @@ def cmd_preset(args) -> int:
             + (" --with-control" if getattr(args, "with_control", False) else "")
         )
         return rc
-    upload_stage(args, attempts, rows, rdir, name, sweep_id, preset)
+    if upload_stage(args, attempts, rows, rdir, name, sweep_id, preset) == (
+        AGENT_JOB_REFUSED_RC
+    ):
+        return AGENT_JOB_REFUSED_RC
     return 0 if rc == 0 else rc

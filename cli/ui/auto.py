@@ -52,6 +52,7 @@ def build_auto_args(
     ns.resume = None
     ns.api_base = api_base or DEFAULT_API_BASE
     ns.verbose = False
+    ns.no_prompt = True  # auto mode never asks (credit question included)
     return ns
 
 

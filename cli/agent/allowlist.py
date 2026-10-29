@@ -17,7 +17,7 @@ import sys
 from functools import lru_cache
 from typing import Any
 
-from .. import preset_schema
+from .. import agent_job, preset_schema
 from .settings import Settings
 
 # Reviewed presets. Adding one is a code change + review + CLI release (phase 1).
@@ -54,6 +54,12 @@ JOB_FIELDS = {
     "cost_class",  # how a job is classified is the server's business: accepted, ignored
     "priority",
     "schema",
+    # Per-assignment upload nonce (security retest R-9). A queue that sends it to a build
+    # that doesn't use it must not fail the claim (Security Desk R-36): accepted, ignored.
+    # This build echoes a well-formed one inside each signed upload of the job
+    # (cli/agent_job.py, job_context); a missing or malformed one is ignored, never a
+    # rejection.
+    "upload_nonce",
 }
 # The server fails an assignment after 3 lapsed leases (queue API spec section 5), so a claim
 # never carries attempt > 3; anything else is contract drift -> rejected.
@@ -306,6 +312,17 @@ def validate_job(
             raise JobRejected(f"override_not_supported:{k}")
         out[k] = v
     return preset, out
+
+
+def job_context(job: dict, api_base: str) -> dict[str, str] | None:
+    """{assignment_id, upload_nonce, api_base} for a validated job's uploads, or None when
+    the claim carried no usable nonce (older server, a pre-release build, or a malformed
+    value with a malformed assignment_id): the job then runs exactly as before. Never a
+    rejection (Security Desk R-36)."""
+    aid, nonce = job.get("assignment_id"), job.get("upload_nonce")
+    if not agent_job.valid(aid, nonce) or not api_base:
+        return None
+    return {"assignment_id": aid, "upload_nonce": nonce, "api_base": api_base}
 
 
 def build_argv(

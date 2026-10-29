@@ -29,6 +29,8 @@ from typing import Any
 import httpx
 
 from ..registry import register_driver
+from ..sampling import HOSTED_SUPPORT
+from ..sampling import split as split_sampling
 from ..timing import now_ms
 from ..types import (
     BackendDetection,
@@ -107,6 +109,18 @@ class HostedApiDriver:
         self._client = httpx.Client(
             timeout=httpx.Timeout(LIST_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
         )
+        # Sampling sent with every request (cli/sampling.py; set by `bench`).
+        self.sampling: dict[str, Any] = {}
+
+    def sampling_supported(self, model: ModelRef | None = None) -> tuple[str, ...]:
+        """OpenAI-style APIs take temperature/top_p/seed; Anthropic temperature/top_p/top_k."""
+        if model is None:
+            return ()
+        provider, _ = self._split_identifier(model)
+        if provider is None:
+            return ()
+        kind = _provider_meta(provider)[2]
+        return HOSTED_SUPPORT["anthropic" if kind == "anthropic" else "openai"]
 
     # -------------------------------------------------------------------- detect
 
@@ -219,7 +233,9 @@ class HostedApiDriver:
         stream: bool = True,
         extras: dict[str, Any] | None = None,
     ) -> ChatRunOutcome:
-        extras = dict(extras or {})
+        # 0.0.10: bench-level sampling first; per-call extras still win.
+        sent, _ignored = split_sampling(self.sampling, self.sampling_supported(model))
+        extras = {**sent, **dict(extras or {})}
 
         provider, model_id = self._split_identifier(model)
         if provider is None:

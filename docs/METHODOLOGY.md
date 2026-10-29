@@ -259,26 +259,19 @@ signature, non-zero otherwise.
 
 ## 8. Signed runs you can audit
 
-The following five permalinks are the highest decode tok/s currently on the
-leaderboard, as of 2026-05-01. Each is a real, signed, unedited run; the
-links resolve to the canonical run page with the full fingerprint, signature,
-and per-workload signals.
+The following three permalinks were among the highest local-hardware decode tok/s on
+the leaderboard as of 2026-05-01. Each is a real, signed, unedited run; the links
+resolve to the canonical run page with the full fingerprint, signature, and
+per-workload signals.
 
 | # | Decode tok/s | Model | Hardware | Backend | Run |
 |---:|---:|---|---|---|---|
-| 1 | 432.2 | meta-llama/llama-4-scout | M3 Pro (18-core GPU) + 36 GB unified | hosted-api (OpenRouter) | [r_g4ph40ae0e1](/r/r_g4ph40ae0e1) |
-| 2 | 286.5 | mlx-community/Qwen2.5-0.5B-Instruct-4bit | M3 Pro (18-core GPU) + 36 GB unified | mlx 0.31.3 | [r_akcbpx5vcqa](/r/r_akcbpx5vcqa) |
-| 3 | 192.5 | mlx-community/stable-code-instruct-3b-4bit | M3 Ultra (60-core GPU) + 96 GB unified | mlx 0.31.3 | [r_y2_5y8oo97d](/r/r_y2_5y8oo97d) |
-| 4 | 175.4 | qwen/qwen3-coder-next | M3 Pro (18-core GPU) + 36 GB unified | hosted-api (OpenRouter) | [r_zrnrkjvkvvi](/r/r_zrnrkjvkvvi) |
-| 5 | 168.3 | mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit | M3 Ultra (60-core GPU) + 96 GB unified | mlx 0.31.3 | [r_l_v1-zq_qaz](/r/r_l_v1-zq_qaz) |
+| 1 | 286.5 | mlx-community/Qwen2.5-0.5B-Instruct-4bit | M3 Pro (18-core GPU) + 36 GB unified | mlx 0.31.3 | [r_akcbpx5vcqa](/r/r_akcbpx5vcqa) |
+| 2 | 192.5 | mlx-community/stable-code-instruct-3b-4bit | M3 Ultra (60-core GPU) + 96 GB unified | mlx 0.31.3 | [r_y2_5y8oo97d](/r/r_y2_5y8oo97d) |
+| 3 | 168.3 | mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit | M3 Ultra (60-core GPU) + 96 GB unified | mlx 0.31.3 | [r_l_v1-zq_qaz](/r/r_l_v1-zq_qaz) |
 
-The fastest signed run as of 2026-05-01 is 432.2 decode tok/s for
-`meta-llama/llama-4-scout` via OpenRouter on the `chat-short` workload —
-[r_g4ph40ae0e1](/r/r_g4ph40ae0e1). The hosted-API number reflects upstream
-provider speed (OpenRouter routes Llama-4-Scout to wafer-scale serving), not
-local hardware. The fastest local-hardware run is 286.5 decode tok/s for
-`Qwen2.5-0.5B-Instruct-4bit` on M3 Pro via MLX —
-[r_akcbpx5vcqa](/r/r_akcbpx5vcqa).
+The two hosted-API runs this table used to list are no longer public, so they
+are not linked here.
 
 The full live ranking is at [`/cheatsheet`](/cheatsheet), recomputed from the
 public API on every page render.

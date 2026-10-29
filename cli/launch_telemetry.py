@@ -33,6 +33,10 @@ UPLOADED_EXTRAS_KEYS = (
     "server_n_ctx",
     "model_file",
     "model_file_bytes",
+    # 0.0.10 (cli/sampling.py): settings sent with each request, and requested
+    # keys the backend could not take. Numbers and fixed key names only.
+    "sampling",
+    "sampling_ignored",
 )
 
 # ---------------------------------------------------------------------------
@@ -268,6 +272,53 @@ _ARG_ALLOWLIST = {
     "--rope-freq-base",
     "--yarn-orig-ctx",
 }
+
+# 0.0.10: flags whose values are checked strictly. A flag listed here is kept only
+# with a value of its declared kind (anything else becomes ``<redacted>``), and a
+# value-less flag never swallows the next token. Fixed flag names and
+# numeric / enum values only: no paths, no free text. Names and value types follow
+# llama.cpp common/arg.cpp (checked against 9725a313b, the 2026-10-22 5090 rerun).
+_INT = "int"
+_NUM = "num"
+_NONE = "none"
+# on/off/auto plus the numeric spellings llama.cpp also takes; nothing else (PRIVACY.md
+# promises numbers or on/off/auto only).
+_ON_OFF_AUTO = frozenset({"on", "off", "auto", "1", "0", "-1"})
+_STRICT_ARGS: dict[str, object] = {
+    # prompt cache (llama-server; both off for comparable timings)
+    "--no-cache-prompt": _NONE,
+    "--cache-prompt": _NONE,
+    "-cram": _INT,  # MiB, -1 = no limit, 0 = disable
+    "--cache-ram": _INT,
+    # sampling (server-side defaults; the CLI now also sends them per request)
+    "--temp": _NUM,
+    "--temperature": _NUM,
+    "-s": _INT,  # seed
+    "--seed": _INT,
+    "--top-k": _INT,
+    "--top-p": _NUM,
+    "--min-p": _NUM,
+    # thinking on/off (llama.cpp "-rea, --reasoning [on|off|auto]")
+    "-rea": _ON_OFF_AUTO,
+    "--reasoning": _ON_OFF_AUTO,
+    # allowed by the preset schema's server_args pattern
+    "--kv-unified": _NONE,
+    # value-less flags that were already allowlisted: never consume the next token
+    "--no-mmap": _NONE,
+    "--mlock": _NONE,
+    "--jinja": _NONE,
+    "--no-kv-offload": _NONE,
+    "-nkvo": _NONE,
+    "--cpu-moe": _NONE,
+    "-cmoe": _NONE,
+    "--swa-full": _NONE,
+    "--no-warmup": _NONE,
+    "--cont-batching": _NONE,
+    "--no-cont-batching": _NONE,
+}
+_ARG_ALLOWLIST |= set(_STRICT_ARGS)
+_INT_RE = re.compile(r"-?[0-9]{1,10}")
+_NUM_RE = re.compile(r"-?[0-9]{1,7}(\.[0-9]{1,6})?")
 _MAX_ARGS_LABEL = 200
 
 
@@ -292,7 +343,18 @@ def label_server_args(args: list[str]) -> str | None:
     while i < len(args):
         tok = args[i]
         flag, eq, val = tok.partition("=")
-        if flag.startswith("-") and flag in _ARG_ALLOWLIST:
+        if flag.startswith("-") and flag in _STRICT_ARGS:
+            kind = _STRICT_ARGS[flag]
+            if kind == _NONE:
+                out.append(f"{flag}=<redacted>" if eq else flag)
+            elif eq:
+                out.append(f"{flag}={_strict_value(val, kind)}")
+            else:
+                out.append(flag)
+                if i + 1 < len(args) and not _looks_like_flag(args[i + 1]):
+                    out.append(_strict_value(args[i + 1], kind))
+                    i += 1
+        elif flag.startswith("-") and flag in _ARG_ALLOWLIST:
             if eq:
                 out.append(f"{flag}={_safe_value(val)}")
             else:
@@ -315,6 +377,16 @@ def label_server_args(args: list[str]) -> str | None:
 
 def _looks_like_flag(tok: str) -> bool:
     return tok.startswith("-") and not re.fullmatch(r"-\d+(\.\d+)?", tok)
+
+
+def _strict_value(val: str, kind: object) -> str:
+    if kind == _INT and _INT_RE.fullmatch(val):
+        return val
+    if kind == _NUM and _NUM_RE.fullmatch(val):
+        return val
+    if isinstance(kind, frozenset) and val in kind:
+        return val
+    return "<redacted>"
 
 
 def _safe_value(val: str) -> str:
