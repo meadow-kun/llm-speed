@@ -27,6 +27,7 @@ import traceback
 from pathlib import Path
 
 from .. import SUITE_VERSION, __version__
+from .. import sampling as sampling_mod
 from ..config import DEFAULT_API_BASE, DEFAULT_WORKLOADS, QUICK_WORKLOADS
 from ..consent import has_consented, prompt_for_consent
 from ..fingerprint import detect_fingerprint
@@ -47,7 +48,6 @@ from ..upload import (
     save_offline,
     upload_or_save,
     upload_saved_payload,
-    warn_if_insecure_api_base,
 )
 from ..upload_guard import offline, upload_block_reason
 
@@ -213,10 +213,14 @@ def _finish_memory_probe(driver, sampler: NvidiaVramSampler | None) -> dict:
     return {}
 
 
-def _attach_launch_telemetry(res: WorkloadResult, driver, model, mem: dict) -> None:
+def _attach_launch_telemetry(
+    res: WorkloadResult, driver, model, mem: dict, sampling: dict | None = None
+) -> None:
     """Fold 0.0.8 launch fields into res.extras (see launch_telemetry.UPLOADED_EXTRAS_KEYS)."""
     extras = dict(res.extras or {})
     extras.update(mem)
+    # 0.0.10: the sampling settings each request carried (cli/sampling.py).
+    extras.update(sampling_mod.record(driver, model, sampling))
     pop = getattr(driver, "pop_run_telemetry", None)
     telemetry = pop() if callable(pop) else []
     # Only single-stream workloads have one unambiguous "first answer".
@@ -260,8 +264,12 @@ def _handle_resume(args) -> int:
     if blocked:
         print_error(f"not uploading {path.name}: {blocked}")
         return 1
-    if not anon:
-        warn_if_insecure_api_base(api_base, api_key)
+    # L-1: refuse plain http off loopback; warn (once) for any non-canonical host.
+    ok, api_key = _guard_upload_base(args, api_base, api_key, anon)
+    if not ok:
+        return 2
+
+    from ..credit import effective_credit
 
     try:
         url = upload_saved_payload(
@@ -270,6 +278,7 @@ def _handle_resume(args) -> int:
             api_key=api_key,
             anon=anon,
             strict_anon=getattr(args, "strict_anon", False),
+            credit=effective_credit(args),
         )
     except Exception as exc:
         print_error(f"resume upload failed: {exc}")
@@ -279,7 +288,59 @@ def _handle_resume(args) -> int:
     return 0
 
 
+def _guard_upload_base(
+    args, api_base: str, api_key: str | None, anon: bool
+) -> tuple[bool, str | None]:
+    """`cli.api_host.guard_api_base` for a bench upload. Returns (ok, api_key to use).
+
+    ok is False (after printing the reason) when the target is refused; the caller
+    exits non-zero. N-5: the API key is dropped (the upload goes ahead without it)
+    when the host isn't api.llm-speed.com and the user didn't opt in to that exact
+    host with --allow-token-to-host / $LLM_SPEED_ALLOW_TOKEN_HOST."""
+    from ..api_host import (
+        InsecureApiBase,
+        api_base_source,
+        check_api_base,
+        display_host,
+        guard_api_base,
+        token_allowed,
+        token_opt_in_hint,
+    )
+
+    try:
+        check_api_base(api_base)
+    except InsecureApiBase as exc:
+        print_error(f"{exc} (from {api_base_source(args)})")
+        return False, None
+    if api_key and not anon and not token_allowed(api_base, args):
+        sys.stderr.write(
+            f"note: not sending your API key to {display_host(api_base)} (from "
+            f"{api_base_source(args)}; it is not api.llm-speed.com). Uploading without "
+            f"it. To send it there, pass {token_opt_in_hint(api_base)}.\n"
+        )
+        api_key = None
+    guard_api_base(
+        api_base, source=api_base_source(args), bearer=bool(api_key) and not anon
+    )
+    return True, api_key
+
+
 def cmd_bench(args) -> int:
+    # Contributor credit: reject bad handles / forbidden combos before any work.
+    from ..credit import CreditError, check_flags
+
+    try:
+        check_flags(args)
+    except CreditError as exc:
+        print_error(str(exc))
+        return 2
+    # Sampling sent with every request (--temperature/--seed/--top-k/--top-p/--min-p).
+    # Validated before any work, also for --preset (passed on to each step).
+    try:
+        sampling = sampling_mod.from_args(args)
+    except sampling_mod.SamplingError as exc:
+        print_error(f"invalid sampling setting: {exc}")
+        return 2
     # --resume short-circuits everything else.
     if getattr(args, "resume", None):
         return _handle_resume(args)
@@ -313,10 +374,13 @@ def cmd_bench(args) -> int:
     # --strict-anon implies --anon for the soft headers fallback path.
     anon = getattr(args, "anon", False) or strict_anon
 
-    # Warn loudly (but don't block) if the bearer would travel over plaintext.
-    # Skipped under any anon mode because those paths don't send Authorization.
-    if not anon and not no_upload:
-        warn_if_insecure_api_base(api_base, api_key)
+    # L-1: before any work, refuse an upload target over plain http (loopback
+    # excepted) and warn once, naming the host, when it isn't api.llm-speed.com.
+    # The bearer is only mentioned when it would actually be sent (no anon mode).
+    if not no_upload:
+        ok, api_key = _guard_upload_base(args, api_base, api_key, anon)
+        if not ok:
+            return 2
 
     # 1. Fingerprint.
     try:
@@ -413,6 +477,23 @@ def cmd_bench(args) -> int:
         if model is None:
             return 1
 
+    if sampling:
+        if hasattr(driver, "sampling"):
+            driver.sampling = dict(sampling)
+            _sent, ignored = sampling_mod.split(
+                sampling, sampling_mod.supported_for(driver, model)
+            )
+            if ignored:
+                print_warning(
+                    f"backend {backend_name!r} cannot take {', '.join(ignored)}; "
+                    "recorded as ignored"
+                )
+        else:
+            print_warning(
+                f"sampling settings ignored: backend {backend_name!r} does not take them"
+            )
+            sampling = {}
+
     # 4. Workloads.
     workload_names = _select_workloads(
         getattr(args, "workload", None), getattr(args, "quick", False)
@@ -476,7 +557,7 @@ def cmd_bench(args) -> int:
             # fill it in here so summary tables and uploaded JSON show it.
             if res.backend_version is None and backend_version is not None:
                 res.backend_version = backend_version
-            _attach_launch_telemetry(res, driver, model, mem)
+            _attach_launch_telemetry(res, driver, model, mem, sampling)
             if is_load_failure((res.extras or {}).get("failure_kind")):
                 load_failure = res
             results.append(res)
@@ -495,7 +576,10 @@ def cmd_bench(args) -> int:
             failed = _failed_result(
                 wname, model, backend_name, f"{type(exc).__name__}: {exc}"
             )
-            failed.extras = {"failure_kind": classify_failure(failed.error)}
+            failed.extras = {
+                "failure_kind": classify_failure(failed.error),
+                **sampling_mod.record(driver, model, sampling),
+            }
             results.append(failed)
             console.print(f" [red]exception:[/red] {exc}")
 
@@ -523,7 +607,13 @@ def cmd_bench(args) -> int:
 
     # --print-payload: emit the upload body (a `{"jws": "..."}` envelope).
     if print_payload:
-        payload = build_upload_payload(report, strict_anon=strict_anon)
+        from ..credit import effective_credit
+
+        payload = build_upload_payload(
+            report,
+            strict_anon=strict_anon,
+            credit=None if anon else effective_credit(args),
+        )
         sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True))
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -576,13 +666,22 @@ def cmd_bench(args) -> int:
                 )
 
             if consent_ok:
+                # One optional question, asked once, only with a human at a TTY
+                # (never in CI, --yes, --strict-anon, --anon or agent children).
+                from ..credit import effective_credit, maybe_ask
+
+                maybe_ask(args)
+                credit = None if anon else effective_credit(args)
                 result_url, fallback_path = upload_or_save(
                     report,
                     api_base=api_base,
                     api_key=api_key,
                     anon=anon,
                     strict_anon=strict_anon,
+                    credit=credit,
                 )
+                if result_url and credit:
+                    console.print(f"Credited to {credit.display} (unverified).")
                 # If upload failed and upload_or_save fell back to a save, prefer
                 # the originally-saved path for the message (less confusing).
                 if fallback_path is not None and offline_path is None:

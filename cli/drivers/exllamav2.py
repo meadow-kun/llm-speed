@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from ..registry import register_driver
+from ..sampling import DRIVER_SUPPORT as SAMPLING_DRIVER_SUPPORT
+from ..sampling import split as split_sampling
 from ..timing import now_ms, stopwatch
 from ..types import (
     BackendDetection,
@@ -50,6 +52,12 @@ class Exllamav2Driver:
 
     def __init__(self) -> None:
         self._loaded: dict[str, tuple[Any, Any, Any, Any]] = {}
+        # Sampling applied to every generation (cli/sampling.py; set by `bench`).
+        self.sampling: dict[str, Any] = {}
+
+    def sampling_supported(self, model: ModelRef | None = None) -> tuple[str, ...]:
+        """Sampling keys this driver sends per request (cli/sampling.py)."""
+        return SAMPLING_DRIVER_SUPPORT["exllamav2"]
 
     # ------------------------------------------------------------------
     # detection
@@ -288,6 +296,13 @@ class Exllamav2Driver:
 
         sampler_cls = getattr(generator_mod, "ExLlamaV2Sampler", None)
         settings = sampler_cls.Settings() if sampler_cls is not None else None
+        # 0.0.10: sampling from the bench command line / preset (no per-request seed).
+        if settings is not None:
+            sent, _ignored = split_sampling(
+                self.sampling, self.sampling_supported(model)
+            )
+            for key, value in sent.items():
+                setattr(settings, key, value)
 
         # Encode prompt for token-count and to seed the stream generator.
         try:

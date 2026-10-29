@@ -23,6 +23,8 @@ from typing import Any
 import httpx
 
 from ..registry import register_driver
+from ..sampling import DRIVER_SUPPORT as SAMPLING_DRIVER_SUPPORT
+from ..sampling import split as split_sampling
 from ..timing import now_ms
 from ..types import (
     BackendDetection,
@@ -77,10 +79,16 @@ class OllamaDriver:
 
     def __init__(self, base_url: str = DEFAULT_BASE) -> None:
         self.base_url = base_url
+        # Sampling sent with every request (cli/sampling.py; set by `bench`).
+        self.sampling: dict[str, Any] = {}
         # Daemon-local; tight default timeouts. We override per-request for chat.
         self._client = httpx.Client(
             timeout=httpx.Timeout(LIST_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
         )
+
+    def sampling_supported(self, model: ModelRef | None = None) -> tuple[str, ...]:
+        """Sampling keys this driver sends per request (cli/sampling.py)."""
+        return SAMPLING_DRIVER_SUPPORT["ollama"]
 
     # -------------------------------------------------------------------- detect
 
@@ -179,8 +187,11 @@ class OllamaDriver:
         extras = dict(extras or {})
 
         options: dict[str, Any] = {"num_predict": int(max_output_tokens)}
-        # passthrough generation knobs
-        for k in ("temperature", "top_p", "top_k", "seed", "num_ctx", "stop"):
+        # 0.0.10: sampling from the bench command line / preset (Ollama "options").
+        sent, _ignored = split_sampling(self.sampling, self.sampling_supported(model))
+        options.update(sent)
+        # passthrough generation knobs (per call; wins)
+        for k in ("temperature", "top_p", "top_k", "min_p", "seed", "num_ctx", "stop"):
             if k in extras:
                 options[k] = extras[k]
         if "options" in extras and isinstance(extras["options"], dict):

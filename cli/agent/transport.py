@@ -5,7 +5,7 @@ to `QueueClient`'s methods and the small result types."""
 
 from __future__ import annotations
 
-import os
+import logging
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -13,9 +13,15 @@ from urllib.parse import urlparse
 import httpx
 
 from .. import __version__
+from .. import agent_job as _agent_job
+from ..api_host import CANONICAL_API_BASE, InsecureApiBase, warn_if_noncanonical
+from ..api_host import check_api_base as _check_upload_base
 from ..config import DEFAULT_API_BASE
 
-CANONICAL_API = "https://api.llm-speed.com"
+CANONICAL_API = CANONICAL_API_BASE
+
+
+log = logging.getLogger("cli.agent")
 
 
 class QueueError(Exception):
@@ -41,27 +47,28 @@ class Claim:
     resumed: bool = False
 
 
+# Test-suite hook, not a setting: only a test may flip it (monkeypatch.setattr). Nothing in
+# a real run sets it, and no environment variable or flag reaches it (0.0.9's
+# LLM_SPEED_AGENT_INSECURE_OK=1 is gone and is ignored if set).
+_INSECURE_OK_FOR_TESTS = False
+
+
 def check_api_base(api_base: str) -> None:
     """Any https queue (the official one or self-hosted); plain http only to this
-    machine's loopback. No credentials, query or fragment in the URL. Tests opt out
-    explicitly with LLM_SPEED_AGENT_INSECURE_OK=1."""
-    if os.environ.get("LLM_SPEED_AGENT_INSECURE_OK") == "1":
+    machine's loopback. No credentials, query or fragment in the URL."""
+    if _INSECURE_OK_FOR_TESTS:
         return
     try:
         u = urlparse(api_base)
-        host = u.hostname
     except ValueError:
-        u, host = urlparse(""), None
-    loopback = host in ("localhost", "127.0.0.1", "::1")
-    if (
-        not host
-        or u.scheme not in ("https", "http")
-        or (u.scheme == "http" and not loopback)
-        or u.username is not None
-        or u.password is not None
-        or u.query
-        or u.fragment
-    ):
+        u = urlparse("")
+    try:
+        # Same scheme / loopback / credentials rule as every CLI upload (cli.api_host).
+        _check_upload_base(api_base)
+        bad = bool(u.query or u.fragment)
+    except InsecureApiBase:
+        bad = True
+    if bad:
         raise QueueError(
             0,
             "insecure_api_base",
@@ -79,7 +86,17 @@ class QueueClient:
     ):
         self.api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
         check_api_base(self.api_base)
+        # L-1: a self-hosted queue is supported, but say so (once per process) before
+        # the machine token or a pairing secret goes there.
+        warn_if_noncanonical(
+            self.api_base,
+            source="the agent's queue (--api-base / enrolled base)",
+            bearer=True,
+            what="this machine's agent token and job results",
+        )
         self.token = token
+        # R-36: declare the upload-nonce feature in claims until a queue refuses the key.
+        self._declare_features = True
         self._http = httpx.Client(
             timeout=timeout, headers={"User-Agent": f"llm-speed-agent/{__version__}"}
         )
@@ -128,17 +145,22 @@ class QueueClient:
         return r.status_code, out
 
     # -- pairing (no token yet)
-    def pair_start(self, capabilities: dict, label: str | None) -> dict:
-        _, b = self._req(
-            "POST",
-            "/v1/agent/pair",
-            auth=False,
-            json={
-                "cli_version": __version__,
-                "label": label,
-                "capabilities": capabilities,
-            },
-        )
+    def pair_start(
+        self,
+        capabilities: dict,
+        label: str | None,
+        enrolment_token: str | None = None,
+    ) -> dict:
+        # Queues before the 2026-10-22 server fix rejected a JSON null label
+        # (agent-queue.ts handlePair), so the key is left out when unset.
+        body: dict[str, Any] = {
+            "cli_version": __version__,
+            "capabilities": capabilities,
+            **({"label": label} if label else {}),
+        }
+        if enrolment_token:
+            body["enrolment_token"] = enrolment_token  # R-8: sent once, never logged
+        _, b = self._req("POST", "/v1/agent/pair", auth=False, json=body)
         return b
 
     def pair_poll(self, pairing_id: str, poll_secret: str) -> tuple[str, dict]:
@@ -174,12 +196,31 @@ class QueueClient:
 
     def claim(self, capabilities: dict) -> Claim:
         """capabilities includes "presets": [{name, version, sha256}] (queue API spec section 4)."""
-        st, b, h = self._req(
-            "POST",
-            "/v1/agent/claim",
-            json={"cli_version": __version__, "capabilities": capabilities},
-            want_headers=True,
-        )
+        body: dict[str, Any] = {
+            "cli_version": __version__,
+            "capabilities": capabilities,
+        }
+        key = _agent_job.CLAIM_FEATURES_KEY
+        if self._declare_features:
+            # This build echoes the nonce (cli/agent_job.py), so it asks for it (R-36).
+            body[key] = [_agent_job.UPLOAD_NONCE_FEATURE]
+        try:
+            st, b, h = self._req(
+                "POST", "/v1/agent/claim", json=body, want_headers=True
+            )
+        except QueueError as e:
+            # A queue from before R-36 refuses unknown claim keys ("unknown field: features").
+            # Drop the key for this process and ask once more; nothing else is retried.
+            if not (
+                key in body and e.status == 400 and f"unknown field: {key}" in str(e)
+            ):
+                raise
+            self._declare_features = False
+            log.info("the queue doesn't take claim %s yet; claiming without it", key)
+            body.pop(key)
+            st, b, h = self._req(
+                "POST", "/v1/agent/claim", json=body, want_headers=True
+            )
         if st == 204 or not b.get("job"):
             control = dict(b.get("control") or {})
             pa = h.get("X-Poll-After-S")

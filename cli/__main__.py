@@ -40,7 +40,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--api-base",
         default=None,
-        help="override API base URL (default: $LLM_SPEED_API)",
+        help=(
+            "override API base URL (default: $LLM_SPEED_API, else "
+            "https://api.llm-speed.com). Any other host gets a warning naming it; "
+            "plain http:// is refused except to localhost / 127.0.0.1 / ::1"
+        ),
+    )
+    parser.add_argument(
+        "--allow-token-to-host",
+        default=None,
+        metavar="HOST",
+        help=(
+            "send your --api-key / bearer token to this non-default API host (exact "
+            "host[:port], e.g. queue.example.org or 127.0.0.1:8787). Without it, or "
+            "$LLM_SPEED_ALLOW_TOKEN_HOST, uploads to any host other than "
+            "api.llm-speed.com go without the key"
+        ),
     )
     parser.add_argument(
         "--auto",
@@ -85,6 +100,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="strongest privacy: rotate keypair per run, drop fingerprint_hash, no User-Agent",
     )
     p_bench.add_argument(
+        "--credit",
+        default=None,
+        metavar="HANDLE",
+        help=(
+            "credit this run's upload to your X (@name) or Reddit (u/name) handle, shown "
+            "publicly as unverified; overrides `llm-speed config credit` for this run. "
+            "Not allowed with --strict-anon or --anon"
+        ),
+    )
+    p_bench.add_argument(
+        "--no-credit",
+        action="store_true",
+        help="upload this run without your saved credit handle",
+    )
+    p_bench.add_argument(
         "--dry-run",
         action="store_true",
         help="run workloads but skip upload AND skip local save; print would-be payload",
@@ -106,6 +136,40 @@ def _build_parser() -> argparse.ArgumentParser:
             "$LLM_SPEED_LLAMA_ARGS. Allowlisted flags and values are uploaded as a label; "
             "anything else is redacted."
         ),
+    )
+    # Sampling sent with every request (0.0.10). Validated in cli/sampling.py.
+    p_bench.add_argument(
+        "--temperature",
+        default=None,
+        metavar="T",
+        help="sampling temperature sent with every request (0-5, e.g. 0 for greedy)",
+    )
+    p_bench.add_argument(
+        "--seed",
+        default=None,
+        metavar="N",
+        help="sampling seed sent with every request (0-4294967295)",
+    )
+    p_bench.add_argument(
+        "--top-k",
+        dest="top_k",
+        default=None,
+        metavar="K",
+        help="top-k sent with every request (0-1000)",
+    )
+    p_bench.add_argument(
+        "--top-p",
+        dest="top_p",
+        default=None,
+        metavar="P",
+        help="top-p sent with every request (0-1)",
+    )
+    p_bench.add_argument(
+        "--min-p",
+        dest="min_p",
+        default=None,
+        metavar="P",
+        help="min-p sent with every request (0-1)",
     )
     p_bench.add_argument(
         "--upload-failures",
@@ -155,7 +219,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument(
         "--yes",
         action="store_true",
-        help="--preset: answer yes to the llama.cpp install prompt",
+        help="--preset: answer yes to the llama.cpp install prompt (and never ask the one-time credit question)",
     )
     p_bench.add_argument(
         "--force",
@@ -176,6 +240,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p_preset.add_argument("preset_action", choices=["hash", "show", "list"])
     p_preset.add_argument(
         "name", nargs="?", default=None, help="preset name, e.g. flint-40b"
+    )
+
+    # config -------------------------------------------------------------
+    p_config = sub.add_parser(
+        "config", help="show or change settings (credit: your public handle on uploads)"
+    )
+    p_config.add_argument("config_key", choices=["credit"], metavar="credit")
+    p_config.add_argument(
+        "value",
+        nargs="?",
+        default=None,
+        metavar="HANDLE",
+        help="@name (X) or u/name (Reddit); omit to show the current setting",
+    )
+    p_config.add_argument(
+        "--clear",
+        action="store_true",
+        help="remove the handle; uploads become anonymous",
     )
 
     # detect -------------------------------------------------------------
@@ -214,32 +296,30 @@ def _build_parser() -> argparse.ArgumentParser:
         "wheel",
         nargs="?",
         default=None,
-        help="path to the local wheel (default: ./dist/<the wheel>)",
-    )
-    p_verify.add_argument(
-        "--dist-base",
-        default=None,
-        help="override the base URL where the published wheel + sidecar live",
+        help=(
+            "path to the local wheel (default: ./dist/<the wheel> or the pipx cache, "
+            "else the published wheel is downloaded from the GitHub release / PyPI)"
+        ),
     )
     p_verify.add_argument(
         "--no-cross-check",
         action="store_true",
         help=(
-            "skip the GitHub-Releases cross-check (offline / corp firewall). "
-            "Degrades the trust chain to a single distribution domain — only "
-            "use this if you genuinely cannot reach github.com."
+            "skip the GitHub release (offline / corp firewall): check against "
+            "PyPI's digest only. Not allowed with --sigstore."
         ),
     )
     p_verify.add_argument(
         "--sigstore",
         action="store_true",
         help=(
-            "additionally verify the Sigstore bundle for the wheel. Requires "
-            "`pip install sigstore`; without it the flag is a no-op with a "
-            "warning. The bundle is fetched from llm-speed.com/dist/ and "
-            "verified against the Fulcio cert + Rekor inclusion proof, with "
-            "the OIDC issuer + workflow identity bound to "
-            "meadow-kun/llm-speed's release-sign.yml."
+            "strict: also require the Sigstore bundle "
+            "llm_speed-V-py3-none-any.whl.sigstore.json from the public GitHub "
+            "release vV, verified against meadow-kun/llm-speed-web "
+            "release-sign.yml@refs/tags/vV, and require the GitHub release sha256 "
+            "and PyPI's sha256 to agree with the wheel. Needs `sigstore` installed "
+            "(pipx inject llm-speed sigstore). Anything missing, unreachable or "
+            "failing prints NOT VERIFIED and exits 1."
         ),
     )
 
@@ -332,6 +412,10 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
         from .commands.preset import cmd_preset_tool
 
         return cmd_preset_tool(args)
+    if cmd == "config":
+        from .credit import cmd_config
+
+        return cmd_config(args)
     if cmd == "detect":
         from .commands.detect import cmd_detect
 
@@ -393,7 +477,7 @@ def _cmd_mcp(args) -> int:
         return 1
     # Warn (not block) when LLM_SPEED_API_BASE / LLM_SPEED_SITE_BASE is
     # set to anything other than the canonical hosts. Mirrors the
-    # symmetric warning in cli.upload.warn_if_insecure_api_base. No
+    # symmetric warning in cli.api_host.warn_if_noncanonical. No
     # bearer token leaks here (the MCP server is read-only / no auth),
     # but a hostile env var would feed poisoned rows to the user's LLM
     # client — which compounds with the I-1 sanitisation defence.

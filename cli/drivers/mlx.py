@@ -18,6 +18,8 @@ from typing import Any
 
 from ..launch_telemetry import ReasoningTracker
 from ..registry import register_driver
+from ..sampling import SAMPLING_KEYS
+from ..sampling import split as split_sampling
 from ..timing import now_ms, stopwatch
 from ..types import (
     BackendDetection,
@@ -70,6 +72,59 @@ class MlxDriver:
     def __init__(self) -> None:
         self._loaded: dict[str, tuple[Any, Any]] = {}
         self._telemetry: list[dict[str, Any]] = []
+        # Sampling applied to every generation (cli/sampling.py; set by `bench`).
+        self.sampling: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # sampling (0.0.10): mlx_lm make_sampler(temp, top_p, min_p, top_k) and
+    # mx.random.seed. Only keys this mlx_lm really accepts count as sent.
+    # ------------------------------------------------------------------
+    _MAKE_SAMPLER_ARG = {
+        "temperature": "temp",
+        "top_p": "top_p",
+        "min_p": "min_p",
+        "top_k": "top_k",
+    }
+
+    @staticmethod
+    def _make_sampler_fn() -> Any | None:
+        try:
+            mod = importlib.import_module("mlx_lm.sample_utils")
+        except Exception:  # noqa: BLE001
+            return None
+        fn = getattr(mod, "make_sampler", None)
+        return fn if callable(fn) else None
+
+    def sampling_supported(self, model: ModelRef | None = None) -> tuple[str, ...]:
+        import inspect
+
+        keys: set[str] = set()
+        fn = self._make_sampler_fn()
+        if fn is not None:
+            try:
+                params = set(inspect.signature(fn).parameters)
+            except (TypeError, ValueError):
+                params = set()
+            keys |= {k for k, a in self._MAKE_SAMPLER_ARG.items() if a in params}
+        random = getattr(self._mx_core(), "random", None)
+        if callable(getattr(random, "seed", None)):
+            keys.add("seed")
+        return tuple(k for k in SAMPLING_KEYS if k in keys)
+
+    def _generation_kwargs(self, model: ModelRef) -> dict[str, Any]:
+        """kwargs for stream_generate/generate; seeds mx.random as a side effect."""
+        sent, _ignored = split_sampling(self.sampling, self.sampling_supported(model))
+        if "seed" in sent:
+            self._mx_core().random.seed(int(sent["seed"]))
+        knobs = {
+            self._MAKE_SAMPLER_ARG[k]: v
+            for k, v in sent.items()
+            if k in self._MAKE_SAMPLER_ARG
+        }
+        if not knobs:
+            return {}
+        fn = self._make_sampler_fn()
+        return {"sampler": fn(**knobs)} if fn is not None else {}
 
     # ------------------------------------------------------------------
     # launch telemetry (0.0.8): peak memory + reasoning split
@@ -352,6 +407,19 @@ class MlxDriver:
         ttft_ms: float | None = None
         output_pieces: list[str] = []
         output_tokens = 0
+        try:
+            gen_kwargs = self._generation_kwargs(model)
+        except Exception as exc:  # noqa: BLE001
+            return ChatRunOutcome(
+                success=False,
+                output_text="",
+                prompt_tokens=prompt_token_count,
+                output_tokens=0,
+                ttft_ms=None,
+                decode_token_times_ms=[],
+                wall_ms=0.0,
+                error=f"mlx sampling setup failed: {exc}",
+            )
 
         stream_generate = getattr(mlx_lm, "stream_generate", None)
         if stream and callable(stream_generate):
@@ -365,6 +433,7 @@ class MlxDriver:
                         tokenizer,
                         formatted_prompt,
                         max_tokens=max_output_tokens,
+                        **gen_kwargs,
                     ):
                         token_ts = now_ms()
                         text = self._extract_text(piece)
@@ -420,6 +489,7 @@ class MlxDriver:
                     tokenizer,
                     formatted_prompt,
                     max_tokens=max_output_tokens,
+                    **gen_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
                 return ChatRunOutcome(

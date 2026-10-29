@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import json
@@ -11,10 +12,13 @@ import sys
 import time
 
 from .. import __version__
+from ..api_host import display_host, same_api_base, token_allowed, token_opt_in_hint
 from ..config import DEFAULT_API_BASE
 from . import service
+from .label import LabelError, generate_default_label, is_valid, validate_label
 from .runner import Runner, approvals_dir, capabilities, read_status
 from .settings import (
+    LEGACY_KEYS,
     SETTABLE,
     Settings,
     atomic_write_json,
@@ -22,7 +26,15 @@ from .settings import (
     logs_dir,
     pause_path,
 )
-from .tokens import RedactFilter, delete_token, load_token, save_token
+from .tokens import (
+    RedactFilter,
+    Stored,
+    TokenStoreError,
+    delete_token,
+    describe_store,
+    load_token,
+    save_token,
+)
 from .transport import QueueClient, QueueError
 
 CONSENT_TEXT = """\
@@ -61,8 +73,23 @@ def _client(settings: Settings, args, *, auth: bool = True) -> QueueClient:
     asked = getattr(args, "api_base", None)
     if not auth:
         return QueueClient(asked)
-    enrolled = (settings.api_base or DEFAULT_API_BASE).rstrip("/")
-    if asked and asked.rstrip("/") != enrolled:
+    if settings.api_base:
+        enrolled = settings.api_base.rstrip("/")
+    else:
+        # Enrolled before the server was remembered: "the default". N-5: a default
+        # that only comes from $LLM_SPEED_API and isn't api.llm-speed.com gets the
+        # token only if the user opted in to that host.
+        enrolled = DEFAULT_API_BASE.rstrip("/")
+        if not token_allowed(enrolled, args):
+            raise QueueError(
+                0,
+                "token_host_not_allowed",
+                f"not sending this machine's token to {display_host(enrolled)} (from "
+                f"$LLM_SPEED_API; it is not api.llm-speed.com). Pass "
+                f"{token_opt_in_hint(enrolled)} if that is your queue, or re-enroll "
+                "with `llm-speed agent enroll --force --api-base URL`",
+            )
+    if asked and not same_api_base(asked, enrolled):
         raise QueueError(
             0,
             "api_base_mismatch",
@@ -70,6 +97,25 @@ def _client(settings: Settings, args, *, auth: bool = True) -> QueueClient:
             "(run `llm-speed agent enroll --force --api-base URL` to switch)",
         )
     return QueueClient(enrolled, load_token(settings.machine_id))
+
+
+def _enroll_base_refusal(args) -> str | None:
+    """N-5: enrolling makes the queue the one host this machine's token is sent to.
+    `--api-base URL` on the command line is that explicit choice; a non-default server
+    that only comes from $LLM_SPEED_API needs the token opt-in for that exact host
+    (an inherited environment variable is not a choice)."""
+    if getattr(args, "api_base", None):
+        return None
+    base = DEFAULT_API_BASE.rstrip("/")
+    if token_allowed(base, args):
+        return None
+    host = display_host(base)
+    return (
+        f"Not enrolling with {host}: it comes from $LLM_SPEED_API, not "
+        f"api.llm-speed.com, and the machine token would be sent there. If {host} is "
+        f"your queue, run `llm-speed agent enroll --api-base {base}` or pass "
+        f"{token_opt_in_hint(base)}."
+    )
 
 
 def _ask_consent() -> bool:
@@ -88,21 +134,114 @@ def _ask_consent() -> bool:
     return ans.strip().lower() in ("y", "yes")
 
 
+def _pairing_label(s: Settings, user_label: str | None, caps: dict) -> str:
+    """--label wins; else the saved label; else generate `<chip-slug>-<random>` once
+    and save it so re-pairing keeps the same name (never hostname/username)."""
+    if user_label:
+        return user_label
+    if s.label and is_valid(s.label):
+        return s.label.strip()
+    s.label = generate_default_label(caps)
+    s.save()
+    return s.label
+
+
+def _store_token(mid: str, token: str, args) -> Stored | None:
+    """Keep the once-delivered token: the login Keychain if it works, else the 0600
+    file (same process, token only in memory meanwhile). None = no store could keep
+    it; the message says what to do. The token is never printed."""
+    prefer = getattr(args, "token_store", None)
+    try:
+        return save_token(mid, token, None if prefer in (None, "auto") else prefer)
+    except (TokenStoreError, ValueError) as e:
+        print(
+            f"Approved, but the machine token could not be stored: {e}.\n"
+            "The server hands the token out only once, so this pairing is used up and "
+            "nothing was saved.\nNext: fix the cause above, ask your queue admin to "
+            f"revoke machine {mid}, then run `llm-speed agent install` again "
+            "(it prints a new pairing code to approve)."
+        )
+        return None
+
+
+def _explain_fallback(stored: Stored) -> None:
+    if not stored.fallback_reason:
+        return
+    print(
+        f"Note: the login Keychain could not be used ({stored.fallback_reason}),\n"
+        f"so the token is in {stored.where} instead (directory 0700). The service reads "
+        "it from there without an unlocked Keychain; nothing else to do.\n"
+        "To keep it in the Keychain instead, run `llm-speed agent enroll --force "
+        "--token-store keychain` in Terminal in the logged-in desktop session "
+        "(needs a new approval)."
+    )
+
+
 def cmd_enroll(args) -> int:
     ensure_dirs()
     s = Settings.load()
     if s.machine_id and load_token(s.machine_id) and not getattr(args, "force", False):
         print(f"Already enrolled as {s.machine_id}. Use --force to enroll again.")
         return 0
+    refusal = _enroll_base_refusal(args)
+    if refusal:
+        print(refusal)
+        return 2
+    from .enrolment import EnrolmentTokenError
+    from .enrolment import take as take_enrolment_token
+
+    if getattr(args, "enrolment_token_argv", None) is not None:
+        print(
+            "error: don't pass the enrolment token on the command line (other users can see "
+            "it, and it is now in your shell history; ask your queue admin for a new one). Put "
+            "it in a file only you can read (chmod 600) and pass --enrolment-token-file PATH, "
+            "or set LLM_SPEED_ENROLMENT_TOKEN.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        # Read (and drop $LLM_SPEED_ENROLMENT_TOKEN) before anything else can start.
+        enrol = take_enrolment_token(getattr(args, "enrolment_token_file", None))
+    except EnrolmentTokenError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    # Where it came from, for the "you can delete it now" note (never the path or value).
+    enrol_source = (
+        None
+        if enrol is None
+        else ("file" if getattr(args, "enrolment_token_file", None) else "env")
+    )
+    user_label = getattr(args, "label", None)
+    if user_label is not None:
+        try:
+            user_label = validate_label(user_label)
+        except LabelError as e:
+            print(f"Invalid --label: {e}. Nothing was sent.")
+            return 2
     if not _ask_consent():
         print("Not enrolled (no consent). Nothing was stored.")
         return 1
     try:
         client = _client(s, args, auth=False)
-        p = client.pair_start(capabilities(s), getattr(args, "label", None))
+        caps = capabilities(s)
+        label = _pairing_label(s, user_label, caps)
+        p = client.pair_start(caps, label, enrol)
     except QueueError as e:
+        if e.status == 401 and e.code == "invalid_enrolment":
+            print(
+                "The queue refused the enrolment token (wrong, expired or already used). "
+                "Not retrying without it; ask your queue admin for a new one."
+            )
+            return 1
         print(f"Could not start pairing: {e}")
         return 1
+    finally:
+        enrol = None  # forgotten after the pair request (201 or not)
+    if enrol_source is not None:
+        from .enrolment import DELETE_FILE_NOTE, UNSET_ENV_NOTE
+
+        # The queue took the token (it is single-use); nothing here keeps a copy.
+        print(DELETE_FILE_NOTE if enrol_source == "file" else UNSET_ENV_NOTE)
     code, pid, secret = p.get("code"), p.get("pairing_id"), p.get("poll_secret")
     if not (code and pid and secret):
         print("Unexpected pairing response from the server.")
@@ -130,16 +269,21 @@ def cmd_enroll(args) -> int:
                 if not mid or not token:
                     print("Approved, but the server sent no token.")
                     return 1
-                where = save_token(mid, token)
-                s.machine_id, s.label = mid, getattr(args, "label", None) or s.label
+                stored = _store_token(mid, token, args)
+                token = ""
+                if stored is None:
+                    return 1
+                s.machine_id, s.label = mid, label
                 s.api_base = client.api_base
+                s.token_store = stored.kind
                 s.consent = {
                     "at": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "cli_version": __version__,
                     "text_sha256": hashlib.sha256(CONSENT_TEXT.encode()).hexdigest(),
                 }
                 s.save()
-                print(f"Approved. Enrolled as {mid}; token stored in {where}.")
+                print(f"Approved. Enrolled as {mid}; token stored in {stored.where}.")
+                _explain_fallback(stored)
                 return 0
             if st in ("expired", "denied", "used", "unknown"):
                 why = {
@@ -150,7 +294,7 @@ def cmd_enroll(args) -> int:
                 return 1
             wait = float(body.get("poll_after_s") or wait)
     except KeyboardInterrupt:
-        print("\nStopped waiting. Nothing was stored.")
+        print("\nStopped waiting. No token was stored.")
         return 1
     print("Pairing timed out. Run `llm-speed agent enroll` again.")
     return 1
@@ -207,6 +351,14 @@ def cmd_run(args) -> int:
     except QueueError as e:
         print(str(e))
         return 1
+    for key in ("busy_util_pct", "busy_window_s", "busy_samples"):
+        val = getattr(args, key, None)
+        if val is not None:  # this run only; `agent config KEY VALUE` saves it
+            try:
+                setattr(s, key, SETTABLE[key](str(val)))
+            except ValueError as e:
+                print(f"bad --{key.replace('_', '-')}: {e}")
+                return 2
     return Runner(client, s).run_forever(once=getattr(args, "once", False))
 
 
@@ -249,6 +401,7 @@ def cmd_status(args) -> int:
         "cli_version": __version__,
         "enrolled": bool(s.machine_id and load_token(s.machine_id)),
         "machine_id": s.machine_id,
+        "token_store": describe_store(s.token_store) if s.machine_id else None,
         "consent": bool(s.consent),
         "paused": pause_path().exists(),
         "service": service.service_state(),
@@ -268,6 +421,8 @@ def cmd_status(args) -> int:
         return 0
     print(f"llm-speed agent {__version__}")
     print(f"  enrolled : {'yes, ' + str(s.machine_id) if out['enrolled'] else 'no'}")
+    if out["token_store"]:
+        print(f"  token    : {out['token_store']}")
     print(f"  service  : {out['service']}")
     print(f"  paused   : {'yes' if out['paused'] else 'no'}")
     print(
@@ -312,6 +467,9 @@ def cmd_config(args) -> int:
             )
         )
         return 0
+    if args.key in LEGACY_KEYS:
+        print(f"{args.key} was removed in 0.0.10: {LEGACY_KEYS[args.key]}")
+        return 2
     if args.key not in SETTABLE:
         print(
             f"unknown or read-only key {args.key!r}; settable: {', '.join(sorted(SETTABLE))}"
@@ -348,6 +506,22 @@ def add_parser(sub) -> None:
     e.add_argument("--label", default=None)
     e.add_argument("--force", action="store_true")
     e.add_argument("--timeout", type=int, default=600)
+    # A token on the command line is visible to every user (ps) and in shell history: the
+    # flag exists only to refuse it without echoing the value (exact match beats the
+    # --enrolment-token-file prefix).
+    e.add_argument(
+        "--enrolment-token",
+        dest="enrolment_token_argv",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    e.add_argument(
+        "--enrolment-token-file",
+        metavar="PATH",
+        default=None,
+        help="single-use enrolment token from your queue admin, read from a file only you "
+        "can read (chmod 600); or set $LLM_SPEED_ENROLMENT_TOKEN. Never pass it on the command line",
+    )
     i = asub.add_parser(
         "install",
         help="enroll if needed, then install + start the launchd/systemd user service",
@@ -355,6 +529,22 @@ def add_parser(sub) -> None:
     i.add_argument("--label", default=None)
     i.add_argument("--force", action="store_true")
     i.add_argument("--timeout", type=int, default=600)
+    # A token on the command line is visible to every user (ps) and in shell history: the
+    # flag exists only to refuse it without echoing the value (exact match beats the
+    # --enrolment-token-file prefix).
+    i.add_argument(
+        "--enrolment-token",
+        dest="enrolment_token_argv",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    i.add_argument(
+        "--enrolment-token-file",
+        metavar="PATH",
+        default=None,
+        help="single-use enrolment token from your queue admin, read from a file only you "
+        "can read (chmod 600); or set $LLM_SPEED_ENROLMENT_TOKEN. Never pass it on the command line",
+    )
     i.add_argument(
         "--dry-run", action="store_true", help="print what would be written/run"
     )
@@ -365,6 +555,24 @@ def add_parser(sub) -> None:
     u.add_argument("--dry-run", action="store_true")
     r = asub.add_parser("run", help="the poll loop (what the service runs)")
     r.add_argument("--once", action="store_true", help="one claim cycle, then exit")
+    r.add_argument(
+        "--busy-util-pct",
+        type=int,
+        default=None,
+        help="GPU busy above this utilization %% (this run; default: agent config, 15)",
+    )
+    r.add_argument(
+        "--busy-window-s",
+        type=float,
+        default=None,
+        help="seconds to sample GPU utilization over (this run; default 15)",
+    )
+    r.add_argument(
+        "--busy-samples",
+        type=int,
+        default=None,
+        help="utilization samples per window (this run; default 5)",
+    )
     pa = asub.add_parser("pause", help="stop taking jobs (local pause file)")
     pa.add_argument("--reason", default=None)
     pa.add_argument(
@@ -387,6 +595,14 @@ def add_parser(sub) -> None:
     c.add_argument("value", nargs="?")
     for parser in (p, e, i, r):
         _add_api_base(parser)
+    for parser in (e, i):
+        parser.add_argument(
+            "--token-store",
+            choices=("auto", "keychain", "file"),
+            default="auto",
+            help="where to keep the machine token (auto: login Keychain on macOS, "
+            "falling back to a 0600 file if the Keychain can't be used; file elsewhere)",
+        )
 
 
 API_BASE_HELP = (

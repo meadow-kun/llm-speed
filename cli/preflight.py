@@ -115,7 +115,9 @@ def check_core_deps(is_available: Callable[[str], bool] = _module_available) -> 
         required=True,
         remediation=(
             "The install is broken/incomplete. Reinstall: "
-            "`pipx install --force llm-speed` (or `pip install -e .` in a dev checkout)."
+            "`curl -fsSL https://llm-speed.com/install.sh | sh`, or "
+            "`pipx uninstall llm-speed && pipx install llm-speed` "
+            "(or `pip install -e .` in a dev checkout)."
         ),
     )
 

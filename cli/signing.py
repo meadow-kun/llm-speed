@@ -29,7 +29,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from joserfc import jws as joserfc_jws
+from joserfc.jwa import EdDSAAlgorithm as _JoseEdDSAAlgorithm
 from joserfc.jwk import OKPKey
+from joserfc.jws import JWSRegistry
 
 from .config import CONFIG_DIR
 from .fingerprint import to_uploadable_dict
@@ -41,7 +43,51 @@ log = logging.getLogger("cli.signing")
 KEY_DIR = CONFIG_DIR / "keys"
 KEY_PATH = KEY_DIR / "ed25519.key"
 
-ALG = "EdDSA"
+# The JWS `alg` header the CLI emits: "Ed25519", the fully-specified RFC 9864 name for
+# exactly what we sign with (the Worker accepts it since a763204, 2026-10-22, as well as
+# the older polymorphic "EdDSA"). Same Ed25519 signature bytes as before; only the header
+# name changes. joserfc >= 1.7 prints `SecurityWarning: EdDSA is deprecated via RFC 9864`
+# whenever its stock EdDSA algorithm is used, so "EdDSA" tokens (older saved runs) are
+# still verified through a private registry whose "EdDSA" entry is Ed25519-only and
+# carries no warning (Security Desk N-6).
+ALG = "Ed25519"
+# One-shot fallback (Security Desk fix 5): a server that still only knows "EdDSA" (an older
+# self-hosted Worker or api/server.py) answers "unexpected alg"; the upload is then re-signed
+# once with this name and sent again (cli/upload.py).
+FALLBACK_ALG = "EdDSA"
+ACCEPTED_ALGS = ("EdDSA", "Ed25519")
+
+
+class _Ed25519UnderEdDSAName(_JoseEdDSAAlgorithm):
+    """joserfc's EdDSA, restricted to the Ed25519 curve (RFC 9864 "Ed25519"
+    semantics), registered under the header name the Worker accepts. No security
+    warning: the ambiguity RFC 9864 deprecates (Ed25519 vs Ed448) is ruled out here."""
+
+    security_warning = None
+
+    def sign(self, msg: bytes, key: OKPKey) -> bytes:
+        if key.curve_name != "Ed25519":
+            raise ValueError("llm-speed signs with Ed25519 keys only")
+        return super().sign(msg, key)
+
+    def verify(self, msg: bytes, sig: bytes, key: OKPKey) -> bool:
+        if key.curve_name != "Ed25519":
+            return False
+        return super().verify(msg, sig, key)
+
+
+class _Registry(JWSRegistry):
+    # Class-level dict on purpose (that is how joserfc looks algorithms up); a fresh one
+    # so the global default registry is untouched.
+    algorithms = {
+        "EdDSA": _Ed25519UnderEdDSAName(),
+        "Ed25519": JWSRegistry.algorithms["Ed25519"],
+    }
+    recommended: list[str] = []
+
+
+def _registry(algs) -> JWSRegistry:
+    return _Registry(algorithms=list(algs))
 
 
 # ---------------------------------------------------------------------------
@@ -329,22 +375,26 @@ def sign_payload_jws(
     payload_dict: dict[str, Any],
     *,
     strict_anon: bool = False,
+    alg: str = ALG,
 ) -> str:
     """Sign a payload dict, return the compact-serialized JWS token.
 
-    Header: {alg: EdDSA, jwk: <pub>, typ: llm-speed+json}
+    Header: {alg: Ed25519, jwk: <pub>, typ: llm-speed+json} (Ed25519 key; see ALG)
     Payload: utf-8 JSON of payload_dict with separators (",", ":")
     """
     priv, pub = ephemeral_keypair() if strict_anon else get_or_create_keypair()
     okp = _ed25519_to_okp_jwk(priv, pub)
+    if alg not in ACCEPTED_ALGS:
+        raise ValueError(f"unsupported alg {alg!r}")
     header = {
-        "alg": ALG,
+        "alg": alg,
         "typ": "llm-speed+json",
         "jwk": public_jwk(pub),
     }
     payload_bytes = json.dumps(payload_dict, separators=(",", ":")).encode("utf-8")
-    # joserfc's default registry excludes EdDSA from "recommended" — pass it explicitly.
-    token = joserfc_jws.serialize_compact(header, payload_bytes, okp, algorithms=[ALG])
+    token = joserfc_jws.serialize_compact(
+        header, payload_bytes, okp, registry=_registry([alg])
+    )
     return token
 
 
@@ -381,8 +431,9 @@ def verify_jws_token(token: str) -> tuple[bool, str, dict[str, Any] | None]:
     except Exception as exc:  # noqa: BLE001
         return False, f"failed to parse header: {exc}", None
 
-    if header.get("alg") != ALG:
-        return False, f"unexpected alg: {header.get('alg')}", None
+    alg = header.get("alg")
+    if alg not in ACCEPTED_ALGS:
+        return False, f"unexpected alg: {alg}", None
     pub_jwk = header.get("jwk")
     if (
         not isinstance(pub_jwk, dict)
@@ -397,7 +448,7 @@ def verify_jws_token(token: str) -> tuple[bool, str, dict[str, Any] | None]:
         return False, f"jwk invalid: {exc}", None
 
     try:
-        obj = joserfc_jws.deserialize_compact(token, key, algorithms=[ALG])
+        obj = joserfc_jws.deserialize_compact(token, key, registry=_registry([alg]))
     except Exception as exc:  # noqa: BLE001
         return False, f"verification failed: {exc}", None
 

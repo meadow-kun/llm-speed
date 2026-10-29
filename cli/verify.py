@@ -1,31 +1,41 @@
 """``llm-speed verify`` - prove the wheel matches the published artifact.
 
-Concretely: compute the SHA-256 of a local wheel and compare it against the
-sidecar checksum file the orchestrator publishes next to the wheel on
-llm-speed.com. If they match, the user can show a friend that the binary they
-are about to run is byte-identical to a publicly-served artifact whose source
-is auditable on GitHub.
+Compute the SHA-256 of a wheel (a local one, or the published one downloaded from the
+public GitHub release, else PyPI) and compare it with the two independent published
+digests:
 
-What this does NOT prove:
+* the GitHub release sidecar
+  ``https://github.com/meadow-kun/llm-speed/releases/download/v<V>/<wheel>.sha256``
+  (written by ``release-sign.yml``, copied to the public release in docs/RELEASE.md
+  step 7), and
+* PyPI's per-file digest from ``https://pypi.org/pypi/llm-speed/<V>/json``.
 
-* That the published wheel was built from the commit it claims to be from -
-  reproducible-build attestation lives elsewhere. We *do* surface the
-  ``llm-speed`` package version + the linked git tag / commit so the user can
-  follow the chain manually.
-* That the wheel hasn't been swapped on the CDN since this run - the
-  comparison is point-in-time. Re-running ``verify`` is the way to recheck.
+Two published digests that disagree are a hard failure (one distribution chain was
+tampered with). Without ``--sigstore`` a MATCH needs at least one published digest equal
+to the wheel's, and every source that is missing or unreachable is named.
 
-The verdict is printed in plain English so the user can paste it as evidence
-of provenance.
+``--sigstore`` is strict: both digests must be published, reachable and equal to the
+wheel's, and the Sigstore bundle ``<wheel>.sigstore.json`` from the same GitHub release
+must verify against the exact signer identity of ``release-sign.yml`` on tag ``v<V>``.
+Anything missing, unreachable or failing prints NOT VERIFIED with the URLs tried and
+exits 1.
+
+llm-speed.com/dist/ is never consulted (it was the 0.0.1 pre-PyPI wheel host; nothing
+publishes it any more).
+
+What this does NOT prove: that the published wheel was built from the commit it claims
+(reproducible builds live elsewhere), or that nothing changes after this point-in-time
+check.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import logging
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -37,41 +47,66 @@ from .ui.theme import (
     C_OK,
     C_WARN,
     REPO_URL,
-    SITE_URL,
     get_console,
 )
 
 log = logging.getLogger("cli.verify")
 
-DEFAULT_DIST_BASE = f"{SITE_URL}/dist"
-
-# Independent trust domain. The sidecar at this URL is a best-effort
-# cross-check against PyPI — disagreement means one of the two
-# distribution chains was compromised, but 404 is acceptable (it just
-# means the CDN+GH-Releases legs aren't published for this version).
+# The public source/releases mirror. Every artifact verify reads from GitHub lives under
+# <GH_RELEASES_BASE>/v<version>/<file>. (Module constant so tests can point it at a
+# fake; there is deliberately no CLI flag to swap the trust root.)
 GH_RELEASES_BASE = "https://github.com/meadow-kun/llm-speed/releases/download"
+PYPI_PROJECT_NAME = "llm-speed"
+SIGSTORE_BUNDLE_SUFFIX = ".sigstore.json"
+MAX_BUNDLE_BYTES = 256 * 1024
+MAX_WHEEL_BYTES = 50 * 1024 * 1024  # the real wheel is ~200 KB
+
+# V-4: the signing certificate MUST carry this issuer and the identity of
+# `release-sign.yml` dispatched on the exact release tag (docs/RELEASE.md, "Signing
+# identity"). Any other identity, workflow or tag is a forgery, even if Rekor has it.
+# (0.0.9 and older pinned `release-pypi.yml@refs/heads/main`, which never signs.)
+SIGSTORE_EXPECTED_ISSUER = "https://token.actions.githubusercontent.com"
+SIGSTORE_IDENTITY_PREFIX = "https://github.com/meadow-kun/llm-speed-web/.github/workflows/release-sign.yml@refs/tags/"
 
 
 def wheel_name_for(version: str) -> str:
-    """The publishable wheel filename for a given version string.
-
-    Matches what `python -m build` produces and what PyPI / the CDN
-    serves. Centralised so a version bump doesn't drift filenames in
-    five places.
-    """
+    """The publishable wheel filename for a given version string."""
     return f"llm_speed-{version}-py3-none-any.whl"
 
 
 def release_tag_for(version: str) -> str:
-    """The GitHub Releases tag name for a given version string.
-
-    Convention: `v<version>`. The 2026-05-07 audit (F-13) flagged that
-    a separate `RELEASE_TAG = "v1.0.2"` hardcode let the GH-Releases
-    leg drift independently of `__version__`. The fix is to derive it.
-    If a future release uses a different tag scheme (e.g. a date-based
-    "release/2026-05" prefix), the *single* place to change is here.
-    """
+    """The GitHub Releases tag for a version: `v<version>` (F-13: derived, never a
+    separate hard-coded tag)."""
     return f"v{version}"
+
+
+def version_from_wheel_name(name: str) -> str | None:
+    """``llm_speed-0.0.10-py3-none-any.whl`` -> ``0.0.10``; None for other names."""
+    prefix, suffix = "llm_speed-", "-py3-none-any.whl"
+    if name.startswith(prefix) and name.endswith(suffix):
+        return name[len(prefix) : -len(suffix)] or None
+    return None
+
+
+def gh_release_url(version: str, filename: str) -> str:
+    return f"{GH_RELEASES_BASE}/{release_tag_for(version)}/{filename}"
+
+
+def gh_releases_sidecar_url(version_tag: str, wheel_name: str) -> str:
+    """The GitHub-release `.sha256` URL for a tag (e.g. ``v0.0.9``) + wheel name."""
+    return f"{GH_RELEASES_BASE}/{version_tag}/{wheel_name}.sha256"
+
+
+def sigstore_bundle_url(version: str, wheel_name: str) -> str:
+    return gh_release_url(version, f"{wheel_name}{SIGSTORE_BUNDLE_SUFFIX}")
+
+
+def pypi_json_url(version: str) -> str:
+    return f"https://pypi.org/pypi/{PYPI_PROJECT_NAME}/{version}/json"
+
+
+def sigstore_identity_for(version: str) -> str:
+    return f"{SIGSTORE_IDENTITY_PREFIX}{release_tag_for(version)}"
 
 
 # ---------------------------------------------------------------------------
@@ -109,108 +144,57 @@ def parse_checksum(text: str) -> str | None:
     return None
 
 
-def fetch_checksum(url: str, *, timeout: float = 15.0) -> str:
-    """Fetch the sidecar ``.sha256`` file. Raises on HTTP / network failure."""
-    # GitHub Releases serves assets via a 302 redirect to objects.githubusercontent.com,
-    # so we must follow redirects or the cross-check URL aborts before reading the body.
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        resp = client.get(url)
-    if resp.status_code != 200:
-        raise RuntimeError(f"GET {url} returned HTTP {resp.status_code}")
-    return resp.text
+class ArtifactMissing(RuntimeError):
+    """The URL answered 404: the artifact is not published there."""
+
+    def __init__(self, url: str):
+        super().__init__(f"GET {url} returned HTTP 404 (not published)")
+        self.url = url
 
 
-# F-30: PyPI publishes a per-file `.sha256` digest in its JSON API at
-# `https://pypi.org/pypi/<pkg>/<ver>/json`. We fold this into the
-# trust-chain check so verify is 3-of-3 (CDN + GH Releases + PyPI).
-PYPI_PROJECT_NAME = "llm-speed"
+def _get(url: str, *, timeout: float) -> httpx.Response:
+    """GET with redirects (GitHub Releases 302s to its object store). Network-level
+    failures become RuntimeError naming the URL, never an unhandled httpx error."""
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            return client.get(url)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(
+            f"could not reach {url} ({type(exc).__name__}: {exc})"
+        ) from None
 
 
-def fetch_sigstore_bundle(
-    dist_base: str, wheel_name: str, *, timeout: float = 20.0
-) -> bytes | None:
-    """Fetch the Sigstore bundle for `wheel_name` from `<dist_base>/<wheel_name>.sigstore`.
-
-    Returns the raw bundle bytes or None if the bundle isn't published.
-    Raises on network-level failures (so the caller can distinguish
-    "no bundle yet" from "couldn't reach the server").
-    """
-    url = f"{dist_base.rstrip('/')}/{wheel_name}.sigstore"
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        resp = client.get(url)
+def _get_ok(url: str, *, timeout: float) -> httpx.Response:
+    resp = _get(url, timeout=timeout)
     if resp.status_code == 404:
-        return None
+        raise ArtifactMissing(url)
     if resp.status_code != 200:
         raise RuntimeError(f"GET {url} returned HTTP {resp.status_code}")
-    if len(resp.content) > 256 * 1024:
+    return resp
+
+
+def fetch_checksum(url: str, *, timeout: float = 15.0) -> str:
+    """Fetch a ``.sha256`` sidecar. `ArtifactMissing` on 404, RuntimeError otherwise."""
+    return _get_ok(url, timeout=timeout).text
+
+
+def fetch_sigstore_bundle(url: str, *, timeout: float = 20.0) -> bytes:
+    """Fetch one Sigstore bundle. `ArtifactMissing` on 404; RuntimeError on any other
+    HTTP / network failure or an implausibly large body."""
+    resp = _get_ok(url, timeout=timeout)
+    if len(resp.content) > MAX_BUNDLE_BYTES:
         raise RuntimeError(f"sigstore bundle at {url} unexpectedly large")
     return resp.content
 
 
-# V-4: identity claims that the Sigstore bundle's signing certificate
-# MUST match. These are the OIDC subject + issuer that GitHub mints
-# for our `release-sign.yml` workflow. A bundle signed by any other
-# identity is a forgery — even if the Rekor log has it.
-SIGSTORE_EXPECTED_ISSUER = "https://token.actions.githubusercontent.com"
-SIGSTORE_EXPECTED_IDENTITY = "https://github.com/meadow-kun/llm-speed-web/.github/workflows/release-pypi.yml@refs/heads/main"
-
-
-def verify_sigstore_bundle(wheel_path: Path, bundle_bytes: bytes) -> tuple[bool, str]:
-    """Verify a Sigstore bundle against the wheel.
-
-    Returns (ok, message). When the `sigstore` package isn't installed,
-    returns (False, "<package missing>") — the caller treats this as
-    informational, not a hard fail, so users without the optional dep
-    aren't worse off than before V-4.
-    """
-    try:
-        from sigstore.models import Bundle  # type: ignore
-        from sigstore.verify import Verifier  # type: ignore
-        from sigstore.verify import policy as _policy
-    except ImportError:
-        return False, (
-            "sigstore-python not installed; install with `pip install sigstore` "
-            "to enable transparency-log verification of wheels"
-        )
-    try:
-        bundle = Bundle.from_json(bundle_bytes)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"could not parse sigstore bundle: {exc}"
-    verifier = Verifier.production()
-    try:
-        # Match identity by prefix — every release-sign.yml run produces a
-        # subject of the form `https://github.com/.../release-sign.yml@refs/tags/v0.0.1`.
-        identity_policy = _policy.Identity(
-            identity=SIGSTORE_EXPECTED_IDENTITY,
-            issuer=SIGSTORE_EXPECTED_ISSUER,
-        )
-        with open(wheel_path, "rb") as f:
-            blob = f.read()
-        verifier.verify_artifact(blob, bundle, identity_policy)
-        return True, "sigstore verification OK"
-    except Exception as exc:  # noqa: BLE001
-        return False, f"sigstore verification failed: {exc}"
-
-
-def fetch_pypi_sha256(
+def fetch_pypi_file(
     project: str, version: str, wheel_name: str, *, timeout: float = 15.0
-) -> str | None:
-    """Return the sha256 PyPI advertises for `<wheel_name>` of `<project>@<version>`.
-
-    Returns None when:
-      - the project / version is not on PyPI yet (404),
-      - PyPI returns malformed JSON,
-      - the requested wheel filename isn't in the version's `urls[]`.
-
-    Raises RuntimeError on transport-level failures so the caller can
-    distinguish "PyPI doesn't know about this version" (None) from
-    "we couldn't reach PyPI" (raise).
-    """
-    import json as _json
-
+) -> tuple[str, str | None] | None:
+    """(sha256, download url) PyPI lists for `wheel_name` of `project==version`, or
+    None when the version (404) or that file isn't on PyPI. RuntimeError when PyPI
+    can't be reached or returns garbage."""
     url = f"https://pypi.org/pypi/{project}/{version}/json"
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        resp = client.get(url)
+    resp = _get(url, timeout=timeout)
     if resp.status_code == 404:
         return None
     if resp.status_code != 200:
@@ -220,23 +204,61 @@ def fetch_pypi_sha256(
     except _json.JSONDecodeError as exc:
         raise RuntimeError(f"PyPI returned non-JSON from {url}: {exc}") from exc
     for entry in data.get("urls") or []:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or entry.get("filename") != wheel_name:
             continue
-        if entry.get("filename") != wheel_name:
-            continue
-        digests = entry.get("digests") or {}
-        sha = digests.get("sha256")
+        sha = (entry.get("digests") or {}).get("sha256")
         if isinstance(sha, str) and len(sha) == 64:
-            return sha.lower()
+            dl = entry.get("url")
+            return sha.lower(), dl if isinstance(dl, str) else None
     return None
+
+
+def fetch_pypi_sha256(
+    project: str, version: str, wheel_name: str, *, timeout: float = 15.0
+) -> str | None:
+    """The sha256 PyPI advertises for `wheel_name`, or None if not published."""
+    found = fetch_pypi_file(project, version, wheel_name, timeout=timeout)
+    return found[0] if found else None
+
+
+def verify_sigstore_bundle(
+    wheel_path: Path, bundle_bytes: bytes, version: str
+) -> tuple[bool, str]:
+    """Verify a Sigstore bundle against the wheel and the exact signer identity for
+    `version`. Returns (ok, message). Without the `sigstore` package this returns
+    (False, ...): `--sigstore` fails closed rather than pretending the check ran."""
+    try:
+        from sigstore.models import Bundle  # type: ignore
+        from sigstore.verify import Verifier  # type: ignore
+        from sigstore.verify import policy as _policy
+    except ImportError:
+        return False, (
+            "sigstore-python is not installed, so the signature was not checked; "
+            "install it with `pipx inject llm-speed sigstore` (or `pip install sigstore`)"
+        )
+    try:
+        bundle = Bundle.from_json(bundle_bytes)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"could not parse sigstore bundle: {exc}"
+    identity = sigstore_identity_for(version)
+    try:
+        verifier = Verifier.production()
+        identity_policy = _policy.Identity(
+            identity=identity, issuer=SIGSTORE_EXPECTED_ISSUER
+        )
+        with open(wheel_path, "rb") as f:
+            blob = f.read()
+        verifier.verify_artifact(blob, bundle, identity_policy)
+        return True, f"sigstore verification OK (signed by {identity})"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"sigstore verification failed for identity {identity}: {exc}"
 
 
 def installed_wheel_path() -> Path | None:
     """Best effort: locate a local wheel for this install. Looks in the
     common dev (``./dist``) and pipx (``~/.local/pipx/.cache``,
     ``~/.local/share/pipx/.cache``) layouts. Returns None when no local
-    wheel can be located — callers can then fall back to downloading the
-    published wheel and checking it against the sidecar."""
+    wheel can be located — callers then download the published wheel."""
     home = Path.home()
     ver = installed_version() or "0.0.0"
     name = wheel_name_for(ver)
@@ -255,55 +277,98 @@ def installed_wheel_path() -> Path | None:
     return None
 
 
-def fetch_published_wheel_to_temp(
-    dist_base: str = DEFAULT_DIST_BASE,
-    wheel_name: str | None = None,
-) -> Path:
-    """Download the published wheel to a temp file so we can hash it.
+def published_wheel_urls(
+    wheel_name: str, version: str, *, github: bool = True
+) -> list[str]:
+    """Where the published wheel is downloaded from when there is no local one: the
+    public GitHub release, then PyPI (its file URL comes from the PyPI JSON, so only
+    the JSON URL is known up front)."""
+    urls = [gh_release_url(version, wheel_name)] if github else []
+    return urls + [pypi_json_url(version)]
 
-    This is the fallback when no local wheel is on disk (e.g. pipx
-    installed and discarded its build cache). Comparing the freshly-
-    downloaded wheel against its sidecar proves "what the CDN serves
-    right now matches its declared digest" — it doesn't tell you
-    anything about what's already installed in your venv, but it does
-    establish trust in the publishing pipeline.
-    """
-    import tempfile
 
-    # Cap the download size so an attacker-controlled --dist-base can't make
-    # us write a 10 GB wheel to /tmp. The real wheel is ~140 KB; 50 MB is a
-    # generous ceiling that still aborts long before disk-fill is plausible.
-    MAX_WHEEL_BYTES = 50 * 1024 * 1024  # 50 MB
-
-    if wheel_name is None:
-        ver = installed_version() or "0.0.0"
-        wheel_name = wheel_name_for(ver)
-    url = f"{dist_base.rstrip('/')}/{wheel_name}"
-    fd, tmp = tempfile.mkstemp(prefix="llm-speed-verify-", suffix=".whl")
-    import os as _os
-
-    _os.close(fd)
-    out = Path(tmp)
+def _download(url: str, out: Path) -> None:
     written = 0
     with httpx.Client(timeout=60.0, follow_redirects=True) as client:
         with client.stream("GET", url) as r:
-            r.raise_for_status()
+            if r.status_code == 404:
+                raise ArtifactMissing(url)
+            if r.status_code != 200:
+                raise RuntimeError(f"GET {url} returned HTTP {r.status_code}")
             with out.open("wb") as f:
                 for chunk in r.iter_bytes():
                     written += len(chunk)
                     if written > MAX_WHEEL_BYTES:
-                        # Clean up the partial file before raising.
-                        try:
-                            f.close()
-                            out.unlink(missing_ok=True)
-                        except OSError:
-                            pass
                         raise RuntimeError(
                             f"wheel download exceeded {MAX_WHEEL_BYTES} bytes "
                             f"from {url} — refusing to continue"
                         )
                     f.write(chunk)
-    return out
+
+
+def fetch_published_wheel_to_temp(
+    wheel_name: str | None = None,
+    version: str | None = None,
+    *,
+    github: bool = True,
+) -> tuple[Path, str]:
+    """Download the published wheel to a temp file so it can be hashed: the GitHub
+    release first, then the file PyPI lists. Returns (path, url it came from). The
+    caller checks it against both published digests; where it came from is not a
+    trust decision. RuntimeError naming every URL tried when none serves it."""
+    import os as _os
+    import tempfile
+
+    version = version or installed_version() or "0.0.0"
+    wheel_name = wheel_name or wheel_name_for(version)
+    candidates: list[str] = []
+    if github:
+        candidates.append(gh_release_url(version, wheel_name))
+    tried: list[str] = []
+    pypi_listed = False
+    while True:
+        if not candidates and not pypi_listed:
+            pypi_listed = True
+            jurl = pypi_json_url(version)
+            try:
+                found = fetch_pypi_file(PYPI_PROJECT_NAME, version, wheel_name)
+            except RuntimeError as exc:
+                tried.append(f"{jurl} ({exc})")
+                found = None
+            else:
+                if not found or not found[1]:
+                    tried.append(f"{jurl} ({wheel_name} not listed)")
+            if found and found[1]:
+                candidates.append(found[1])
+        if not candidates:
+            break
+        url = candidates.pop(0)
+        fd, tmp = tempfile.mkstemp(prefix="llm-speed-verify-", suffix=".whl")
+        _os.close(fd)
+        out = Path(tmp)
+        try:
+            _download(url, out)
+        except ArtifactMissing:
+            out.unlink(missing_ok=True)
+            tried.append(f"{url} (HTTP 404)")
+            continue
+        except httpx.HTTPError as exc:
+            out.unlink(missing_ok=True)
+            tried.append(f"{url} ({type(exc).__name__})")
+            continue
+        except RuntimeError as exc:
+            out.unlink(missing_ok=True)
+            if "exceeded" in str(exc):
+                raise
+            tried.append(f"{url} ({exc})")
+            continue
+        except BaseException:
+            out.unlink(missing_ok=True)
+            raise
+        return out, url
+    raise RuntimeError(
+        "could not download the published wheel; tried: " + "; ".join(tried)
+    )
 
 
 def installed_version() -> str | None:
@@ -342,160 +407,123 @@ def installed_pip_show() -> str | None:
 # ---------------------------------------------------------------------------
 
 
+# Leg statuses: "agreed" (published and equal to the expected digest), "missing"
+# (HTTP 404 / not listed), "unreachable" (network or other HTTP error).
+@dataclass
+class Leg:
+    name: str
+    url: str | None
+    status: str = "pending"
+    detail: str = ""
+
+
 @dataclass
 class Verdict:
     matched: bool
     local_path: Path
     local_hash: str
     expected_hash: str
-    sidecar_url: str
-    cross_check_url: str | None = None
-    pypi_url: str | None = None  # F-30: third-leg PyPI digest URL when consulted
-    pypi_sha256: str | None = None  # F-30: digest PyPI advertised
-    pypi_status: str = (
-        "skipped"  # one of {"skipped", "agreed", "not_published", "disagreed"}
+    version: str
+    legs: list[Leg] = field(default_factory=list)
+
+    def agreed_urls(self) -> list[str]:
+        urls = [leg.url for leg in self.legs if leg.status == "agreed" and leg.url]
+        return list(dict.fromkeys(urls))
+
+    def unavailable(self) -> list[Leg]:
+        return [leg for leg in self.legs if leg.status in ("missing", "unreachable")]
+
+
+def _legs_text(legs: list[Leg]) -> str:
+    return "".join(
+        f"  {leg.name:<22}: {leg.url} ({leg.detail or leg.status})\n" for leg in legs
     )
-    note: str = ""
-
-
-def gh_releases_sidecar_url(version_tag: str, wheel_name: str) -> str:
-    """The sidecar's GitHub-Releases URL for a given tag + wheel name. Tag
-    is e.g. ``v1.0.1`` (the convention used by ``release_publish.sh``)."""
-    return f"{GH_RELEASES_BASE}/{version_tag}/{wheel_name}.sha256"
 
 
 def verify_wheel(
     wheel_path: Path,
     *,
-    dist_base: str = DEFAULT_DIST_BASE,
-    sidecar_name: str | None = None,
-    cross_check_url: str | None = None,
+    published_name: str | None = None,
+    version: str | None = None,
+    github: bool = True,
     pypi_check: bool = True,
+    strict: bool = False,
 ) -> Verdict:
-    """Compute local sha256 and compare against the sidecar at dist_base.
+    """Hash the wheel and compare it with the GitHub release ``.sha256`` and PyPI's
+    digest for release `version` (default: from the wheel name, else this install).
 
-    Raises ``RuntimeError`` when the network lookup fails so the caller can
-    surface that distinct from a hash-mismatch verdict.
+    Two published digests that disagree raise (tampering). No published digest at all
+    raises (never "match against nothing"). ``strict`` (``--sigstore``): both legs must
+    be published and reachable, else raise naming the URLs.
 
-    ``sidecar_name`` lets the caller override the sidecar's URL filename when
-    ``wheel_path.name`` isn't the publishable name (e.g. when we downloaded
-    the wheel to a tempfile with a generated name and need to query the
-    canonical ``llm_speed-0.0.1-py3-none-any.whl.sha256``).
-
-    ``cross_check_url`` is an optional second sidecar URL (typically the
-    GitHub-Releases mirror) — when provided, we fetch BOTH and require they
-    agree before declaring a match. Disagreement means one of the two
-    distribution chains was tampered with; we surface that as a hard fail.
+    ``published_name`` is the canonical wheel file name when ``wheel_path`` is a temp
+    file with a generated name.
     """
     wheel_path = wheel_path.resolve()
     if not wheel_path.exists():
         raise RuntimeError(f"wheel not found: {wheel_path}")
-
     local = sha256_file(wheel_path)
-    sidecar_filename = sidecar_name or wheel_path.name
-    sidecar = f"{dist_base.rstrip('/')}/{sidecar_filename}.sha256"
+    name = published_name or wheel_path.name
+    ver = version or version_from_wheel_name(name) or installed_version()
+    if not ver:
+        raise RuntimeError(f"cannot tell which release {name} belongs to")
 
-    # Post-2026-05-12 (F-13 fix): PyPI is the primary trust anchor; the
-    # CDN sidecar at `<dist_base>/<wheel>.sha256` is a best-effort
-    # cross-check. A 404 here is non-fatal (the CDN doesn't have to host
-    # a separate sidecar when PyPI's per-file digest covers the same
-    # ground). A 200 with a disagreeing digest IS fatal — that's tampering.
-    expected: str | None = None
-    try:
-        raw = fetch_checksum(sidecar)
-    except RuntimeError:
-        # CDN leg unavailable — defer to PyPI as primary, below.
-        raw = ""
-    if raw:
-        expected = parse_checksum(raw)
-        if expected is None:
-            raise RuntimeError(f"sidecar at {sidecar} does not contain a sha256 digest")
+    found: list[tuple[Leg, str]] = []
+    legs: list[Leg] = []
 
-    # Cross-check: an attacker who compromises only one distribution chain
-    # can swap the wheel + sidecar there. Independently fetching the same
-    # sidecar from a separate domain (typically GitHub Releases) closes
-    # that single-point-of-failure when the leg is published.
-    #
-    # As of 2026-05-12 this leg is best-effort, not load-bearing. A 404 means
-    # the GH-Releases mirror hasn't been published for this version — fall
-    # through to PyPI (which IS published). A 200 with disagreement is still
-    # a hard fail.
-    if cross_check_url:
+    if github:
+        gh = Leg(
+            "GitHub release sha256", gh_releases_sidecar_url(release_tag_for(ver), name)
+        )
+        legs.append(gh)
         try:
-            cross_raw = fetch_checksum(cross_check_url)
-        except RuntimeError:
-            cross_raw = ""
-        if cross_raw:
-            cross_expected = parse_checksum(cross_raw)
-            if cross_expected is None:
-                raise RuntimeError(
-                    f"cross-check sidecar at {cross_check_url} did not contain a "
-                    "valid sha256 digest"
-                )
-            if expected is None:
-                # CDN was 404 but GH-Releases agrees; promote it to expected.
-                expected = cross_expected
-            elif cross_expected != expected:
-                raise RuntimeError(
-                    f"sidecar disagreement: {sidecar} says {expected}, "
-                    f"{cross_check_url} says {cross_expected}. "
-                    "One of the distribution chains has been tampered with — "
-                    "do not trust this binary."
-                )
+            raw = fetch_checksum(gh.url or "")
+        except ArtifactMissing:
+            gh.status, gh.detail = "missing", "HTTP 404"
+        except RuntimeError as exc:
+            gh.status, gh.detail = "unreachable", str(exc)
+        else:
+            digest = parse_checksum(raw)
+            if digest is None:
+                raise RuntimeError(f"{gh.url} does not contain a sha256 digest")
+            found.append((gh, digest))
 
-    # F-30: optional third-leg cross-check against PyPI's published
-    # per-file digest. PyPI is an independent root of trust from CDN +
-    # GitHub Releases — its digests are part of the index payload that
-    # `pip` consumes during normal `pip install llm-speed`. Folding it
-    # in here makes the verify chain 3-of-3 once PyPI publish lands.
-    pypi_url: str | None = None
-    pypi_sha: str | None = None
-    pypi_status = "skipped"
     if pypi_check:
-        ver = installed_version()
-        wheel_basename = sidecar_filename
-        if ver:
-            pypi_url = f"https://pypi.org/pypi/{PYPI_PROJECT_NAME}/{ver}/json"
-            try:
-                pypi_sha = fetch_pypi_sha256(PYPI_PROJECT_NAME, ver, wheel_basename)
-            except RuntimeError:
-                # Network failure to PyPI is non-fatal when the CDN/GH legs
-                # established `expected`; if BOTH the CDN+GH and PyPI legs
-                # are unreachable, the caller surfaces "matched=False with
-                # expected=None" — caller decides whether to fail closed.
-                pypi_status = "skipped"
-                pypi_sha = None
+        pl = Leg("PyPI sha256", pypi_json_url(ver))
+        legs.append(pl)
+        try:
+            sha = fetch_pypi_sha256(PYPI_PROJECT_NAME, ver, name)
+        except RuntimeError as exc:
+            pl.status, pl.detail = "unreachable", str(exc)
+        else:
+            if sha is None:
+                pl.status, pl.detail = "missing", f"{name} not listed for {ver}"
             else:
-                if pypi_sha is None:
-                    pypi_status = "not_published"
-                elif expected is None:
-                    # CDN+GH 404'd; PyPI is the only published digest.
-                    # Promote it to the canonical expected — this is the
-                    # post-F-13 normal path.
-                    expected = pypi_sha
-                    pypi_status = "agreed"
-                elif pypi_sha != expected:
-                    raise RuntimeError(
-                        f"PyPI sidecar disagreement: PyPI advertises "
-                        f"sha256={pypi_sha} for {wheel_basename} at version "
-                        f"{ver}, but {sidecar} says {expected}. One of the "
-                        "distribution chains has been tampered with — do not "
-                        "trust this binary."
-                    )
-                else:
-                    pypi_status = "agreed"
+                found.append((pl, sha))
 
-    if expected is None:
-        # Every leg (CDN sidecar, GH-Releases mirror, PyPI per-file digest)
-        # was unreachable or unpublished. Cannot verify — fail closed.
+    digests = {d for _, d in found}
+    if len(digests) > 1:
         raise RuntimeError(
-            f"verify: no published sha256 digest found for this wheel.\n"
-            f"  CDN sidecar  : {sidecar} (404 or unreachable)\n"
-            f"  GH Releases  : {cross_check_url or '(not consulted)'}\n"
-            f"  PyPI         : {pypi_url or '(no installed version)'} ({pypi_status})\n"
-            "  Either the published artifact has been withdrawn, or all "
-            "three trust roots are unreachable. Refusing to declare 'match' "
-            "against nothing."
+            "published digests disagree: "
+            + "; ".join(f"{leg.url} says {d}" for leg, d in found)
+            + ". One of the distribution chains has been tampered with — do not "
+            "trust this binary."
+        )
+    if not digests:
+        raise RuntimeError(
+            "no published sha256 digest found for this wheel:\n"
+            + _legs_text(legs)
+            + "  Refusing to declare 'match' against nothing."
+        )
+    expected = digests.pop()
+    for leg, _ in found:
+        leg.status = "agreed"
+
+    unavailable = [leg for leg in legs if leg.status in ("missing", "unreachable")]
+    if strict and (unavailable or not (github and pypi_check)):
+        raise RuntimeError(
+            "--sigstore requires both the GitHub release sha256 and PyPI's sha256; "
+            "missing or unreachable:\n" + _legs_text(unavailable)
         )
 
     return Verdict(
@@ -503,174 +531,165 @@ def verify_wheel(
         local_path=wheel_path,
         local_hash=local,
         expected_hash=expected,
-        sidecar_url=sidecar,
-        cross_check_url=cross_check_url,
-        pypi_url=pypi_url,
-        pypi_sha256=pypi_sha,
-        pypi_status=pypi_status,
+        version=ver,
+        legs=legs,
     )
+
+
+def check_sigstore(
+    wheel: Path, wheel_name: str, version: str
+) -> tuple[bool, list[str]]:
+    """The `--sigstore` leg: the bundle from the public GitHub release, verified
+    against `sigstore_identity_for(version)`. Fails closed; names the URL tried."""
+    url = sigstore_bundle_url(version, wheel_name)
+    try:
+        bundle = fetch_sigstore_bundle(url)
+    except ArtifactMissing:
+        return False, [f"no sigstore bundle published; tried {url} (HTTP 404)"]
+    except RuntimeError as exc:
+        return False, [f"could not fetch the sigstore bundle; tried {url} ({exc})"]
+    ok, msg = verify_sigstore_bundle(wheel, bundle, version)
+    return ok, [msg, f"bundle: {url}"]
+
+
+def _leg_line(leg: Leg) -> str:
+    if leg.status == "agreed":
+        return f"  {leg.name:<22}: OK  {leg.url}"
+    if leg.status == "missing":
+        return f"  [{C_WARN}]{leg.name:<22}: not published[/] {leg.url} ({leg.detail})"
+    return f"  [{C_WARN}]{leg.name:<22}: unreachable[/] {leg.url} ({leg.detail})"
+
+
+class _NoWrapConsole:
+    """URLs in verify's output must stay copy-pasteable: rich never wraps a line."""
+
+    def __init__(self, console):
+        self._console = console
+
+    def print(self, *a, **kw) -> None:
+        kw.setdefault("soft_wrap", True)
+        self._console.print(*a, **kw)
 
 
 def cmd_verify(args) -> int:
     """``llm-speed verify [<path>]`` entry point."""
-    cons = get_console()
+    cons = _NoWrapConsole(get_console())
     cons.print(
         f"[{C_BRAND}]llm-speed verify[/] - prove this binary matches the public artifact"
     )
     cons.print()
 
     target = getattr(args, "wheel", None)
-    dist_base = getattr(args, "dist_base", None) or DEFAULT_DIST_BASE
     no_cross_check = bool(getattr(args, "no_cross_check", False))
-    # V-13: a hostile install script could pass both `--no-cross-check`
-    # AND `--dist-base <attacker-controlled-url>` to degrade to
-    # single-source trust — verify would then only consult the attacker's
-    # own sidecar. Refuse the combination outright. `--no-cross-check`
-    # is intended for offline / corporate-firewall users on the DEFAULT
-    # dist-base, not as a way to escape the dual-domain anchor.
-    if no_cross_check and dist_base != DEFAULT_DIST_BASE:
+    want_sigstore = bool(getattr(args, "sigstore", False))
+    if no_cross_check and want_sigstore:
         cons.print(
-            f"[{C_ERR}]error:[/] --no-cross-check is only valid with the "
-            "default --dist-base. Pass either flag, not both."
+            f"[{C_ERR}]error:[/] --sigstore needs the GitHub release; it can't be "
+            "combined with --no-cross-check."
         )
-        cons.print(f"  [dim]default dist-base: {DEFAULT_DIST_BASE}[/]")
         return 2
     fetched_temp: Path | None = None
-    if target:
-        wheel = Path(target).expanduser()
-    else:
-        wheel = installed_wheel_path()
-        if wheel is None:
-            # No local wheel — fetch the published one and check it against
-            # its own sidecar. This establishes trust in the publishing
-            # pipeline; it does not prove what's already in the user's venv
-            # matches, but it's a useful default for pipx users.
-            cons.print(
-                f"  [dim]no local wheel found — fetching from {dist_base.rstrip('/')}/[/]"
-            )
-            try:
-                wheel = fetch_published_wheel_to_temp(dist_base)
-                fetched_temp = wheel
-            except Exception as exc:  # noqa: BLE001
-                cons.print(f"[{C_ERR}]error:[/] download failed: {exc}")
-                _ver_hint = installed_version() or "0.0.0"
+    try:
+        installed = installed_version() or "0.0.0"
+        if target:
+            wheel = Path(target).expanduser()
+            published_name = wheel.name
+        else:
+            local = installed_wheel_path()
+            published_name = wheel_name_for(installed)
+            if local is not None:
+                wheel = local
+            else:
+                where = "PyPI" if no_cross_check else "the GitHub release, then PyPI"
                 cons.print(
-                    f"  [dim]pass --wheel <path>, e.g.[/] llm-speed verify --wheel ./dist/{wheel_name_for(_ver_hint)}"
+                    f"  [dim]no local wheel found — downloading {published_name} from {where}[/]"
+                )
+                try:
+                    wheel, src = fetch_published_wheel_to_temp(
+                        published_name, installed, github=not no_cross_check
+                    )
+                    fetched_temp = wheel
+                except Exception as exc:  # noqa: BLE001
+                    cons.print(f"[{C_ERR}]error:[/] download failed: {exc}")
+                    cons.print(
+                        f"  [dim]pass a wheel path, e.g.[/] llm-speed verify ./dist/{published_name}"
+                    )
+                    if want_sigstore:
+                        cons.print(f"[{C_ERR}]NOT VERIFIED[/].")
+                    return 1
+                cons.print(f"  downloaded from: {src}")
+
+        cons.print(f"  local wheel    : {wheel}")
+        if no_cross_check:
+            cons.print(
+                f"  [{C_WARN}]cross-check disabled[/] — PyPI only, no GitHub leg"
+            )
+        try:
+            verdict = verify_wheel(
+                wheel,
+                published_name=published_name,
+                github=not no_cross_check,
+                strict=want_sigstore,
+            )
+        except RuntimeError as exc:
+            cons.print(f"[{C_ERR}]error:[/] {exc}")
+            cons.print(f"[{C_ERR}]NOT VERIFIED[/].")
+            return 1
+
+        cons.print(f"  local sha256   : {verdict.local_hash}")
+        cons.print(f"  expected sha256: {verdict.expected_hash}")
+        for leg in verdict.legs:
+            cons.print(_leg_line(leg))
+        cons.print()
+
+        if not verdict.matched:
+            cons.print(
+                f"[{C_ERR}]MISMATCH[/]. The wheel does NOT match the published artifact.\n"
+                "      Do not trust this binary; reinstall from PyPI or build from source."
+            )
+            return 1
+
+        # L-2: with --sigstore the signature is checked BEFORE any verdict, and
+        # anything short of a verified bundle is a failure.
+        if want_sigstore:
+            ok, lines = check_sigstore(wheel, published_name, verdict.version)
+            colour = C_OK if ok else C_ERR
+            cons.print(f"  [{colour}]sigstore: {lines[0]}[/]")
+            for line in lines[1:]:
+                cons.print(f"    {line}")
+            if not ok:
+                cons.print()
+                cons.print(
+                    f"[{C_ERR}]NOT VERIFIED[/]. The checksums matched, but --sigstore "
+                    "was requested and the signature could not be verified."
                 )
                 return 1
 
-    cons.print(f"  local wheel    : {wheel}")
-
-    # When we fetched the wheel ourselves, the on-disk filename is a tempname
-    # (e.g. /tmp/llm-speed-verify-xxxxx.whl) — but the published sidecar lives
-    # at <dist>/<canonical-wheel-name>.sha256, NOT under the tempname.
-    _ver = installed_version() or "0.0.0"
-    sidecar_name = wheel_name_for(_ver) if fetched_temp is not None else None
-    try:
-        # Cross-check against the GitHub-Releases mirror by default. Tag is
-        # derived from __version__ (post-2026-05-12 F-13 fix). A 404 on the
-        # cross-check leg is non-fatal because PyPI now serves the canonical
-        # per-file digest (F-30); the leg just adds defence-in-depth when it
-        # exists. --no-cross-check disables the second domain entirely.
-        if no_cross_check:
-            cross_check = None
-            cons.print(f"  [{C_WARN}]cross-check disabled[/] — PyPI-only trust")
-        else:
-            cross_check = gh_releases_sidecar_url(
-                release_tag_for(_ver),
-                sidecar_name or wheel.name,
-            )
-        verdict = verify_wheel(
-            wheel,
-            dist_base=dist_base,
-            sidecar_name=sidecar_name,
-            cross_check_url=cross_check,
-        )
-    except RuntimeError as exc:
-        cons.print(f"[{C_ERR}]error:[/] {exc}")
-        cons.print(f"  [dim]could not reach sidecar at {dist_base.rstrip('/')}[/]")
-        return 1
-
-    cons.print(f"  local sha256   : {verdict.local_hash}")
-    cons.print(f"  expected sha256: {verdict.expected_hash}")
-    cons.print(f"  sidecar URL    : {verdict.sidecar_url}")
-    if verdict.cross_check_url:
-        cons.print(f"  cross-check OK : {verdict.cross_check_url}")
-    # F-30: third-leg PyPI status. Print one of:
-    #   "PyPI digest OK : <url>"           (3-of-3 agreement)
-    #   "PyPI not yet published"           (graceful pre-publish state)
-    #   "PyPI digest skipped (no version)" (dev install / source tree)
-    if verdict.pypi_status == "agreed":
-        cons.print(f"  PyPI digest OK : {verdict.pypi_url}")
-    elif verdict.pypi_status == "not_published":
-        cons.print(
-            f"  [{C_HINT}]PyPI digest    : not yet published at {verdict.pypi_url}[/]"
-        )
-    elif verdict.pypi_status == "skipped":
-        cons.print(
-            f"  [{C_HINT}]PyPI digest    : skipped (couldn't determine "
-            "installed version)[/]"
-        )
-    cons.print()
-
-    if verdict.matched:
         cons.print(
             f"[{C_OK}]MATCH[/]. The bytes you are about to run are byte-identical "
-            f"to the wheel served at\n      {dist_base.rstrip('/')}/{wheel.name}"
+            f"to the published {published_name}; its digest is published at:"
         )
-        cons.print(f"      Source code (audit it yourself): {REPO_URL}")
-        # V-4: optional Sigstore verification. We only run this when the
-        # match holds — otherwise the bundle is moot. The default is
-        # opt-in (--sigstore) because it adds a ~3s round-trip + needs
-        # the sigstore-python dep; once that's in the base install we'll
-        # flip the default.
-        if getattr(args, "sigstore", False):
-            _ver_canonical = installed_version() or "0.0.0"
-            sidecar_canonical = (
-                wheel_name_for(_ver_canonical)
-                if fetched_temp is not None
-                else wheel.name
+        for url in verdict.agreed_urls():
+            cons.print(f"      {url}")
+        if verdict.unavailable():
+            cons.print(
+                f"      [{C_HINT}]({len(verdict.unavailable())} source(s) not "
+                "published or unreachable; listed above. `--sigstore` requires all.)[/]"
             )
+        cons.print(f"      Source code (audit it yourself): {REPO_URL}")
+
+        if installed_version():
+            cons.print()
+            cons.print(f"  installed version: [{C_HINT}]llm-speed {installed}[/]")
+        show = installed_pip_show()
+        if show:
+            cons.print("  [dim]pip show llm-speed:[/]")
+            for line in show.splitlines():
+                cons.print(f"    [dim]{line}[/]")
+        return 0
+    finally:
+        if fetched_temp is not None:
             try:
-                bundle = fetch_sigstore_bundle(dist_base, sidecar_canonical)
-            except RuntimeError as exc:
-                cons.print(f"  [{C_WARN}]sigstore fetch failed:[/] {exc}")
-                bundle = None
-            if bundle is None:
-                cons.print(
-                    f"  [{C_HINT}]sigstore: bundle not yet published at "
-                    f"{dist_base.rstrip('/')}/{sidecar_canonical}.sigstore[/]"
-                )
-            else:
-                ok, msg = verify_sigstore_bundle(wheel, bundle)
-                if ok:
-                    cons.print(f"  [{C_OK}]sigstore: {msg}[/]")
-                else:
-                    cons.print(f"  [{C_ERR}]sigstore: {msg}[/]")
-                    return 1
-    else:
-        cons.print(
-            f"[{C_ERR}]MISMATCH[/]. Local wheel does NOT match the published artifact.\n"
-            f"      Do not trust this binary; redownload from {SITE_URL} or build from source."
-        )
-
-    # Bonus: surface the version + the show output so the user has the full
-    # provenance picture in one block.
-    ver = installed_version()
-    if ver:
-        cons.print()
-        cons.print(f"  installed version: [{C_HINT}]llm-speed {ver}[/]")
-    show = installed_pip_show()
-    if show:
-        cons.print("  [dim]pip show llm-speed:[/]")
-        for line in show.splitlines():
-            cons.print(f"    [dim]{line}[/]")
-
-    # Clean up the downloaded wheel if we fetched it ourselves.
-    if fetched_temp is not None:
-        try:
-            fetched_temp.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    return 0 if verdict.matched else 1
+                fetched_temp.unlink(missing_ok=True)
+            except OSError:
+                pass
