@@ -429,6 +429,8 @@ def cmd_status(args) -> int:
         "gates": st.get("gates"),
         "current_job": st.get("current_job"),
         "last_result": st.get("last_result"),
+        "last_preset_refusal": st.get("last_preset_refusal"),
+        "signed_presets": bool(s.signed_presets),
         "awaiting_approval": pending,
         "updated_at": st.get("updated_at"),
         "settings": {
@@ -445,12 +447,22 @@ def cmd_status(args) -> int:
     print(f"  service  : {out['service']}")
     print(f"  paused   : {'yes' if out['paused'] else 'no'}")
     print(
+        f"  signed presets: {'on' if s.signed_presets else 'off'}"
+        + ("" if s.signed_presets else " (turn on: llm-speed agent signed-presets on)")
+    )
+    print(
         f"  state    : {out['state'] or '-'}{(' (' + out['reason'] + ')') if out['reason'] else ''}"
     )
     if out["current_job"]:
         print(f"  job      : {out['current_job']}")
     if out["last_result"]:
         print(f"  last     : {out['last_result']}")
+    ref = out["last_preset_refusal"]
+    if ref:
+        print(
+            f"  refused  : signed preset {ref.get('preset')} v{ref.get('version')} "
+            f"({ref.get('reason')}) at {ref.get('at')}; job {ref.get('job_id')} handed back"
+        )
     for aid in pending:
         print(f"  awaiting approval: {aid}  (llm-speed agent approve {aid})")
     return 0
@@ -475,6 +487,53 @@ def cmd_presets(args) -> int:
     return 0
 
 
+SIGNED_PRESETS_PROMPT = (
+    "Turn on signed presets for this machine?\n"
+    "  This machine will run benchmark tests published by llm-speed.com: presets the\n"
+    "  queue signed with a key built into this CLI, without a CLI release for each one.\n"
+    "  Each one is checked (signature, revocation list, the same schema as packaged\n"
+    "  presets) before it runs; it can download models from allowlisted Hugging Face\n"
+    "  orgs and run llama.cpp / MLX with allowlisted flags only. Uploads stay\n"
+    "  --strict-anon. Turn it off any time: llm-speed agent signed-presets off\n"
+)
+
+
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def cmd_signed_presets(args) -> int:
+    """Per-machine opt-in for server-signed presets (Security Desk R-93). Off is the kill switch."""
+    s = Settings.load()
+    want = getattr(args, "state", None)
+    if want in (None, "status"):
+        print(f"signed presets: {'on' if s.signed_presets else 'off'}")
+        return 0
+    if want == "off":
+        s.signed_presets = False
+        s.save()
+        print("signed presets: off (this machine runs packaged presets only)")
+        print("Restart the agent to apply it now: llm-speed agent restart")
+        return 0
+    if not getattr(args, "yes", False):
+        print(SIGNED_PRESETS_PROMPT)
+        if not _interactive():
+            print("Not a terminal: re-run with --yes to confirm. Nothing changed.")
+            return 2
+        try:
+            ans = input("Turn on signed presets? [y/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("Nothing changed (signed presets stay off).")
+            return 1
+    s.signed_presets = True
+    s.save()
+    print("signed presets: on")
+    print("Restart the agent to apply it now: llm-speed agent restart")
+    return 0
+
+
 def cmd_config(args) -> int:
     s = Settings.load()
     if not args.key:
@@ -489,7 +548,10 @@ def cmd_config(args) -> int:
     if args.key in LEGACY_KEYS:
         print(f"{args.key} was removed in 0.0.10: {LEGACY_KEYS[args.key]}")
         return 2
-    if args.key not in SETTABLE:
+    if args.key == "signed_presets" and args.value is not None:
+        print("use `llm-speed agent signed-presets on|off` (it asks to confirm)")
+        return 2
+    if args.key not in SETTABLE and args.key != "signed_presets":
         print(
             f"unknown or read-only key {args.key!r}; settable: {', '.join(sorted(SETTABLE))}"
         )
@@ -609,6 +671,14 @@ def add_parser(sub) -> None:
     for name in ("approve", "decline"):
         a = asub.add_parser(name, help=f"{name} a job held by manual_approve")
         a.add_argument("assignment_id")
+    sp = asub.add_parser(
+        "signed-presets",
+        help="on/off: run benchmark tests published (signed) by llm-speed.com on this machine",
+    )
+    sp.add_argument("state", nargs="?", choices=("on", "off", "status"))
+    sp.add_argument(
+        "--yes", action="store_true", help="confirm turning it on without a prompt"
+    )
     c = asub.add_parser("config", help="show or set local policy")
     c.add_argument("key", nargs="?")
     c.add_argument("value", nargs="?")
@@ -654,13 +724,14 @@ def dispatch(args) -> int:
         "status": cmd_status,
         "presets": cmd_presets,
         "config": cmd_config,
+        "signed-presets": cmd_signed_presets,
         "approve": lambda a: _decide(a, "approve"),
         "decline": lambda a: _decide(a, "decline"),
         "restart": lambda a: service.restart(),
     }
     if c not in table:
         print(
-            "usage: llm-speed agent {enroll,install,uninstall,run,pause,resume,restart,status,presets,approve,decline,config}"
+            "usage: llm-speed agent {enroll,install,uninstall,run,pause,resume,restart,status,presets,approve,decline,config,signed-presets}"
         )
         return 2
     return table[c](args)

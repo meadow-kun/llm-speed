@@ -210,6 +210,65 @@ def validate_preset(p: Any) -> None:
         raise PresetInvalid("; ".join(errs[:8]))
 
 
+PLACEHOLDER_KEY = "_placeholder"
+# A hash that is one character repeated (000…, 111…, ccc…) is a staging value, never a real
+# git revision (40) or sha256 (64).
+_FAKE_HEX_RE = re.compile(r"([0-9a-fA-F])\1{39}|([0-9a-fA-F])\2{63}")
+PLACEHOLDER_MAX_BYTES = 1024  # no real model file is this small
+PLACEHOLDER_LLAMA_BUILD = 999999  # sentinel "build not known yet"
+
+
+def placeholder_markers(p: Any) -> list[str]:
+    """Why a preset is still a staging placeholder (empty = real). Markers: a top-level
+    `_placeholder` note, the word DUMMY in any string, a revision/sha256 made of one
+    repeated character, a single-file llama.cpp entry without sha256, a model of
+    <= 1024 bytes, or min_llama_build >= 999999.
+    Used by the agent (never advertised or run), `bench --preset` (refused) and
+    tools/release_guard.py (release refused), so dummy values can't ship or upload."""
+    out: list[str] = []
+    if isinstance(p, dict) and PLACEHOLDER_KEY in p:
+        out.append(f"has a {PLACEHOLDER_KEY} note")
+
+    def walk(v: Any, path: str) -> None:
+        if isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, f"{path}.{k}")
+        elif isinstance(v, list):
+            for i, x in enumerate(v):
+                walk(x, f"{path}[{i}]")
+        elif isinstance(v, str):
+            if "DUMMY" in v.upper():
+                out.append(f"{path} says DUMMY")
+            elif _FAKE_HEX_RE.fullmatch(v):
+                out.append(f"{path} is a repeated-character placeholder hash")
+
+    walk(p, "$")
+    if isinstance(p, dict):
+        build = p.get("min_llama_build")
+        if (
+            isinstance(build, int)
+            and not isinstance(build, bool)
+            and build >= PLACEHOLDER_LLAMA_BUILD
+        ):
+            out.append(f"$.min_llama_build is the {PLACEHOLDER_LLAMA_BUILD} sentinel")
+        models = p.get("models")
+        for k, m in (models if isinstance(models, dict) else {}).items():
+            if not isinstance(m, dict):
+                continue
+            if m.get("backend") == "llama.cpp" and "file" in m and not m.get("sha256"):
+                out.append(
+                    f"$.models.{k} has no sha256"
+                )  # every single-file GGUF must be pinned
+            size = m.get("bytes")
+            if (
+                isinstance(size, int)
+                and not isinstance(size, bool)
+                and size <= PLACEHOLDER_MAX_BYTES
+            ):
+                out.append(f"$.models.{k}.bytes is a placeholder size ({size})")
+    return out
+
+
 def identity(p: dict) -> dict[str, Any]:
     return {"name": p["preset"], "version": p["version"], "sha256": preset_sha256(p)}
 

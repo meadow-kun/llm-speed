@@ -293,6 +293,9 @@ _NONE = "none"
 # on/off/auto plus the numeric spellings llama.cpp also takes; nothing else (PRIVACY.md
 # promises numbers or on/off/auto only).
 _ON_OFF_AUTO = frozenset({"on", "off", "auto", "1", "0", "-1"})
+# -lm/--load-mode and -lzm/--lazy-mode: their fixed words only (no numeric spellings).
+_LOAD_MODE = frozenset({"auto", "none", "mmap", "mlock", "mmap+mlock", "dio"})
+_ON_OFF_AUTO_WORDS = frozenset({"on", "auto", "off"})
 _STRICT_ARGS: dict[str, object] = {
     # prompt cache (llama-server; both off for comparable timings)
     "--no-cache-prompt": _NONE,
@@ -312,6 +315,12 @@ _STRICT_ARGS: dict[str, object] = {
     "--reasoning": _ON_OFF_AUTO,
     # allowed by the preset schema's server_args pattern
     "--kv-unified": _NONE,
+    # next release (Boss, 2026-10-31): weight load mode and lazy loading, fixed
+    # values only (DR-005; disk-bound offload runs need them on the record)
+    "-lm": _LOAD_MODE,
+    "--load-mode": _LOAD_MODE,
+    "-lzm": _ON_OFF_AUTO_WORDS,
+    "--lazy-mode": _ON_OFF_AUTO_WORDS,
     # value-less flags that were already allowlisted: never consume the next token
     "--no-mmap": _NONE,
     "--mlock": _NONE,

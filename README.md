@@ -23,6 +23,8 @@ With Homebrew (installation tested on Apple Silicon):
 brew install meadow-kun/tap/llm-speed
 ```
 
+Already installed? Running the install command again keeps the old version. Upgrade with the tool you used: `pipx upgrade llm-speed`, `uv tool upgrade llm-speed`, `pip install -U llm-speed` or `brew upgrade llm-speed` (or re-run the installer), then check `llm-speed --version`. Installed with a uv pin (`uv tool install llm-speed==X`)? `uv tool upgrade` won't move it; use `uv tool install llm-speed@latest`. Upgrade and uninstall steps, with every file the CLI writes: https://llm-speed.com/install#uninstall
+
 Check dependencies and backend setup with `llm-speed doctor`. On an interactive terminal it offers setup steps; otherwise it prints guidance.
 
 ## Run

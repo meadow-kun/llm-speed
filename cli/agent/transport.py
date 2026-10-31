@@ -5,6 +5,7 @@ to `QueueClient`'s methods and the small result types."""
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -194,8 +195,10 @@ class QueueClient:
         _, b = self._req("GET", "/v1/agent/status")
         return b
 
-    def claim(self, capabilities: dict) -> Claim:
-        """capabilities includes "presets": [{name, version, sha256}] (queue API spec section 4)."""
+    def claim(self, capabilities: dict, features: list[str] | None = None) -> Claim:
+        """capabilities includes "presets": [{name, version, sha256}] (queue API spec section 4).
+        `features` adds claim features (0.0.12: "signed_presets" = this machine also takes
+        jobs pinning a published, signed preset it doesn't package)."""
         body: dict[str, Any] = {
             "cli_version": __version__,
             "capabilities": capabilities,
@@ -203,7 +206,7 @@ class QueueClient:
         key = _agent_job.CLAIM_FEATURES_KEY
         if self._declare_features:
             # This build echoes the nonce (cli/agent_job.py), so it asks for it (R-36).
-            body[key] = [_agent_job.UPLOAD_NONCE_FEATURE]
+            body[key] = [_agent_job.UPLOAD_NONCE_FEATURE, *(features or [])]
         try:
             st, b, h = self._req(
                 "POST", "/v1/agent/claim", json=body, want_headers=True
@@ -263,13 +266,43 @@ class QueueClient:
         return b
 
     # -- phase 2
+    # Response caps (Security Desk R-98): a bundle is <= 64 KiB of bytes (the Worker's
+    # MAX_BUNDLE), so its base64url envelope stays well under 128 KiB; a revocation list is
+    # small. Anything larger is refused before it is parsed.
+    MAX_PRESET_RESPONSE = 128 * 1024
+    MAX_REVOCATIONS_RESPONSE = 256 * 1024
+
+    def _get_capped(self, path: str, cap: int) -> dict:
+        """Unauthenticated GET on the enrolled api_base, read at most `cap` bytes."""
+        try:
+            with self._http.stream("GET", self.api_base + path) as r:
+                cl = r.headers.get("Content-Length")
+                if cl and cl.isdigit() and int(cl) > cap:
+                    raise QueueError(r.status_code, "response_too_large")
+                buf = bytearray()
+                for chunk in r.iter_bytes():
+                    buf += chunk
+                    if len(buf) > cap:
+                        raise QueueError(r.status_code, "response_too_large")
+                status = r.status_code
+        except httpx.HTTPError as exc:
+            raise QueueError(0, "network", type(exc).__name__) from None
+        try:
+            body = json.loads(bytes(buf)) if buf else {}
+        except ValueError:
+            body = {}
+        if status >= 400:
+            err = (body.get("error") or {}) if isinstance(body, dict) else {}
+            raise QueueError(status, err.get("code") or f"http_{status}")
+        return body if isinstance(body, dict) else {}
+
     def get_preset(self, name: str, version: int | None = None) -> dict:
         path = f"/v1/presets/{name}" + (
             f"/{int(version)}" if version is not None else ""
         )
-        _, b = self._req("GET", path, auth=False)
-        return b
+        return self._get_capped(path, self.MAX_PRESET_RESPONSE)
 
     def get_revocations(self) -> dict:
-        _, b = self._req("GET", "/v1/presets/revocations", auth=False)
-        return b
+        return self._get_capped(
+            "/v1/presets/revocations", self.MAX_REVOCATIONS_RESPONSE
+        )

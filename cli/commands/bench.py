@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import math
 import os
 import sys
 import traceback
@@ -341,6 +342,14 @@ def cmd_bench(args) -> int:
     except sampling_mod.SamplingError as exc:
         print_error(f"invalid sampling setting: {exc}")
         return 2
+    # --min-prefill-tps: local read-timeout knob for disk-bound llama.cpp runs. It goes
+    # through the env var so --preset steps and the driver see the same value; not uploaded.
+    min_tps = getattr(args, "min_prefill_tps", None)
+    if min_tps is not None:
+        if not (math.isfinite(min_tps) and min_tps > 0):
+            print_error("invalid --min-prefill-tps: want a number > 0")
+            return 2
+        os.environ["LLM_SPEED_MIN_PREFILL_TPS"] = repr(float(min_tps))
     # --resume short-circuits everything else.
     if getattr(args, "resume", None):
         return _handle_resume(args)
