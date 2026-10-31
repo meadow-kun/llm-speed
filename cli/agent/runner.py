@@ -299,10 +299,15 @@ def default_launcher(
             os.close(wfd)
         env[_agent_job.FD_ENV] = str(rfd)
         pass_fds = (rfd,)
+    # R-74: a fixed cwd, never the directory `agent run` was started from (a top-level
+    # cli/ there would shadow the installed package for `-m cli` without -I / -P).
+    cwd = state_dir()
+    cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         with open(logfile, "ab") as f:
             return subprocess.Popen(
                 argv,
+                cwd=str(cwd),
                 stdin=subprocess.DEVNULL,
                 stdout=f,
                 stderr=subprocess.STDOUT,

@@ -183,6 +183,10 @@ class ReasoningTracker:
 # ---------------------------------------------------------------------------
 
 _VERSION_LINE_RE = re.compile(r"version:\s*(\d+)\s*\(([0-9a-f]{6,40})\)", re.IGNORECASE)
+# llama.cpp 0.7+ (b11804 and later): "version: 0.7.0-dev (build 11804, commit c7fc50941)"
+_VERSION_BUILD_RE = re.compile(
+    r"\(build\s+(\d+),\s*commit\s+([0-9a-f]{6,40})\)", re.IGNORECASE
+)
 _BUILD_INFO_RE = re.compile(r"\bb(\d+)-([0-9a-f]{6,40})\b", re.IGNORECASE)
 _TAG_RE = re.compile(r"\bb(\d{3,})\b")
 _SHALLOW_BUILD_MAX = 100  # `git clone --depth 1` builds report build number 1
@@ -191,7 +195,8 @@ _SHALLOW_BUILD_MAX = 100  # `git clone --depth 1` builds report build number 1
 def parse_llama_build(text: str | None) -> dict[str, str | None]:
     """Return {'build': 'b11803'|None, 'commit': 'abc1234'|None}.
 
-    Accepts ``llama-server --version`` output ("version: 11803 (abc1234)"),
+    Accepts ``llama-server --version`` output ("version: 11803 (abc1234)", or from
+    0.7 on "version: 0.7.0-dev (build 11804, commit abc1234)"),
     ``/props`` ``build_info`` ("b11803-abc1234") or a bare tag ("b11803").
     A build number below 100 comes from a shallow clone (git rev-list count is
     meaningless there), so only the commit is trusted.
@@ -200,7 +205,11 @@ def parse_llama_build(text: str | None) -> dict[str, str | None]:
     if not text:
         return out
     number: str | None = None
-    m = _VERSION_LINE_RE.search(text) or _BUILD_INFO_RE.search(text)
+    m = (
+        _VERSION_LINE_RE.search(text)
+        or _VERSION_BUILD_RE.search(text)
+        or _BUILD_INFO_RE.search(text)
+    )
     if m:
         number, out["commit"] = m.group(1), m.group(2).lower()[:12]
     else:

@@ -288,6 +288,14 @@ What we collect, and why:
   update list, recording that you opted in, when, and the exact wording you
   agreed to. Nobody gets updates without that tick.
 
+- *"Email me once when a run of … is posted"* on a "measurement wanted" page
+  (`/requests/<model>/<hardware>`). We store your address, the model and hardware
+  you're watching, when you signed up, a hashed confirmation code and whether
+  you confirmed. We first email a confirmation link and send nothing else until
+  you click it; then we send one email when a matching run is posted and delete
+  the address. Unconfirmed sign-ups get no further mail. Addresses are never
+  shown on the site or returned by the API.
+
 Retention: notice-only addresses are deleted after the notice is sent. Update
 list addresses are kept until you unsubscribe. Every email we send carries a
 personal unsubscribe link; using it deletes your address from the list and from

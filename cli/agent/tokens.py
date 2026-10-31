@@ -194,6 +194,74 @@ def _file_load() -> str | None:
     return p.read_text(encoding="utf-8").strip() or None
 
 
+PROBE_ACCOUNT = "llm-speed-preflight"
+
+
+def _file_probe() -> str | None:
+    """Can the 0600 file store be written here? Writes and removes `token.probe` (no
+    token in it)."""
+    p = token_file().with_name("token.probe")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(p.parent, 0o700)
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, b"probe")
+            mode = os.fstat(fd).st_mode & 0o777
+        finally:
+            os.close(fd)
+            p.unlink()
+    except OSError as e:
+        return f"could not write {p}: {e.strerror or e}"
+    if mode & 0o077:
+        return f"{p} was created with mode {mode:o}, not 0600"
+    return None
+
+
+def _keychain_probe() -> str | None:
+    try:
+        _keychain_save(PROBE_ACCOUNT, "lsa_preflight-probe")
+    except TokenStoreError as e:
+        return str(e)
+    finally:
+        try:
+            subprocess.run(
+                [
+                    "security",
+                    "delete-generic-password",
+                    "-s",
+                    SERVICE,
+                    "-a",
+                    PROBE_ACCOUNT,
+                ],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return None
+
+
+def probe_store(prefer: str | None = None) -> str | None:
+    """Before pairing (R-74): None if save_token() would be able to keep a token, else
+    why not. Mirrors save_token's order: the 0600 file is the fallback for every
+    backend, so only when it fails is the Keychain (if that is the backend) probed."""
+    bad = _file_probe()
+    if bad is None:
+        return None
+    if _backend(prefer) == "keychain":
+        kc = _keychain_probe()
+        if kc is None:
+            return None
+        return f"no token store is writable (login Keychain: {kc}; file: {bad})"
+    return f"the token store is not writable ({bad})"
+
+
 def save_token(machine_id: str, token: str, prefer: str | None = None) -> Stored:
     """Store the token; never lose it to a Keychain failure.
 

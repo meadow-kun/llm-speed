@@ -301,6 +301,25 @@ def cmd_enroll(args) -> int:
 
 
 def cmd_install(args) -> int:
+    if service.platform_kind() in ("windows", "unsupported"):
+        # before enrolling: a pairing approved for a machine that can't run the service
+        # would be wasted
+        print(
+            service.WINDOWS_MESSAGE
+            if service.platform_kind() == "windows"
+            else "unsupported platform"
+        )
+        return 1
+    prefer = getattr(args, "token_store", None)
+    bad = service.preflight(
+        dry_run=getattr(args, "dry_run", False),
+        token_store=None if prefer in (None, "auto") else prefer,
+    )
+    if bad:
+        # before enrolling, for the same reason (and a single-use enrolment token)
+        print(bad)
+        print("Nothing was paired; an enrolment token, if you have one, was not used.")
+        return 1
     s = Settings.load()
     if not getattr(args, "dry_run", False) and not (
         s.machine_id and load_token(s.machine_id)
@@ -524,7 +543,7 @@ def add_parser(sub) -> None:
     )
     i = asub.add_parser(
         "install",
-        help="enroll if needed, then install + start the launchd/systemd user service",
+        help="enroll if needed, then install + start the launchd / systemd user service (WSL2: a Windows logon task)",
     )
     i.add_argument("--label", default=None)
     i.add_argument("--force", action="store_true")

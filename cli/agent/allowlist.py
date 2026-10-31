@@ -12,12 +12,14 @@ that were checked against the preset's own data.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import re
 import sys
 from functools import lru_cache
 from typing import Any
 
 from .. import agent_job, preset_schema
+from .pyflags import isolation_flags
 from .settings import Settings
 
 # Reviewed presets. Adding one is a code change + review + CLI release (phase 1).
@@ -331,7 +333,19 @@ def build_argv(
     """argv for the child: the same `llm-speed bench --preset` a person would paste."""
     if name not in REVIEWED_PRESETS:
         raise JobRejected("preset_not_allowlisted")
-    argv = [sys.executable, "-m", "cli", "bench", "--preset", name]
+    # R-74: same venv-aware isolation as the agent; -u because -I ignores
+    # PYTHONUNBUFFERED and the job log is read while the child runs. The child's cwd is
+    # the agent state dir (runner.default_launcher), never where `agent run` was typed.
+    argv = [
+        sys.executable,
+        *isolation_flags(),
+        "-u",
+        "-m",
+        "cli",
+        "bench",
+        "--preset",
+        name,
+    ]
     for k, v in overrides.items():
         _, flag = OVERRIDES[k]
         assert flag not in FORBIDDEN_FLAGS
@@ -346,10 +360,17 @@ def build_argv(
         else:
             argv += [flag, str(int(v))]
     # Local-only settings.
+    # absolute here, because the child runs in another cwd (same meaning as before)
     if settings.models_dir:
-        argv += ["--models-dir", settings.models_dir]
+        argv += [
+            "--models-dir",
+            os.path.abspath(os.path.expanduser(settings.models_dir)),
+        ]
     if settings.llama_server:
-        argv += ["--llama-server", settings.llama_server]
+        argv += [
+            "--llama-server",
+            os.path.abspath(os.path.expanduser(settings.llama_server)),
+        ]
     if not (upload and settings.upload):
         argv.append("--no-upload")
     argv.append("--strict-anon")  # agent uploads are always strict-anon

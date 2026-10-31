@@ -1,6 +1,6 @@
 [project]
 name = "llm-speed"
-version = "0.0.10"
+version = "0.0.11"
 description = "Benchmark any LLM on any hardware. CLI for the llm-speed.com flywheel."
 requires-python = ">=3.10"
 authors = [{name = "meadow-kun", email = "2424351+meadow-kun@users.noreply.github.com"}]

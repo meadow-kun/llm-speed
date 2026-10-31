@@ -234,6 +234,12 @@ def llama_server_candidates(explicit: str | None = None) -> list[str]:
         str(home / ".local/bin/llama-server"),
         str(home / "llama.cpp/build/bin/llama-server"),
     ]
+    # official CUDA release builds unpacked by the install command below (newest first)
+    c += sorted(
+        glob.glob(str(prebuilt_root() / "*" / "llama-*" / "llama-server")),
+        key=_build_key,
+        reverse=True,
+    )
     c += sorted(
         glob.glob(str(home / "llama.cpp*/build/bin/llama-server")), reverse=True
     )
@@ -269,10 +275,81 @@ def find_llama_server(
     return None, None, tried
 
 
+# Official llama.cpp Linux x86_64 CUDA release archives, newest CUDA first. Blackwell
+# (RTX 50xx, sm_120) needs CUDA 12.8 or newer; older CUDA builds lack its kernels.
+PREBUILT_CUDA = ("13.4", "12.8")
+MIN_BLACKWELL_CUDA = (12, 8)
+RELEASES = "https://github.com/ggml-org/llama.cpp/releases/download"
+
+
+def prebuilt_root() -> Path:
+    return Path.home() / ".local" / "share" / "llm-speed" / "llama.cpp"
+
+
+def _build_key(path: str) -> int:
+    m = re.search(r"llama-b(\d+)", path)
+    return int(m.group(1)) if m else 0
+
+
+def _ver(v: str | None) -> tuple[int, int]:
+    m = re.match(r"(\d+)\.(\d+)", v or "")
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def pick_prebuilt_cuda(driver_cuda: str | None) -> str | None:
+    """Newest release CUDA the driver can run (driver's "CUDA Version" >= build's), never
+    below 12.8. Unknown driver CUDA: the 12.8 build (runs on drivers >= 570)."""
+    if not driver_cuda:
+        return PREBUILT_CUDA[-1]
+    for c in PREBUILT_CUDA:
+        if _ver(c) <= _ver(driver_cuda):
+            return c
+    return None
+
+
+def nvcc_version() -> str | None:
+    if not shutil.which("nvcc"):
+        return None
+    try:
+        out = subprocess.run(
+            ["nvcc", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"release (\d+\.\d+)", out or "")
+    return m.group(1) if m else None
+
+
+def prebuilt_install(tag: str, cuda: str) -> tuple[list[str], str]:
+    """Download + unpack the official CUDA build and its CUDA runtime next to it
+    (llama-server's RUNPATH is $ORIGIN). No sudo, nothing outside ~/.local/share."""
+    dest = prebuilt_root() / f"{tag}-cuda-{cuda}"
+    main = f"{RELEASES}/{tag}/llama-{tag}-bin-ubuntu-cuda-{cuda}-x64.tar.gz"
+    rt = f"{RELEASES}/{tag}/cudart-llama-{tag}-bin-ubuntu-cuda-{cuda}-x64.tar.gz"
+    import shlex
+
+    d, sub = shlex.quote(str(dest)), shlex.quote(str(dest / f"llama-{tag}"))
+    script = (
+        f"set -o pipefail; mkdir -p {d} && "
+        f"curl -fL --retry 3 {main} | tar xz -C {d} && "
+        f"curl -fL --retry 3 {rt} | tar xz -C {sub} --strip-components=1 && "
+        f"{sub}/llama-server --version"
+    )
+    return ["bash", "-c", script], script
+
+
 def llama_install_command(
     facts: dict[str, Any], tag: str
 ) -> tuple[list[str] | None, str]:
-    """(command to run after y/N, human text). Never sudo."""
+    """(command to run after y/N, human text). Never sudo.
+
+    NVIDIA on Linux x86_64: under WSL2 always, and elsewhere when no CUDA >= 12.8 nvcc
+    is installed, the official release build for CUDA 12.8+ (works on Blackwell / RTX 50xx);
+    otherwise a source build with the local CUDA toolkit."""
     if facts.get("kind") == "apple":
         if shutil.which("brew"):
             return [
@@ -281,6 +358,17 @@ def llama_install_command(
                 "llama.cpp",
             ], "brew install llama.cpp   (or: brew upgrade llama.cpp)"
         return None, "install Homebrew (https://brew.sh), then: brew install llama.cpp"
+    nv_x86 = facts.get("kind") == "nvidia" and facts.get("arch") in ("x86_64", "AMD64")
+    nvcc = nvcc_version()
+    if nv_x86 and (facts.get("wsl") or _ver(nvcc) < MIN_BLACKWELL_CUDA):
+        cuda = pick_prebuilt_cuda(facts.get("cuda_driver_api"))
+        if cuda is None:
+            return None, (
+                f"the NVIDIA driver supports CUDA {facts.get('cuda_driver_api')}, but "
+                "llama.cpp's CUDA builds need 12.8 or newer: update the GPU driver "
+                "(on WSL2: the Windows driver; never install a Linux driver inside WSL)"
+            )
+        return prebuilt_install(tag, cuda)
     dest = Path.home() / f"llama.cpp-{tag}"
     script = (
         f"git clone https://github.com/ggml-org/llama.cpp {dest} && "
