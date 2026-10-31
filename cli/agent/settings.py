@@ -91,7 +91,14 @@ class Settings:
     # nvidia-smi.exe first), an absolute path to pin one, "off" = no NVIDIA sampling.
     nvidia_smi: str | None = None
     upload: bool = True
-    remote_presets: bool = False  # phase 2 (signed presets) flag
+    remote_presets: bool = (
+        False  # also check packaged presets against the revocation list
+    )
+    # 0.0.12: run presets the server signed with a key pinned in this CLI (verified,
+    # schema-checked, never new executable surface). Off by default (Security Desk R-93):
+    # opt in per machine with `llm-speed agent signed-presets on` (asks to confirm).
+    # Off = packaged presets only; turning it off again is the kill switch.
+    signed_presets: bool = False
     # Which store holds the machine token: "keychain" | "file" (set by enroll; the
     # token itself is never written here). None = enrolled before 0.0.10.
     token_store: str | None = None

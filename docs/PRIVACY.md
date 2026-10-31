@@ -49,7 +49,7 @@ For each workload (W1..W5):
 | `extras.peak_vram_mib`, `extras.peak_vram_source` (0.0.8) | peak GPU / MLX memory during the workload, rounded to 16 MiB (no total VRAM, which stays bucketed) |
 | `extras.time_to_first_answer_ms`, `extras.reasoning_tokens_est`, `extras.answer_started` (0.0.8) | timing of the first non-reasoning token; no text is uploaded |
 | `extras.llama_cpp_build`, `extras.llama_cpp_commit`, `extras.llama_cpp_build_source` (0.0.8) | exact llama.cpp build the numbers came from |
-| `extras.llama_server_args` (0.0.8; 0.0.10 adds `--no-cache-prompt`, `--cache-prompt`, `--cache-ram`, `--temp`, `--seed`, `--top-k`, `--top-p`, `--min-p`, `--reasoning`, `--kv-unified`) | allowlisted llama-server flags and values (e.g. `-c 4096 --n-cpu-moe 20 --temp 0 --seed 42 --reasoning off`); the 0.0.10 flags keep only numeric or on/off/auto values; other flags and path-like or free-text values are redacted |
+| `extras.llama_server_args` (0.0.8; 0.0.10 adds `--no-cache-prompt`, `--cache-prompt`, `--cache-ram`, `--temp`, `--seed`, `--top-k`, `--top-p`, `--min-p`, `--reasoning`, `--kv-unified`; the next release adds `-lm`/`--load-mode`, `-lzm`/`--lazy-mode`) | allowlisted llama-server flags and values (e.g. `-c 4096 --n-cpu-moe 20 --temp 0 --seed 42 --reasoning off`); the 0.0.10 flags keep only numeric or on/off/auto values; `--load-mode` keeps only `auto`, `none`, `mmap`, `mlock`, `mmap+mlock` or `dio`, and `--lazy-mode` only `on`, `auto` or `off`; other flags and path-like or free-text values are redacted |
 | `extras.sampling`, `extras.sampling_ignored` (0.0.10) | sampling settings the CLI sent with each request (`temperature`, `seed`, `top_k`, `top_p`, `min_p`; numbers only) and the names of requested keys the backend could not take; absent when none were set (presets default to temperature 0, seed 42) |
 | `extras.model_file`, `extras.model_file_bytes` (0.0.8) | GGUF file basename (already sent as `model.identifier`) and its size |
 
@@ -276,30 +276,44 @@ Cloudflare Turnstile.
 **Email is always optional.** You can request a run or download the dataset
 without giving one.
 
+**Every address is confirmed first (double opt-in).** Whichever form you use,
+we first email a confirmation link (valid for 7 days, usable once) and send
+nothing else to that address until you press Confirm. If you don't confirm, the
+sign-up is deleted after 7 days. Sign-up forms are protected by Cloudflare
+Turnstile and per-network rate limits; to enforce the hourly limit we keep a
+daily-rotating keyed hash of your IPv4 address or IPv6 /64 network (never the
+address itself) on an unconfirmed sign-up, and delete it when you confirm.
+
 What we collect, and why:
 
 - *"Get an email when this run is live."* If you enter an address on a
-  request, we store it with the request so we can send you one notice when that
-  run is published. After that notice is sent, the address is deleted unless
-  you also ticked the box below.
+  request, we store it with the model and hardware you requested so we can send
+  you a notice when that run is published, once you've confirmed.
 - *"Also send me new benchmark results (about monthly, unsubscribe anytime)"*
   on the request form, or *"Get dataset updates"* on the data page. This box
-  is unticked by default. Only if you tick it do we add your address to our
-  update list, recording that you opted in, when, and the exact wording you
-  agreed to. Nobody gets updates without that tick.
-
+  is unticked by default. Only if you tick it do we record that you opted in,
+  when, and the version of the exact wording you agreed to, and it counts only
+  after you confirm. Nobody gets updates without that tick and confirmation.
 - *"Email me once when a run of … is posted"* on a "measurement wanted" page
   (`/requests/<model>/<hardware>`). We store your address, the model and hardware
   you're watching, when you signed up, a hashed confirmation code and whether
-  you confirmed. We first email a confirmation link and send nothing else until
-  you click it; then we send one email when a matching run is posted and delete
-  the address. Unconfirmed sign-ups get no further mail. Addresses are never
-  shown on the site or returned by the API.
+  you confirmed. Once confirmed, we send one email when a matching run is posted
+  and delete the address. Addresses are never shown on the site or returned by
+  the API.
 
-Retention: notice-only addresses are deleted after the notice is sent. Update
-list addresses are kept until you unsubscribe. Every email we send carries a
-personal unsubscribe link; using it deletes your address from the list and from
-any pending request notices straight away. You can also ask for deletion at
+To limit abuse we also keep, for two days, a log of mail sent: a one-way hash
+of the address (not the address) and its domain, so one inbox gets at most
+three confirmation emails a day.
+
+Addresses entered before sign-ups had this confirmation step are kept
+unconfirmed and are never emailed, not even to ask for confirmation. You can still have them deleted (see below).
+
+Retention: unconfirmed sign-ups are deleted after 7 days; notice-only addresses
+are deleted after the notice is sent. Update list addresses are kept until you
+unsubscribe. Every email we send is plain text and carries a personal
+unsubscribe link that contains neither your address nor any code from the
+confirmation email; using it deletes your address from the list and from any
+pending notices straight away. You can also ask for deletion at
 privacy@llm-speed.com.
 
 We never sell, rent or share your email address, and we use it for nothing

@@ -19,6 +19,7 @@ import atexit
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -70,13 +71,45 @@ CHUNK_READ_TIMEOUT_S = 30.0  # but a single SSE chunk must not stall
 # for the prompt: assume prefill no slower than this many tokens/s (~3.5 chars each).
 MIN_PREFILL_TPS = 50.0
 MAX_READ_TIMEOUT_S = 3600.0
+# Local overrides for runs that read weights from disk (mmap / partial offload), where
+# prefill can fall below 50 tok/s and a cold first request can take over 30 s. Read at
+# request time, never uploaded. Unset, empty or invalid values keep the defaults above.
+MIN_PREFILL_TPS_ENV = "LLM_SPEED_MIN_PREFILL_TPS"
+READ_TIMEOUT_ENV = "LLM_SPEED_READ_TIMEOUT_S"
+
+
+def _positive_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        val = float("nan")
+    if not math.isfinite(val) or val <= 0:
+        LOG.warning("ignoring %s=%r (want a number > 0); using %s", name, raw, default)
+        return default
+    return val
+
+
+def min_prefill_tps() -> float:
+    """Prefill floor (tokens/s) used to size the read timeout; $LLM_SPEED_MIN_PREFILL_TPS."""
+    return _positive_env_float(MIN_PREFILL_TPS_ENV, MIN_PREFILL_TPS)
+
+
+def base_read_timeout_s() -> float:
+    """Read timeout before the prompt allowance; $LLM_SPEED_READ_TIMEOUT_S (default 30 s)."""
+    return _positive_env_float(READ_TIMEOUT_ENV, CHUNK_READ_TIMEOUT_S)
 
 
 def read_timeout_for_prompt(prompt_chars: int) -> float:
     """Per-read timeout that scales with prompt length (CLI_ISSUES #9): 30 s for
-    short prompts, ~12 min for a 128K-token prompt, capped at an hour."""
+    short prompts, ~12 min for a 128K-token prompt, capped at an hour.
+    $LLM_SPEED_MIN_PREFILL_TPS / $LLM_SPEED_READ_TIMEOUT_S loosen it for disk-bound runs."""
     est_tokens = max(0, prompt_chars) / 3.5
-    return min(MAX_READ_TIMEOUT_S, CHUNK_READ_TIMEOUT_S + est_tokens / MIN_PREFILL_TPS)
+    return min(
+        MAX_READ_TIMEOUT_S, base_read_timeout_s() + est_tokens / min_prefill_tps()
+    )
 
 
 DIGEST_BYTES = 256 * 1024  # 256KB sha256 prefix
@@ -462,6 +495,11 @@ class LlamaCppDriver:
                         output_tokens = usage.get("completion_tokens") or output_tokens
                         backend_extras["usage"] = usage
 
+        except httpx.ReadTimeout as exc:
+            return _failed_outcome(
+                f"streaming request failed: ReadTimeout: {exc} (prompt-sized read timeout; "
+                f"for disk-bound runs lower ${MIN_PREFILL_TPS_ENV} or raise ${READ_TIMEOUT_ENV})"
+            )
         except httpx.HTTPError as exc:
             return _failed_outcome(f"streaming request failed: {exc}")
 

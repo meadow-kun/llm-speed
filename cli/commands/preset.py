@@ -97,7 +97,19 @@ def cmd_preset_tool(args) -> int:
     return 2
 
 
-def load_preset(name: str) -> dict[str, Any]:
+def load_preset(name: str, sha256: str | None = None) -> dict[str, Any]:
+    """A packaged preset, or with `sha256` (`--preset-sha256`, what `llm-speed agent` passes
+    for a server-signed preset) the cached signed bundle, re-verified against the pinned
+    keys and the shared schema on this read (cli/agent/signed_presets.py)."""
+    if sha256 is not None:
+        from ..agent.signed_presets import PresetVerificationError, load_verified
+
+        try:
+            return load_verified(sha256, name)
+        except PresetVerificationError as exc:
+            raise SystemExit(
+                f"signed preset {name!r} {sha256[:12]} refused: {exc} ({exc.code})"
+            ) from None
     path = PRESET_DIR / f"{name}.json"
     if not path.exists():
         raise SystemExit(
@@ -642,7 +654,8 @@ def cmd_preset(args) -> int:
     # it now (memory only) so the per-cell children never inherit the fd or its number.
     take_from_env()
     name = args.preset
-    preset = load_preset(name)
+    signed_sha = getattr(args, "preset_sha256", None)
+    preset = load_preset(name, signed_sha) if signed_sha else load_preset(name)
     rdir = results_dir(name)
     models_dir = Path(
         os.path.expanduser(

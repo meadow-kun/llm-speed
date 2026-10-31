@@ -137,6 +137,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "anything else is redacted."
         ),
     )
+    p_bench.add_argument(
+        "--min-prefill-tps",
+        default=None,
+        type=float,
+        metavar="TPS",
+        help=(
+            "llama.cpp: slowest prefill (tokens/s) to wait for before a request times out "
+            "(default 50; same as $LLM_SPEED_MIN_PREFILL_TPS). Lower it for runs that read "
+            "weights from disk. Local only, not uploaded."
+        ),
+    )
     # Sampling sent with every request (0.0.10). Validated in cli/sampling.py.
     p_bench.add_argument(
         "--temperature",
@@ -187,6 +198,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "guided launch run, e.g. --preset flint-40b: detects the GPU, picks quants that "
             "fit, downloads (resumable), runs 4K/16K/32K, records failures, then uploads "
             "through the normal consent flow. Rerun to resume."
+        ),
+    )
+    p_bench.add_argument(
+        "--preset-sha256",
+        default=None,
+        metavar="SHA256",
+        help=(
+            "--preset: run the server-signed preset with this sha256 from the local signed "
+            "cache (~/.cache/llm-speed/presets/_signed), re-verified against the pinned keys "
+            "on load. `llm-speed agent` passes it for signed presets."
         ),
     )
     p_bench.add_argument(

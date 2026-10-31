@@ -4,7 +4,9 @@ A job is data, never a command. It names a preset by (name, version, sha256); th
 agent runs it only if that triple matches a preset shipped in the INSTALLED CLI
 package (cli/presets/<name>.json, validated against the shared schema
 cli/schemas/llm-speed-preset-1.schema.json; or the built-in `selftest`)
-and the name is in the reviewed list below. Overrides can only narrow the preset.
+and the name is in the reviewed list below, or (0.0.12) a bundle the server signed with a
+key pinned in this CLI that passes the same schema (signed_presets.resolve_signed_preset).
+Overrides can only narrow the preset.
 The agent builds argv itself; nothing from the server reaches argv except values
 that were checked against the preset's own data.
 """
@@ -22,8 +24,10 @@ from .. import agent_job, preset_schema
 from .pyflags import isolation_flags
 from .settings import Settings
 
-# Reviewed presets. Adding one is a code change + review + CLI release (phase 1).
+# Packaged, reviewed presets (phase 1; kept for backwards compatibility). Since 0.0.12 a
+# new preset is published as signed data instead (ops/AGENT_QUEUE_API.md section 8).
 REVIEWED_PRESETS = ("flint-40b", "selftest")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # `selftest`: no model, no download, no upload, no fit rows. Lets the queue operator check a
 # newly enrolled machine end to end in seconds. Its identity is the sha256 of this dict's
@@ -94,6 +98,15 @@ class JobRejected(ValueError):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason[:120]
+
+
+class PresetUnverified(JobRejected):
+    """A signed preset could not be fetched or verified: the job is released, never run.
+    `code` is signed_presets' reason code; `detail` is for local status only."""
+
+    def __init__(self, code: str, detail: str = ""):
+        super().__init__(f"preset_unverified:{code}")
+        self.code, self.detail = code, detail[:200]
 
 
 @lru_cache(maxsize=1)
@@ -198,8 +211,11 @@ def validate_job(
     now: dt.datetime | None = None,
     preset_loader=preset_schema.packaged_preset,
     flags: frozenset[str] | None = None,
+    signed_loader=None,
 ) -> tuple[dict, dict[str, Any]]:
-    """Return (preset, overrides) or raise JobRejected(reason). Reasons use the queue API's codes."""
+    """Return (preset, overrides) or raise JobRejected(reason). Reasons use the queue API's codes.
+    `signed_loader(name, version, sha256)` returns a verified signed preset or raises
+    PresetUnverified; None = packaged presets only (the 0.0.11 behaviour)."""
     if not isinstance(job, dict):
         raise JobRejected("invalid_job")
     extra = set(job) - JOB_FIELDS
@@ -242,7 +258,7 @@ def validate_job(
         r"[a-z0-9][a-z0-9.\-]{0,62}", name
     ):
         raise JobRejected("bad_preset")
-    if name not in REVIEWED_PRESETS:
+    if name not in REVIEWED_PRESETS and signed_loader is None:
         raise JobRejected("preset_not_allowed")
     if settings.allow_presets is not None and name not in settings.allow_presets:
         raise JobRejected("preset_not_allowed_on_this_machine")
@@ -257,19 +273,32 @@ def validate_job(
         raise JobRejected("bad_overrides")
     if name == "selftest":
         return _validate_selftest(ident, ov)
-    preset = preset_loader(name)
-    if preset is None:
-        raise JobRejected("preset_not_installed")
-    try:
-        preset_schema.validate_preset(preset)
-    except preset_schema.PresetInvalid:
-        raise JobRejected("installed_preset_invalid") from None
-    mine = preset_schema.identity(preset)
-    if (mine["version"], mine["sha256"]) != (version, sha):
-        raise JobRejected("preset_not_allowed")  # same name, different bytes/version
+    preset = preset_loader(name) if name in REVIEWED_PRESETS else None
+    if preset is not None:
+        try:
+            preset_schema.validate_preset(preset)
+        except preset_schema.PresetInvalid:
+            raise JobRejected("installed_preset_invalid") from None
+    mine = preset_schema.identity(preset) if preset is not None else None
+    signed = False
+    if mine is None or (mine["version"], mine["sha256"]) != (version, sha):
+        # Not packaged: only a server-signed bundle with exactly this triple can stand in.
+        # A packaged name always means the packaged bytes: a signed bundle can't take it
+        # (Security Desk R-96), so a mismatch there is refused as before.
+        if signed_loader is None or name in REVIEWED_PRESETS:
+            raise JobRejected(
+                "preset_not_installed" if preset is None else "preset_not_allowed"
+            )
+        if not SHA256_RE.fullmatch(sha) or version < 1:
+            raise JobRejected("bad_preset")
+        preset = signed_loader(name, version, sha)  # raises PresetUnverified
+        signed = True
+        mine = preset_schema.identity(preset)
+        if (mine["name"], mine["version"], mine["sha256"]) != (name, version, sha):
+            raise PresetUnverified("name_mismatch")
 
     flags = bench_flags() if flags is None else flags
-    if "--preset" not in flags:
+    if "--preset" not in flags or (signed and "--preset-sha256" not in flags):
         raise JobRejected("preset_command_not_available")
     out: dict[str, Any] = {}
     models = set(preset.get("models", {}))
@@ -328,10 +357,22 @@ def job_context(job: dict, api_base: str) -> dict[str, str] | None:
 
 
 def build_argv(
-    name: str, overrides: dict[str, Any], settings: Settings, *, upload: bool = True
+    name: str,
+    overrides: dict[str, Any],
+    settings: Settings,
+    *,
+    upload: bool = True,
+    signed_sha256: str | None = None,
 ) -> list[str]:
-    """argv for the child: the same `llm-speed bench --preset` a person would paste."""
-    if name not in REVIEWED_PRESETS:
+    """argv for the child: the same `llm-speed bench --preset` a person would paste.
+    A signed preset adds `--preset-sha256 SHA` (the child loads and re-verifies the cached
+    bundle); nothing else differs from a packaged preset."""
+    if signed_sha256 is not None:
+        if not SHA256_RE.fullmatch(signed_sha256) or not re.fullmatch(
+            r"[a-z0-9][a-z0-9.\-]{0,62}", name
+        ):
+            raise JobRejected("preset_not_allowlisted")
+    elif name not in REVIEWED_PRESETS:
         raise JobRejected("preset_not_allowlisted")
     # R-74: same venv-aware isolation as the agent; -u because -I ignores
     # PYTHONUNBUFFERED and the job log is read while the child runs. The child's cwd is
@@ -346,6 +387,8 @@ def build_argv(
         "--preset",
         name,
     ]
+    if signed_sha256 is not None:
+        argv += ["--preset-sha256", signed_sha256]
     for k, v in overrides.items():
         _, flag = OVERRIDES[k]
         assert flag not in FORBIDDEN_FLAGS

@@ -26,7 +26,14 @@ from .. import agent_job as _agent_job
 from ..api_host import ALLOW_TOKEN_HOST_ENV, display_host, is_canonical_api_base
 from ..config import CACHE_DIR
 from . import gates
-from .allowlist import JobRejected, advertised, build_argv, job_context, validate_job
+from .allowlist import (
+    JobRejected,
+    PresetUnverified,
+    advertised,
+    build_argv,
+    job_context,
+    validate_job,
+)
 from .settings import (
     Settings,
     atomic_write_json,
@@ -58,6 +65,11 @@ BAD_NONCE_NOTE = "the queue's upload nonce for this job could not be used; its r
 log = logging.getLogger("cli.agent")
 
 IDLE_POLL_S = 60
+# Release codes for a signed preset that could not be used (worker RELEASE_REASONS, 0.0.12).
+# A queue from before 0.0.12 only knows gate_closed, which is sent instead.
+SIGNED_PRESET_FEATURE = "signed_presets"
+BASE_RELEASE_REASONS = ("gate_closed", "declined", "approval_timeout", "paused")
+TRANSIENT_PRESET_CODES = ("fetch_failed", "revocations_unavailable")
 # After a claimed job is handed back because this machine lacks the free VRAM / memory /
 # disk it needs, wait longer before claiming again (the queue may offer the same job).
 RESOURCE_RETRY_S = 300
@@ -429,6 +441,9 @@ class Runner:
         self.next_wait: float | None = None  # set by handle() when a job is handed back
         self.stopped_reason: str | None = None
         self.server_requires_approval = False
+        self._signed: str | None = (
+            None  # sha256 of the signed preset of the current job
+        )
         ensure_dirs()
 
     # ------------------------------------------------------------- control
@@ -544,7 +559,14 @@ class Runner:
             write_status(state="waiting", reason="; ".join(g.reasons))
             return IDLE_POLL_S
         try:
-            claim = self.client.claim(capabilities(self.settings, facts=self.facts))
+            claim = self.client.claim(
+                capabilities(self.settings, facts=self.facts),
+                **(
+                    {"features": [SIGNED_PRESET_FEATURE]}
+                    if self.settings.signed_presets
+                    else {}
+                ),
+            )
         except QueueError as e:
             return self._on_error(e)
         self.backoff = 5.0
@@ -596,12 +618,24 @@ class Runner:
             state="claimed",
             current_job={"job_id": job_id, "preset": name, "at": utcnow()},
         )
+        self._signed = None
         try:
             preset, overrides = validate_job(
-                job, self.settings, preset_loader=self.preset_loader, flags=self.flags
+                job,
+                self.settings,
+                preset_loader=self.preset_loader,
+                flags=self.flags,
+                signed_loader=(
+                    self._load_signed
+                    if self.settings.signed_presets
+                    else self._signed_disabled
+                ),
             )
-            if self.settings.remote_presets:
-                self._check_revocations(preset)
+            if self.settings.remote_presets and self._signed is None:
+                self._check_revocations(preset)  # a signed preset was checked already
+        except PresetUnverified as r:
+            self._refuse_signed(job, lease, r)
+            return
         except JobRejected as r:
             if r.reason == "not_before":
                 self._release(job, lease, "gate_closed")
@@ -644,6 +678,55 @@ class Runner:
             max_runtime_min=job.get("max_runtime_min"),
         )
 
+    @staticmethod
+    def _signed_disabled(name: str, version: int, sha256: str) -> dict:
+        """Signed presets are off on this machine (the default; R-93): never fetched."""
+        raise JobRejected("signed_presets_disabled")
+
+    def _load_signed(self, name: str, version: int, sha256: str) -> dict:
+        """validate_job's signed_loader: the verified bundle, or PresetUnverified."""
+        from .signed_presets import PresetVerificationError, resolve_signed_preset
+
+        try:
+            preset = resolve_signed_preset(
+                self.client, name, version, sha256, self.preset_keys
+            )
+        except PresetVerificationError as e:
+            raise PresetUnverified(e.code, str(e)) from None
+        self._signed = sha256
+        return preset
+
+    def _refuse_signed(self, job: dict, lease: dict, r: PresetUnverified) -> None:
+        """Never run it: hand it back with a reason code (like gate_closed) and say why
+        in local status (`llm-speed agent status`)."""
+        ident = job.get("preset") if isinstance(job.get("preset"), dict) else {}
+        code = reason_code(r.code) or "unverified"
+        log.warning(
+            "job %s: signed preset %s v%s not used: %s",
+            job.get("job_id"),
+            ident.get("name"),
+            ident.get("version"),
+            code,
+        )
+        write_status(
+            last_preset_refusal={
+                "job_id": str(job.get("job_id")),
+                "preset": ident.get("name"),
+                "version": ident.get("version"),
+                "sha256": ident.get("sha256"),
+                "reason": code,
+                "detail": redact(r.detail),
+                "at": utcnow(),
+            }
+        )
+        release = (
+            "preset_unavailable"
+            if r.code in TRANSIENT_PRESET_CODES
+            else "preset_unverified"
+        )
+        self._release(job, lease, release, detail=f"{code}: {redact(r.detail)}")
+        self.next_wait = RESOURCE_RETRY_S * random.uniform(0.8, 1.2)
+
     def _check_revocations(self, preset: dict) -> None:
         """Phase 2 (remote_presets on): the signed revocation list is checked before every
         job, packaged presets included. Any failure = reject (fail closed)."""
@@ -672,7 +755,17 @@ class Runner:
     ) -> None:
         """`reason` is the queue's release code; `detail` (local status only) says why."""
         try:
-            self.client.release(str(job.get("job_id")), lease.get("lease_id"), reason)
+            try:
+                self.client.release(
+                    str(job.get("job_id")), lease.get("lease_id"), reason
+                )
+            except QueueError as e:
+                # A queue from before 0.0.12 knows only the four original codes.
+                if e.status != 400 or reason in BASE_RELEASE_REASONS:
+                    raise
+                self.client.release(
+                    str(job.get("job_id")), lease.get("lease_id"), "gate_closed"
+                )
         except QueueError as e:
             log.info("release failed (%s); the lease will expire", e.code)
         write_status(
@@ -793,7 +886,9 @@ class Runner:
         max_runtime_min: int | None,
     ) -> None:
         job_id, name = str(job.get("job_id")), str(preset["preset"])
-        argv = build_argv(name, overrides, self.settings, upload=upload)
+        argv = build_argv(
+            name, overrides, self.settings, upload=upload, signed_sha256=self._signed
+        )
         logfile = logs_dir() / f"job-{job_id}.log"
         uploads_before = _load_json(preset_results_dir(name) / "uploads.json") or {}
         started = utcnow()
