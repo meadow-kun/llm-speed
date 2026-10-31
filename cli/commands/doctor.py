@@ -117,6 +117,158 @@ def agent_token_checks() -> list[Check]:
     ]
 
 
+def _on_windows_drive(p: str) -> bool:
+    import os
+
+    return os.path.realpath(os.path.expanduser(p)).startswith("/mnt/")
+
+
+def wsl_checks(*, runner=None, force: bool | None = None) -> list[Check]:
+    """Under WSL2 only: where models live, CUDA, the Windows nvidia-smi.exe the busy check
+    reads, VM memory vs the host, a Linux NVIDIA driver installed by mistake, and a
+    CUDA llama.cpp build. Read-only; never changes WSL or Windows settings."""
+    import os
+    from pathlib import Path
+
+    from ..agent import gates, wsl
+    from ..config import CACHE_DIR
+
+    if not (wsl.is_wsl() if force is None else force):
+        return []
+    checks: list[Check] = []
+    try:
+        from ..agent.settings import Settings
+
+        s = Settings.load()
+    except (OSError, ValueError, TypeError):
+        s = None
+    dirs = {
+        "llm-speed cache": str(CACHE_DIR),
+        "Hugging Face cache": os.environ.get("HF_HOME") or "~/.cache/huggingface",
+    }
+    if s and s.models_dir:
+        dirs["agent models_dir"] = s.models_dir
+    bad = [f"{k} {v}" for k, v in dirs.items() if _on_windows_drive(v)]
+    checks.append(
+        Check(
+            id="wsl.models",
+            title="WSL: models on the distro disk",
+            status=WARN if bad else OK,
+            detail=("on a Windows drive (slow 9P reads): " + "; ".join(bad))
+            if bad
+            else "cache and models dirs are inside the distro",
+            remediation="keep models under the distro's home (unset HF_HOME / "
+            "`llm-speed agent config models_dir auto`)"
+            if bad
+            else None,
+        )
+    )
+    cuda = Path(wsl.WSL_LIB) / "libcuda.so.1"
+    checks.append(
+        Check(
+            id="wsl.cuda",
+            title="WSL: CUDA from the Windows driver",
+            status=OK if cuda.exists() else WARN,
+            detail=str(cuda) if cuda.exists() else f"{cuda} missing",
+            remediation=None
+            if cuda.exists()
+            else "install or update the NVIDIA driver on Windows (no Linux driver inside "
+            "WSL); if it is still missing, WSL itself may be too old, but `wsl --update` "
+            "stops every running distro, so only run it when nothing else in WSL needs "
+            "to keep running (llm-speed never runs it)",
+        )
+    )
+    run = runner or gates._run
+    smi, util, notes, _present = gates.read_nvidia_util(
+        s or Settings(), runner=run, wsl=True
+    )
+    exe_ok = bool(smi and smi.endswith(".exe"))
+    checks.append(
+        Check(
+            id="wsl.nvidia_smi",
+            title="WSL: Windows nvidia-smi.exe (busy check)",
+            status=OK if exe_ok else WARN,
+            detail=f"{smi}: utilization {util}%"
+            if exe_ok
+            else (
+                f"not readable ({'; '.join(notes) or 'not found'}); "
+                + (
+                    f"using {smi}, which can't see Windows apps"
+                    if smi
+                    else "the agent will treat the GPU as busy"
+                )
+            ),
+            remediation=None
+            if exe_ok
+            else "check [interop] enabled=true in /etc/wsl.conf, or pin it: "
+            "`llm-speed agent config nvidia_smi /mnt/c/Windows/System32/nvidia-smi.exe`",
+        )
+    )
+    vm, host = wsl.vm_ram_gb(), wsl.host_ram_gb()
+    checks.append(
+        Check(
+            id="wsl.memory",
+            title="WSL: memory",
+            status=OK,
+            detail=(
+                f"the VM sees {vm} GB" + (f" of the host's {host} GB" if host else "")
+            )
+            + "; WSL's default cap is 50% of host RAM (`memory=` in .wslconfig, a global "
+            "setting llm-speed never changes); CPU offload is limited by the VM's share",
+        )
+    )
+    pkgs, libs = wsl.linux_nvidia_driver_packages(), wsl.stray_libcuda()
+    checks.append(
+        Check(
+            id="wsl.linux_driver",
+            title="WSL: no Linux NVIDIA driver inside WSL",
+            status=WARN if (pkgs or libs) else OK,
+            detail=("found " + ", ".join(pkgs + libs)) if (pkgs or libs) else "none",
+            remediation=(
+                "NVIDIA: never install a Linux display driver inside WSL; it shadows the "
+                "Windows driver's /usr/lib/wsl/lib/libcuda.so. Remove it: "
+                f"sudo apt remove {' '.join(pkgs) or '<the nvidia driver package>'}"
+            )
+            if (pkgs or libs)
+            else None,
+        )
+    )
+    checks.append(_wsl_llama_check())
+    return checks
+
+
+def _wsl_llama_check() -> Check:
+    from pathlib import Path
+
+    from . import preset as pr
+
+    path, info, _ = pr.find_llama_server(None, None)
+    if not path:
+        return Check(
+            id="wsl.llama_cpp",
+            title="WSL: llama.cpp CUDA build",
+            status=WARN,
+            detail="no llama-server found",
+            remediation="`llm-speed bench --preset <name>` offers the official CUDA 12.8+ "
+            f"Linux build (unpacked under {pr.prebuilt_root()}); RTX 50xx needs CUDA 12.8+",
+        )
+    cuda = (
+        "CUDA" in ((info or {}).get("flags") or [])
+        or (Path(path).parent / "libggml-cuda.so").exists()
+    )
+    return Check(
+        id="wsl.llama_cpp",
+        title="WSL: llama.cpp CUDA build",
+        status=OK if cuda else WARN,
+        detail=f"{Path(path).name} {(info or {}).get('build') or '?'}"
+        + ("" if cuda else " (no CUDA backend found next to it)"),
+        remediation=None
+        if cuda
+        else "use a CUDA 12.8+ build: `llm-speed bench --preset <name>` offers the "
+        "official one",
+    )
+
+
 def run_doctor(
     *,
     api_base: str | None = None,
@@ -129,7 +281,7 @@ def run_doctor(
     """Run the doctor flow. Returns an exit code (0 ready, 1 not ready)."""
     cons = console or get_console()
     do_checks = run_checks_fn or (
-        lambda: run_checks(api_base=api_base) + agent_token_checks()
+        lambda: run_checks(api_base=api_base) + agent_token_checks() + wsl_checks()
     )
     confirm_fn = confirm or _default_confirm
     if interactive is None:
