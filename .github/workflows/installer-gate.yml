@@ -112,25 +112,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip wheel --no-deps -w "$RUNNER_TEMP/au-dist" .
+          # Built from a copy outside the checkout: an in-tree build leaves
+          # llm_speed.egg-info (NEW) behind, which shadows the installed version
+          # in metadata checks run from the checkout (0.0.14 gate run).
+          python -c 'import shutil, sys; shutil.copytree(".", sys.argv[1], ignore=shutil.ignore_patterns(".git", "build", "*.egg-info"))' "$RUNNER_TEMP/au-src"
+          python -m pip wheel --no-deps -w "$RUNNER_TEMP/au-dist" "$RUNNER_TEMP/au-src"
+          rm -rf "$RUNNER_TEMP/au-src"
           ls "$RUNNER_TEMP/au-dist/llm_speed-$NEW_VERSION-py3-none-any.whl"
+          if compgen -G "*.egg-info" >/dev/null || [ -e build ]; then
+            echo "build output left in the checkout" >&2; exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/gate-cwd"
       - name: Installer gate (bash, with Homebrew)
         if: runner.os != 'Windows'
         shell: bash
+        # an empty directory, not the checkout (nothing on sys.path from cwd)
+        working-directory: ${{ runner.temp }}/gate-cwd
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = Linux ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
             eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           fi
           INSTALLER_GATE_ROOT="$RUNNER_TEMP/installer-gate-runs" PYTHON=python \
-            bash scripts/check-installers.sh --bootstrap-tools --summary "$GITHUB_STEP_SUMMARY" \
+            bash "$GITHUB_WORKSPACE/scripts/check-installers.sh" --bootstrap-tools --summary "$GITHUB_STEP_SUMMARY" \
             --auto-update-wheel "$RUNNER_TEMP/au-dist/llm_speed-$NEW_VERSION-py3-none-any.whl" \
             "$NEW_VERSION" "$PREV_VERSION"
       - name: Installer gate (PowerShell)
         if: runner.os == 'Windows'
         shell: pwsh
+        working-directory: ${{ runner.temp }}/gate-cwd
         run: |
           $env:INSTALLER_GATE_ROOT = Join-Path $env:RUNNER_TEMP 'installer-gate-runs'
           $wheel = Join-Path $env:RUNNER_TEMP "au-dist/llm_speed-$($env:NEW_VERSION)-py3-none-any.whl"
-          ./scripts/check-installers.ps1 -New $env:NEW_VERSION -Prev $env:PREV_VERSION -BootstrapTools -Python python -Summary $env:GITHUB_STEP_SUMMARY -AutoUpdateWheel $wheel
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/check-installers.ps1') -New $env:NEW_VERSION -Prev $env:PREV_VERSION -BootstrapTools -Python python -Summary $env:GITHUB_STEP_SUMMARY -AutoUpdateWheel $wheel
           exit $LASTEXITCODE
