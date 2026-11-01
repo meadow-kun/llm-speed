@@ -1,7 +1,7 @@
 """llm-speed CLI entry point.
 
 Argparse dispatcher across `bench`, `detect`, `list-models`, `compare`,
-`login`, `self-update`, plus the new `verify`, `about` subcommands and the
+`login`, `update` (alias `self-update`), plus the new `verify`, `about` subcommands and the
 default no-args interactive wizard.
 
 Side-effect-imports `cli.drivers` and `cli.workloads` to populate the
@@ -292,11 +292,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "config",
         help=(
             "show or change settings (credit: your public handle on uploads; "
-            "storage-info: drive info on uploads, on|off)"
+            "storage-info: drive info on uploads, on|off; set KEY VALUE: auto_update "
+            "or auto_update_prereleases, true|false)"
         ),
     )
     p_config.add_argument(
-        "config_key", choices=["credit", "storage-info"], metavar="credit|storage-info"
+        "config_key",
+        choices=["credit", "storage-info", "set"],
+        metavar="credit|storage-info|set",
     )
     p_config.add_argument(
         "value",
@@ -307,6 +310,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "credit: @name (X) or u/name (Reddit); storage-info: on or off. "
             "Omit to show the current setting"
         ),
+    )
+    p_config.add_argument(
+        "setting_value",
+        nargs="?",
+        default=None,
+        metavar="VALUE",
+        help="set: true or false (omit to show the current value)",
     )
     p_config.add_argument(
         "--clear",
@@ -339,8 +349,20 @@ def _build_parser() -> argparse.ArgumentParser:
     # login --------------------------------------------------------------
     sub.add_parser("login", help="claim a contributor profile via GitHub OAuth (stub)")
 
-    # self-update --------------------------------------------------------
-    sub.add_parser("self-update", help="check for a newer suite manifest (stub)")
+    # update -------------------------------------------------------------
+    p_update = sub.add_parser(
+        "update",
+        aliases=["self-update"],
+        help=(
+            "update llm-speed to the latest release on PyPI with the installer it came "
+            "from (pipx, uv tool, Homebrew or pip in a venv)"
+        ),
+    )
+    p_update.add_argument(
+        "--check",
+        action="store_true",
+        help="only report whether an update is available",
+    )
 
     # verify -------------------------------------------------------------
     p_verify = sub.add_parser(
@@ -467,6 +489,12 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
 
         return cmd_preset_tool(args)
     if cmd == "config":
+        if getattr(args, "config_key", None) == "set":
+            from .autoupdate import cmd_config_set
+
+            return cmd_config_set(args)
+        if getattr(args, "setting_value", None) is not None:
+            parser.error(f"config {args.config_key} takes one value")
         if getattr(args, "config_key", None) == "storage-info":
             from .storage_info import cmd_config_storage
 
@@ -494,10 +522,10 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
         from .commands.login import cmd_login
 
         return cmd_login(args)
-    if cmd == "self-update":
-        from .commands.self_update import cmd_self_update
+    if cmd in ("update", "self-update"):
+        from .autoupdate import cmd_update
 
-        return cmd_self_update(args)
+        return cmd_update(args)
     if cmd == "verify":
         from .verify import cmd_verify
 
@@ -560,6 +588,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _configure_logging(getattr(args, "verbose", False))
     try:
+        from .autoupdate import maybe_start_background
+
+        # Daily, detached, never waits; off for CI / non-TTY / opt-out (docs/CLI.md).
+        maybe_start_background(getattr(args, "command", None))
+    except Exception:  # noqa: BLE001 - an update problem never breaks a command
+        pass
+    from .autoupdate import InUse
+
+    # R-136: the updater won't replace the install while this command runs. `agent run`
+    # marks itself only while a job runs (Runner.cycle); `update` must not block itself.
+    cmd = getattr(args, "command", None)
+    marker = None if cmd in ("agent", "update", "self-update") else InUse()
+    try:
+        if marker is not None:
+            marker.__enter__()
         return _dispatch(args, parser)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
@@ -569,6 +612,9 @@ def main(argv: list[str] | None = None) -> int:
             traceback.print_exc()
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if marker is not None:
+            marker.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

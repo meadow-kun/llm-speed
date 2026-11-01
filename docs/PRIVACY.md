@@ -220,6 +220,21 @@ non-whitelisted string field exceeds 256 characters. The whitelist:
 
 ---
 
+### Update check (0.0.14)
+
+Once a day the CLI asks `https://pypi.org/pypi/llm-speed/json` whether a newer
+llm-speed exists, and installs it with your installer (pipx, uv, Homebrew or pip). This
+request goes to PyPI, not to llm-speed: it sends nothing to llm-speed servers and
+carries no run data, fingerprint or key. PyPI (and, for Homebrew installs, GitHub and
+Homebrew's servers, which `brew upgrade` contacts) see an ordinary download request from
+your IP address. Turn it off with `LLM_SPEED_DISABLE_AUTOUPDATE=1` or
+`llm-speed config set auto_update false`; it is already off in CI and without a
+terminal. `--anon` and `--strict-anon` don't turn it off: they cover what a benchmark
+uploads, not this check. When pip, pipx or uv install the update they send PyPI their
+usual user agent (installer and Python versions, OS and similar platform details), as
+on any manual install; the CLI's own JSON check sends httpx's default user agent.
+Details: docs/CLI.md "Auto-update".
+
 ## 3. Three modes
 
 | Capability | default | `--anon` | `--strict-anon` |
@@ -507,7 +522,7 @@ pageviews. A small first-party shopping-interest counter is described below.
 |---|---|
 | Provider | Cloudflare, Inc. (the same edge that already terminates TLS for the site) |
 | Cookies | none |
-| `localStorage` / `sessionStorage` | none |
+| `localStorage` / `sessionStorage` | none (see *Browser storage*) |
 | Client-side fingerprinting | none |
 | Persistent client identifier | none |
 | Client IP storage | not persisted (Cloudflare aggregates at the edge; the unaltered edge-log retention applies as already documented in §4) |
@@ -522,6 +537,12 @@ The beacon also reports basic web vitals (LCP / CLS / INP) as part of the
 same cookieless request. If we ever change what analytics the site loads,
 this document and the CSP get updated in the same commit. We don't ship
 analytics features without disclosing them here.
+
+### Browser storage
+
+The site saves a few preferences in your browser, like your theme and your
+recent model and GPU picks. They never leave your browser and aren't used for
+tracking. Clearing site data removes them.
 
 ### Shopping-interest trial
 
