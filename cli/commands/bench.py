@@ -27,7 +27,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from .. import SUITE_VERSION, __version__
+from .. import SUITE_VERSION, __version__, ssd_stream
 from .. import sampling as sampling_mod
 from ..config import DEFAULT_API_BASE, DEFAULT_WORKLOADS, QUICK_WORKLOADS
 from ..consent import has_consented, prompt_for_consent
@@ -233,11 +233,28 @@ def _attach_launch_telemetry(
             extras.update(labels(model))
         except Exception as exc:  # noqa: BLE001
             log.debug("run_labels failed: %s", exc)
+    # 0.0.13: extras.ssd_stream / extras.cpu_tensors (allowlisted names; the whole field
+    # is dropped if any isn't) for an ssd_stream preset entry; nothing otherwise.
+    extras.update(ssd_stream.upload_extras())
     if res.error:
         extras["failure_kind"] = extras.get("failure_kind") or classify_failure(
             res.error
         )
     res.extras = extras
+
+
+def _attach_storage(fp, driver, model) -> None:
+    """Probe the drive holding the model and put the block in fp.extras["storage"]
+    (uploaded as fingerprint.storage). No local model path: nothing is added."""
+    from .. import storage_info
+
+    try:
+        block = storage_info.probe(storage_info.model_path(driver, model))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("storage probe failed: %s", exc)
+        block = None
+    if block is not None:
+        fp.extras = {**(fp.extras or {}), "storage": block}
 
 
 def _handle_resume(args) -> int:
@@ -350,6 +367,13 @@ def cmd_bench(args) -> int:
             print_error("invalid --min-prefill-tps: want a number > 0")
             return 2
         os.environ["LLM_SPEED_MIN_PREFILL_TPS"] = repr(float(min_tps))
+    # 0.0.13 opt-in drive info: only a contradictory flag pair is an error.
+    from .. import storage_info
+
+    storage_err = storage_info.check_flags(args)
+    if storage_err:
+        print_error(storage_err)
+        return 2
     # --resume short-circuits everything else.
     if getattr(args, "resume", None):
         return _handle_resume(args)
@@ -503,6 +527,15 @@ def cmd_bench(args) -> int:
             )
             sampling = {}
 
+    # 3a. Opt-in drive info (off by default; never with --strict-anon or in an agent job).
+    #     Probed only when on, so an opted-out run never even looks at the drive.
+    #     And only on runs that stream weights from disk (an ssd_stream preset entry);
+    #     any other run is never probed.
+    if storage_info.effective(args) and storage_info.streams_from_disk():
+        _attach_storage(fp, driver, model)
+    elif "storage" in (fp.extras or {}):
+        fp.extras = {k: v for k, v in fp.extras.items() if k != "storage"}
+
     # 4. Workloads.
     workload_names = _select_workloads(
         getattr(args, "workload", None), getattr(args, "quick", False)
@@ -547,6 +580,9 @@ def cmd_bench(args) -> int:
         if callable(reset_tel):
             reset_tel()
         sampler = _start_memory_probe(driver, fp)
+        # 0.0.13 ssd_stream (set by `bench --preset` for that entry only): the
+        # llama-server's peak RSS and disk bytes read during this workload.
+        proc_sampler = ssd_stream.start_proc_sampler()
         try:
             wl = get_workload(wname)
             try:
@@ -554,6 +590,9 @@ def cmd_bench(args) -> int:
             finally:
                 mem = _finish_memory_probe(driver, sampler)
                 sampler = None
+                if proc_sampler is not None:
+                    mem.update(proc_sampler.stop())
+                    proc_sampler = None
             if not isinstance(res, WorkloadResult):
                 # Defensive: a workload returned something weird.
                 res = _failed_result(
@@ -680,6 +719,16 @@ def cmd_bench(args) -> int:
                 from ..credit import effective_credit, maybe_ask
 
                 maybe_ask(args)
+                # 0.0.13: the one-time drive-info question (default No), right after the
+                # credit question, same rules plus never under --strict-anon or with a
+                # --share/--no-share flag. A yes adds the block to this upload only if it
+                # streams weights from disk; the local copy saved above is as before.
+                if (
+                    storage_info.maybe_ask(args)
+                    and storage_info.effective(args)
+                    and storage_info.streams_from_disk()
+                ):
+                    _attach_storage(report.fingerprint, driver, model)
                 credit = None if anon else effective_credit(args)
                 result_url, fallback_path = upload_or_save(
                     report,

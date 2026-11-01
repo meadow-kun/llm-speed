@@ -115,6 +115,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="upload this run without your saved credit handle",
     )
     p_bench.add_argument(
+        "--share-storage-info",
+        action="store_true",
+        help=(
+            "add the drive holding the model (model name, NVMe/SATA/USB, PCIe link, "
+            "filesystem; no serials, capacity or paths) to this run. Off by default; "
+            "never with --strict-anon"
+        ),
+    )
+    p_bench.add_argument(
+        "--no-share-storage-info",
+        action="store_true",
+        help="don't add drive info to this run, whatever `llm-speed config storage-info` says",
+    )
+    p_bench.add_argument(
         "--dry-run",
         action="store_true",
         help="run workloads but skip upload AND skip local save; print would-be payload",
@@ -211,6 +225,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_bench.add_argument(
+        "--install-backend",
+        action="store_true",
+        help=(
+            "--preset: install a missing backend without asking, only the official "
+            "llama.cpp prebuilt under ~/.local/share/llm-speed/llama.cpp (no sudo) or "
+            "mlx-lm into this CLI's own virtual environment. `llm-speed agent` passes it "
+            "only when `llm-speed agent auto-install on`."
+        ),
+    )
+    p_bench.add_argument(
         "--with-control",
         action="store_true",
         help="--preset: also run the preset's control model",
@@ -265,15 +289,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # config -------------------------------------------------------------
     p_config = sub.add_parser(
-        "config", help="show or change settings (credit: your public handle on uploads)"
+        "config",
+        help=(
+            "show or change settings (credit: your public handle on uploads; "
+            "storage-info: drive info on uploads, on|off)"
+        ),
     )
-    p_config.add_argument("config_key", choices=["credit"], metavar="credit")
+    p_config.add_argument(
+        "config_key", choices=["credit", "storage-info"], metavar="credit|storage-info"
+    )
     p_config.add_argument(
         "value",
         nargs="?",
         default=None,
-        metavar="HANDLE",
-        help="@name (X) or u/name (Reddit); omit to show the current setting",
+        metavar="HANDLE|on|off",
+        help=(
+            "credit: @name (X) or u/name (Reddit); storage-info: on or off. "
+            "Omit to show the current setting"
+        ),
     )
     p_config.add_argument(
         "--clear",
@@ -434,6 +467,10 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
 
         return cmd_preset_tool(args)
     if cmd == "config":
+        if getattr(args, "config_key", None) == "storage-info":
+            from .storage_info import cmd_config_storage
+
+            return cmd_config_storage(args)
         from .credit import cmd_config
 
         return cmd_config(args)

@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import sys
 import time
+from dataclasses import dataclass
 
 from .. import __version__
 from ..api_host import display_host, same_api_base, token_allowed, token_opt_in_hint
@@ -177,11 +178,16 @@ def _explain_fallback(stored: Stored) -> None:
     )
 
 
-def cmd_enroll(args) -> int:
+def cmd_enroll(args, *, apply_now: bool = True) -> int:
+    """Pair this machine. After a successful pairing, ask the signed-tests setup
+    question once (`apply_now`: restart a running agent so a yes applies; `agent
+    install` passes False because it starts the service itself)."""
     ensure_dirs()
     s = Settings.load()
     if s.machine_id and load_token(s.machine_id) and not getattr(args, "force", False):
         print(f"Already enrolled as {s.machine_id}. Use --force to enroll again.")
+        if _setup_due(s, args) and _flag_or_terminal(args):
+            setup_dialog(s, args, apply_now=apply_now, upgrade=True)
         return 0
     refusal = _enroll_base_refusal(args)
     if refusal:
@@ -284,6 +290,8 @@ def cmd_enroll(args) -> int:
                 s.save()
                 print(f"Approved. Enrolled as {mid}; token stored in {stored.where}.")
                 _explain_fallback(stored)
+                if _setup_due(s, args, enrolling=True):
+                    setup_dialog(s, args, apply_now=apply_now, enrolling=True)
                 return 0
             if st in ("expired", "denied", "used", "unknown"):
                 why = {
@@ -321,19 +329,28 @@ def cmd_install(args) -> int:
         print("Nothing was paired; an enrolment token, if you have one, was not used.")
         return 1
     s = Settings.load()
-    if not getattr(args, "dry_run", False) and not (
-        s.machine_id and load_token(s.machine_id)
-    ):
-        rc = cmd_enroll(args)
+    dry = getattr(args, "dry_run", False)
+    was = _setup_values(s)
+    if not dry and not (s.machine_id and load_token(s.machine_id)):
+        # The setup question comes after pairing; the service started below reads it.
+        rc = cmd_enroll(args, apply_now=False)
         if rc != 0:
             return rc
-    rc, steps = service.install(dry_run=getattr(args, "dry_run", False))
+    elif not dry and _setup_due(s, args) and _flag_or_terminal(args):
+        setup_dialog(s, args, apply_now=False, upgrade=True)
+    # A changed setting on an agent that is already running needs a restart after the
+    # install below (`systemctl --user enable --now` leaves a running unit as it was).
+    changed = not dry and _setup_values(Settings.load()) != was
+    before = service.service_state() if changed else None
+    rc, steps = service.install(dry_run=dry)
     for line in steps:
         print(line)
-    if getattr(args, "dry_run", False):
+    if dry:
         print("(dry run: nothing was written or started)")
     elif rc == 0:
         print("Service installed and started.")
+        if changed and not _not_running(before):
+            _apply_now()
     else:
         print(f"Service install failed (exit {rc}).")
     return rc
@@ -408,6 +425,17 @@ def cmd_resume(args) -> int:
     return 0
 
 
+def _status_backends(s: Settings) -> dict | None:
+    if not s.machine_id:
+        return None
+    from . import backends
+
+    try:
+        return backends.status_probe(s)
+    except OSError:
+        return None
+
+
 def cmd_status(args) -> int:
     s = Settings.load()
     st = read_status()
@@ -430,7 +458,12 @@ def cmd_status(args) -> int:
         "current_job": st.get("current_job"),
         "last_result": st.get("last_result"),
         "last_preset_refusal": st.get("last_preset_refusal"),
-        "signed_presets": bool(s.signed_presets),
+        "signed_presets": s.signed_presets is True,
+        "signed_presets_asked": s.signed_presets_asked is True,
+        "auto_install_backends": s.auto_install_backends is True,
+        "auto_install_asked": s.auto_install_asked is True,
+        "backends": _status_backends(s),
+        "last_backend_check": st.get("backends"),
         "awaiting_approval": pending,
         "updated_at": st.get("updated_at"),
         "settings": {
@@ -446,10 +479,14 @@ def cmd_status(args) -> int:
         print(f"  token    : {out['token_store']}")
     print(f"  service  : {out['service']}")
     print(f"  paused   : {'yes' if out['paused'] else 'no'}")
-    print(
-        f"  signed presets: {'on' if s.signed_presets else 'off'}"
-        + ("" if s.signed_presets else " (turn on: llm-speed agent signed-presets on)")
-    )
+    print(f"  signed presets: {signed_presets_status_line(s)}")
+    print(f"  auto-install  : {auto_install_status_line(s)}")
+    if out["backends"] is not None:
+        from .backends import describe
+
+        print(
+            f"  backends : {describe(out['backends'])} (looked up as the service does)"
+        )
     print(
         f"  state    : {out['state'] or '-'}{(' (' + out['reason'] + ')') if out['reason'] else ''}"
     )
@@ -502,36 +539,272 @@ def _interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def cmd_signed_presets(args) -> int:
-    """Per-machine opt-in for server-signed presets (Security Desk R-93). Off is the kill switch."""
+# 0.0.13 setup dialog (Boss: "set when it installs and by the user willingly"): one
+# y/N question per setting, asked once. Wording approved by Boss
+# 2026-10-31 (docs/CLI_CHANGELOG.md 0.0.13).
+SIGNED_PRESETS_SETUP_TEXT = (
+    "Allow signed tests from llm-speed.com on this machine?\n"
+    "  The agent may run benchmark tests published and signed by llm-speed.com.\n"
+    "  Each test's signature is checked before it runs. Turn it off any time:\n"
+    "  llm-speed agent signed-presets off\n"
+)
+SIGNED_PRESETS_SETUP_QUESTION = "Allow signed tests? [y/N] "
+SIGNED_PRESETS_SETUP_NO = (
+    "Signed tests stay off. To allow them later: llm-speed agent signed-presets on"
+)
+SIGNED_PRESETS_NONINTERACTIVE_HINT = (
+    "Signed tests from llm-speed.com: off (not asked: no terminal). To allow them: "
+    "llm-speed agent signed-presets on"
+)
+AUTO_INSTALL_SETUP_TEXT = (
+    "Let the agent install a missing backend on this machine?\n"
+    "  When a test needs llama.cpp or MLX and it isn't installed, the agent may install\n"
+    "  it: the official llama.cpp prebuilt into ~/.local/share/llm-speed/llama.cpp (no\n"
+    "  sudo), or mlx-lm into the agent's own Python environment. Turn it off any time:\n"
+    "  llm-speed agent auto-install off\n"
+)
+AUTO_INSTALL_SETUP_QUESTION = "Allow automatic backend installs? [y/N] "
+AUTO_INSTALL_SETUP_NO = (
+    "Automatic backend installs stay off. To allow them later: "
+    "llm-speed agent auto-install on"
+)
+AUTO_INSTALL_NONINTERACTIVE_HINT = (
+    "Automatic backend installs: off (not asked: no terminal). To allow them: "
+    "llm-speed agent auto-install on"
+)
+SETUP_UPGRADE_LEAD = "New settings for this machine (each asked once, never again):\n"
+
+
+@dataclass(frozen=True)
+class _Setting:
+    attr: str  # Settings field (on/off)
+    asked: str  # Settings field (the question was answered)
+    flag: str  # argparse dest of --X / --no-X on enroll and install
+    label: str  # "signed presets: on"
+    command: str  # llm-speed agent COMMAND on|off
+    text: str
+    question: str
+    no: str
+    hint: str
+
+
+SETUP_SETTINGS = (
+    _Setting(
+        "signed_presets",
+        "signed_presets_asked",
+        "signed_presets",
+        "signed presets",
+        "signed-presets",
+        SIGNED_PRESETS_SETUP_TEXT,
+        SIGNED_PRESETS_SETUP_QUESTION,
+        SIGNED_PRESETS_SETUP_NO,
+        SIGNED_PRESETS_NONINTERACTIVE_HINT,
+    ),
+    _Setting(
+        "auto_install_backends",
+        "auto_install_asked",
+        "auto_install_backends",
+        "auto-install",
+        "auto-install",
+        AUTO_INSTALL_SETUP_TEXT,
+        AUTO_INSTALL_SETUP_QUESTION,
+        AUTO_INSTALL_SETUP_NO,
+        AUTO_INSTALL_NONINTERACTIVE_HINT,
+    ),
+)
+
+
+def signed_presets_status_line(s: Settings) -> str:
+    if s.signed_presets is True:
+        return (
+            "on (signed tests from llm-speed.com allowed; "
+            "turn off: llm-speed agent signed-presets off)"
+        )
+    return "off (turn on: llm-speed agent signed-presets on)"
+
+
+def auto_install_status_line(s: Settings) -> str:
+    if s.auto_install_backends is True:
+        return (
+            "on (the agent may install llama.cpp / mlx-lm a job needs; "
+            "turn off: llm-speed agent auto-install off)"
+        )
+    return "off (turn on: llm-speed agent auto-install on)"
+
+
+def _setup_values(s: Settings) -> tuple:
+    return tuple(getattr(s, q.attr) is True for q in SETUP_SETTINGS)
+
+
+def _not_running(state: str | None) -> bool:
+    return (
+        state is None
+        or state in ("not installed", "unsupported", "inactive", "failed")
+        or state.startswith("unknown")
+    )
+
+
+def _apply_now() -> int:
+    """Make a setting change take effect: restart an installed agent service (launchd
+    `kickstart -k`, systemd `restart`, WSL2 logon task end + run). Nothing is started
+    where no service is installed; the agent reads its settings when it starts."""
+    state = service.service_state()
+    if state in ("not installed", "unsupported") or state.startswith("unknown"):
+        print(
+            "The agent service is not installed here; the setting applies when the "
+            "agent starts."
+        )
+        return 0
+    rc = service.restart()
+    if rc == 0:
+        print("Agent restarted; the setting applies now.")
+    else:
+        print(f"Could not restart the agent (exit {rc}). Run: llm-speed agent restart")
+    return rc
+
+
+def _record(s: Settings, q: _Setting, on: bool) -> None:
+    setattr(s, q.attr, on is True)
+    setattr(s, q.asked, True)
+    s.save()
+
+
+def _due(s: Settings, args, q: _Setting, enrolling: bool) -> bool:
+    """Ask (or apply the explicit flag) at enrolment, or once on an enrolled machine that
+    was never asked and doesn't have it on. An explicit --[no-]FLAG always applies."""
+    if getattr(args, q.flag, None) is not None:
+        return True
+    if enrolling:
+        return getattr(s, q.asked) is not True
+    return getattr(s, q.asked) is not True and getattr(s, q.attr) is not True
+
+
+def _setup_due(s: Settings, args, *, enrolling: bool = False) -> bool:
+    return any(_due(s, args, q, enrolling) for q in SETUP_SETTINGS)
+
+
+def _flag_or_terminal(args) -> bool:
+    return (
+        any(getattr(args, q.flag, None) is not None for q in SETUP_SETTINGS)
+        or _interactive()
+    )
+
+
+def setup_dialog(
+    s: Settings,
+    args,
+    *,
+    apply_now: bool = True,
+    upgrade: bool = False,
+    enrolling: bool = False,
+) -> None:
+    """The setup questions (Security Desk R-93 rules for each: on only by an explicit
+    yes typed in a terminal or an explicit --X flag; Enter = no; no terminal and no
+    flag = stays off, not recorded, one-line hint). One restart at the end when a
+    value changed and `apply_now`."""
+    due = [q for q in SETUP_SETTINGS if _due(s, args, q, enrolling)]
+    if not due:
+        return
+    before = _setup_values(s)
+    led = False
+    for q in due:
+        flag = getattr(args, q.flag, None)
+        if flag is True or flag is False:
+            _record(s, q, flag)
+            print(
+                f"{q.label}: {'on' if flag else 'off'} (from --{'' if flag else 'no-'}"
+                f"{q.flag.replace('_', '-')})"
+            )
+            continue
+        if not _interactive():
+            print(q.hint)
+            continue
+        print()
+        if not led and upgrade:
+            print(SETUP_UPGRADE_LEAD, end="")
+        led = True
+        print(q.text, end="")
+        try:
+            ans = input(q.question).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nNot answered; it stays off (asked again next time).")
+            break
+        if ans in ("y", "yes"):
+            _record(s, q, True)
+            print(f"{q.label}: on")
+        else:
+            _record(s, q, False)
+            print(q.no)
+    if apply_now and _setup_values(s) != before:
+        _apply_now()
+
+
+# Interactive commands that ask the setup questions once on an upgraded, enrolled
+# machine. Never `run` (what the service starts) and never machine-readable output.
+_UPGRADE_ASK_CMDS = (None, "status", "restart", "presets")
+
+
+def _maybe_ask_upgraded(c, args) -> None:
+    if c not in _UPGRADE_ASK_CMDS or getattr(args, "json", False):
+        return
+    if not _interactive():
+        return
+    s = Settings.load()
+    if not (s.machine_id and s.consent) or not _setup_due(s, args):
+        return
+    # `agent restart` restarts right after, so no second restart here.
+    setup_dialog(s, args, apply_now=c != "restart", upgrade=True)
+    print()
+
+
+def _on_off_command(args, q: _Setting, confirm_text: str, confirm_q: str) -> int:
+    """`agent signed-presets|auto-install [on|off|status] [--yes]`. Both on and off
+    restart an installed agent so they apply now (R-103)."""
     s = Settings.load()
     want = getattr(args, "state", None)
     if want in (None, "status"):
-        print(f"signed presets: {'on' if s.signed_presets else 'off'}")
+        print(f"{q.label}: {'on' if getattr(s, q.attr) is True else 'off'}")
         return 0
     if want == "off":
-        s.signed_presets = False
-        s.save()
-        print("signed presets: off (this machine runs packaged presets only)")
-        print("Restart the agent to apply it now: llm-speed agent restart")
+        _record(s, q, False)
+        print(
+            "signed presets: off (this machine runs packaged presets only)"
+            if q is SETUP_SETTINGS[0]
+            else f"{q.label}: off (a job whose backend is missing fails backend_missing)"
+        )
+        _apply_now()
         return 0
     if not getattr(args, "yes", False):
-        print(SIGNED_PRESETS_PROMPT)
+        print(confirm_text)
         if not _interactive():
             print("Not a terminal: re-run with --yes to confirm. Nothing changed.")
             return 2
         try:
-            ans = input("Turn on signed presets? [y/N] ").strip().lower()
+            ans = input(confirm_q).strip().lower()
         except EOFError:
             ans = ""
         if ans not in ("y", "yes"):
-            print("Nothing changed (signed presets stay off).")
+            print(f"Nothing changed ({q.label} stays off).")
             return 1
-    s.signed_presets = True
-    s.save()
-    print("signed presets: on")
-    print("Restart the agent to apply it now: llm-speed agent restart")
+    _record(s, q, True)
+    print(f"{q.label}: on")
+    _apply_now()
     return 0
+
+
+def cmd_signed_presets(args) -> int:
+    """Per-machine opt-in for server-signed presets (Security Desk R-93). Off is the
+    kill switch."""
+    return _on_off_command(
+        args, SETUP_SETTINGS[0], SIGNED_PRESETS_PROMPT, "Turn on signed presets? [y/N] "
+    )
+
+
+def cmd_auto_install(args) -> int:
+    """Per-machine opt-in for the agent installing a missing backend (0.0.13)."""
+    return _on_off_command(
+        args, SETUP_SETTINGS[1], AUTO_INSTALL_SETUP_TEXT, AUTO_INSTALL_SETUP_QUESTION
+    )
 
 
 def cmd_config(args) -> int:
@@ -551,7 +824,13 @@ def cmd_config(args) -> int:
     if args.key == "signed_presets" and args.value is not None:
         print("use `llm-speed agent signed-presets on|off` (it asks to confirm)")
         return 2
-    if args.key not in SETTABLE and args.key != "signed_presets":
+    if args.key == "auto_install_backends" and args.value is not None:
+        print("use `llm-speed agent auto-install on|off` (it asks to confirm)")
+        return 2
+    if args.key not in SETTABLE and args.key not in (
+        "signed_presets",
+        "auto_install_backends",
+    ):
         print(
             f"unknown or read-only key {args.key!r}; settable: {', '.join(sorted(SETTABLE))}"
         )
@@ -679,12 +958,38 @@ def add_parser(sub) -> None:
     sp.add_argument(
         "--yes", action="store_true", help="confirm turning it on without a prompt"
     )
+    ai = asub.add_parser(
+        "auto-install",
+        help="on/off: let the agent install a missing llama.cpp (official prebuilt, no "
+        "sudo) or mlx-lm (its own venv) when a job needs it",
+    )
+    ai.add_argument("state", nargs="?", choices=("on", "off", "status"))
+    ai.add_argument(
+        "--yes", action="store_true", help="confirm turning it on without a prompt"
+    )
     c = asub.add_parser("config", help="show or set local policy")
     c.add_argument("key", nargs="?")
     c.add_argument("value", nargs="?")
     for parser in (p, e, i, r):
         _add_api_base(parser)
     for parser in (e, i):
+        parser.add_argument(
+            "--signed-presets",
+            dest="signed_presets",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="allow (or not) signed tests from llm-speed.com on this machine without "
+            "asking (for scripted installs; default: ask once in a terminal, Enter = no)",
+        )
+        parser.add_argument(
+            "--auto-install-backends",
+            dest="auto_install_backends",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="allow (or not) the agent to install a missing backend a job needs, "
+            "without asking (for scripted installs; default: ask once in a terminal, "
+            "Enter = no)",
+        )
         parser.add_argument(
             "--token-store",
             choices=("auto", "keychain", "file"),
@@ -725,13 +1030,15 @@ def dispatch(args) -> int:
         "presets": cmd_presets,
         "config": cmd_config,
         "signed-presets": cmd_signed_presets,
+        "auto-install": cmd_auto_install,
         "approve": lambda a: _decide(a, "approve"),
         "decline": lambda a: _decide(a, "decline"),
         "restart": lambda a: service.restart(),
     }
+    _maybe_ask_upgraded(c, args)
     if c not in table:
         print(
-            "usage: llm-speed agent {enroll,install,uninstall,run,pause,resume,restart,status,presets,approve,decline,config,signed-presets}"
+            "usage: llm-speed agent {enroll,install,uninstall,run,pause,resume,restart,status,presets,approve,decline,config,signed-presets,auto-install}"
         )
         return 2
     return table[c](args)

@@ -99,10 +99,27 @@ class Settings:
     # opt in per machine with `llm-speed agent signed-presets on` (asks to confirm).
     # Off = packaged presets only; turning it off again is the kill switch.
     signed_presets: bool = False
+    # 0.0.13: the setup question about signed presets was asked on this machine (at
+    # enrolment, or once on the first interactive `agent status` after an upgrade).
+    # Kept apart from the on/off value so a "no" is never asked again.
+    signed_presets_asked: bool = False
+    # 0.0.13: let the agent install a missing backend a job needs (the official llama.cpp
+    # prebuilt under ~/.local/share/llm-speed/llama.cpp, no sudo; or mlx-lm into the
+    # agent's own venv). Off by default; same opt-in rules as signed_presets.
+    auto_install_backends: bool = False
+    auto_install_asked: bool = False
     # Which store holds the machine token: "keychain" | "file" (set by enroll; the
     # token itself is never written here). None = enrolled before 0.0.10.
     token_store: str | None = None
     extra: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Security Desk R-103: only a real JSON `true` turns signed presets on. A
+        # hand-edited "false" / "true" string, 1 or anything else counts as off.
+        self.signed_presets = self.signed_presets is True
+        self.signed_presets_asked = self.signed_presets_asked is True
+        self.auto_install_backends = self.auto_install_backends is True
+        self.auto_install_asked = self.auto_install_asked is True
 
     @classmethod
     def load(cls) -> Settings:

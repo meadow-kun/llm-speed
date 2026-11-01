@@ -52,6 +52,7 @@ For each workload (W1..W5):
 | `extras.llama_server_args` (0.0.8; 0.0.10 adds `--no-cache-prompt`, `--cache-prompt`, `--cache-ram`, `--temp`, `--seed`, `--top-k`, `--top-p`, `--min-p`, `--reasoning`, `--kv-unified`; the next release adds `-lm`/`--load-mode`, `-lzm`/`--lazy-mode`) | allowlisted llama-server flags and values (e.g. `-c 4096 --n-cpu-moe 20 --temp 0 --seed 42 --reasoning off`); the 0.0.10 flags keep only numeric or on/off/auto values; `--load-mode` keeps only `auto`, `none`, `mmap`, `mlock`, `mmap+mlock` or `dio`, and `--lazy-mode` only `on`, `auto` or `off`; other flags and path-like or free-text values are redacted |
 | `extras.sampling`, `extras.sampling_ignored` (0.0.10) | sampling settings the CLI sent with each request (`temperature`, `seed`, `top_k`, `top_p`, `min_p`; numbers only) and the names of requested keys the backend could not take; absent when none were set (presets default to temperature 0, seed 42) |
 | `extras.model_file`, `extras.model_file_bytes` (0.0.8) | GGUF file basename (already sent as `model.identifier`) and its size |
+| `extras.ssd_stream`, `extras.cpu_tensors`, `extras.peak_rss_bytes`, `extras.disk_read_bytes` (0.0.13) | only for a preset entry marked `ssd_stream` (weights streamed from disk): `true`; the exact allowlisted tensor names pinned to CPU (only `per_layer_token_embd.weight`; the field is dropped whole if any other value appears); the llama-server process's peak resident memory and bytes read from disk during the workload (integers). No paths, device or mount names |
 
 ### Fit attempts (`--preset` only, 0.0.8)
 
@@ -112,6 +113,54 @@ collected unless you type it in yourself.
   privacy@llm-speed.com with the handle (and, if you have them, the run ids) and we remove it
   from those runs within 7 days.
 
+### Storage drive (opt-in, off by default, 0.0.13)
+
+Only if you turn it on, and only on runs that stream weights from disk (a preset entry with
+`ssd_stream: true`, recorded as `extras.ssd_stream: true`), the run adds one block,
+`fingerprint.storage`, describing the drive that holds the model file. When a model is too big
+for your GPU and RAM, its speed depends mostly on that drive. Every other run is never probed
+and never carries the block, even with the setting on.
+
+| Field | Example | Why |
+|---|---|---|
+| `storage.bus` | `nvme`, `sata`, `usb`, `virtual`, `other` | how the drive is connected |
+| `storage.pcie_gen` | `4` (NVMe only, else `null`) | PCIe generation of the drive's current link |
+| `storage.pcie_width` | `4` (NVMe only, else `null`) | PCIe lanes of the current link |
+| `storage.fs` | `ext4`, `xfs`, `btrfs`, `apfs`, `ntfs`, `9p`, `other` | filesystem type the model file sits on |
+| `storage.wsl_9p` | `true` / `false` | the model sits on a WSL `/mnt/<drive>` share (much slower reads) |
+
+- **No drive model name.** The drive's model or friendly name is never read, sent or accepted
+  (a user can rename a drive to anything, and model strings can carry serials).
+- **On the server:** if a run carries `fingerprint.storage`, it must have exactly the five keys
+  above with the exact values listed and come from a run that streams weights from disk (a
+  result with `extras.ssd_stream: true`); otherwise the API refuses the whole upload (HTTP 400,
+  `invalid fingerprint.storage`) and stores nothing. Any other key, `model` included, is refused.
+  The CLI only ever sends that exact shape. Nothing on llm-speed.com displays the block today.
+- **Never collected:** drive model or name, capacity, serial numbers, WWN/EUI, device paths,
+  mount points, partition or volume ids, volume labels. Anything a probe can't read is `null`.
+- **How you turn it on.** The CLI asks once, right after the contributor-credit question, only
+  at an interactive terminal; Enter means no. Or `llm-speed config storage-info on|off`, or
+  `bench --share-storage-info` / `--no-share-storage-info` for one run. Saved as
+  `share_storage_info` in `~/.config/llm-speed/config.json` (mode 0600); only the JSON value
+  `true` counts as on.
+- **When it is never sent:** on any run that doesn't stream weights from disk, with
+  `--strict-anon` (even with `--share-storage-info`), from `llm-speed agent` jobs, in CI, or
+  when the setting is unset. When it is off the CLI doesn't
+  look at the drive at all.
+- **How it is read.** Linux: sysfs (which kind of device holds the file, and the NVMe
+  controller's PCIe `current_link_speed` / `current_link_width`). macOS: `diskutil info` and
+  `system_profiler SPNVMeDataType SPSerialATADataType -json`, reading only the device name to
+  match the disk and the link fields (never the model or serial). Windows and WSL2: Windows'
+  own `powershell.exe` by its fixed path (`%SystemRoot%\System32\WindowsPowerShell\v1.0`, or
+  `/mnt/c/Windows/System32/WindowsPowerShell/v1.0` from WSL; never one found on `PATH` or in
+  the current folder), with `Get-PhysicalDisk` BusType and the controller's PCIe link; the
+  script prints nothing else.
+- **Presets.** A `bench --preset` step that streams from disk tells its bench run which model
+  file to look at through a local environment variable (`LLM_SPEED_MODEL_PATH_LOCAL`); the path
+  itself is never uploaded or logged.
+- **Local files.** A run saved while it is on contains the same block (local runs are the same
+  signed payload), only for runs that stream weights from disk.
+
 ### Agent job uploads only: the job's upload nonce
 
 Only runs uploaded by an `llm-speed agent` job (a machine you enrolled with a queue and
@@ -151,7 +200,9 @@ The CLI does not send any of the following. They never leave your machine:
 - **macOS marketing minor/patch** (`13.5.7` → just `13`)
 - **Linux distro patchlevel** (`Ubuntu 24.04.1 LTS` is dropped entirely)
 - **Locale**
-- **NVMe / disk model / serial**
+- **Disk serial numbers, WWN/EUI, capacity, device paths, mount points, partition or volume ids and labels**
+- **Disk model or name** (never, even with storage-drive info on)
+- **Disk connection and filesystem**, unless you opt in to storage-drive info (section 1)
 - **Hostname / username**
 - **Power source / thermal state** (captured locally for run flags, never sent)
 - **Prompt text** — the workload prompts are part of the open-source suite, not user data
@@ -183,6 +234,7 @@ non-whitelisted string field exceeds 256 characters. The whitelist:
 | Server-side IP logging | not persisted | not persisted | not persisted |
 | Cross-run correlation by the server | possible via `public_key` and `fingerprint_hash` | possible via `public_key` | **not possible** |
 | Contributor credit handle (opt-in) | if you set one | **never sent** | **never sent** |
+| Storage-drive block (opt-in; only on runs that stream weights from disk) | if you turn it on | if you turn it on | **never sent** |
 
 ### `--anon` vs `--strict-anon`
 
@@ -437,6 +489,12 @@ handle (see "Contributor credit" in section 1). Press Enter to stay anonymous. I
 once (people who agreed with an earlier version are asked once on their next interactive
 upload), only at an interactive terminal, and never in CI, with `--yes`, `--strict-anon` or
 `--anon`, or in `llm-speed agent` jobs.
+
+Right after that (0.0.13), one more optional question, default No: whether to add the
+storage-drive block, only on runs that stream weights from disk (see "Storage drive" in
+section 1). Asked once, only at an interactive
+terminal; never in CI, with `--yes`, `--strict-anon`, `--share-storage-info` /
+`--no-share-storage-info`, or in `llm-speed agent` jobs. Unset means off.
 
 ---
 

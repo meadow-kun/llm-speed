@@ -32,11 +32,12 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .. import __version__
+from .. import __version__, llama_prebuilt
 from .. import fit_sweep as fs
 from .. import sampling as sampling_mod
 from ..config import CACHE_DIR, DEFAULT_API_BASE
@@ -174,7 +175,9 @@ def build_plan(
             m["contexts"] = list(override)
         m.setdefault("contexts", list(preset["contexts"]))
         size_mib = (m.get("bytes") or 0) / MIB
-        if budget is not None and size_mib > budget:
+        # 0.0.13 ssd_stream: the file streams from disk (mmap + --n-cpu-moe), so its size
+        # isn't held against VRAM; the agent gate uses its vram_need_gib instead.
+        if budget is not None and size_mib > budget and m.get("ssd_stream") is not True:
             m["skip_status"] = skip_status
             m["skip_note"] = (
                 f"file {size_mib / 1024:.1f} GiB > {budget / 1024:.1f} GiB {mem_label} available for weights"
@@ -234,10 +237,22 @@ def build_plan(
 # ----------------------------------------------------------------- llama-server
 
 
-def llama_server_candidates(explicit: str | None = None) -> list[str]:
+def llama_server_candidates(
+    explicit: str | None = None, env: Mapping[str, str] | None = None
+) -> list[str]:
+    """Where llama-server is looked for, in order. `env` replaces os.environ for
+    $LLAMA_SERVER and $PATH, so `agent status` / `doctor` can look the way the agent
+    service will (cli/agent/backends.service_env)."""
     home = Path.home()
+    e = os.environ if env is None else env
     c: list[str] = []
-    for v in (explicit, os.environ.get("LLAMA_SERVER"), shutil.which("llama-server")):
+    for v in (
+        explicit,
+        e.get("LLAMA_SERVER"),
+        shutil.which("llama-server")
+        if env is None
+        else shutil.which("llama-server", path=env.get("PATH", os.defpath)),
+    ):
         if v:
             c.append(str(Path(v).expanduser()))
     c += [
@@ -267,24 +282,60 @@ def llama_server_candidates(explicit: str | None = None) -> list[str]:
 
 
 def find_llama_server(
-    explicit: str | None, min_build: int | None
+    explicit: str | None,
+    min_build: int | None,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[str | None, dict | None, list[str]]:
-    """First candidate that runs and meets the minimum build; else the best found."""
+    """First candidate that runs and meets the minimum build (no minimum: the first that
+    runs); else the best found."""
     tried: list[str] = []
     best: tuple[str, dict] | None = None
-    for cand in llama_server_candidates(explicit):
+    for cand in llama_server_candidates(explicit, env):
         if not (Path(cand).is_file() and os.access(cand, os.X_OK)):
             continue
         info = fs.llama_version(cand)
         bn = info.get("build_number")
         tried.append(f"{cand}: build {info.get('build') or bn or 'unknown'}")
-        if min_build and bn and bn >= int(min_build):
+        if llama_build_ok(cand, info, min_build):
             return cand, info, tried
         if best is None:
             best = (cand, info)
     if best:
         return best[0], best[1], tried
     return None, None, tried
+
+
+def llama_build_ok(path: str | None, info: dict | None, min_build: Any) -> bool:
+    """A found llama-server meets the preset: no `min_llama_build` = any build that
+    runs; else its reported build number must be at least the minimum."""
+    if not path:
+        return False
+    if not min_build:
+        return True
+    bn = (info or {}).get("build_number")
+    return bool(bn and bn >= int(min_build))
+
+
+# Pinned known-good llama.cpp release for installs when a preset names no newer
+# `min_llama_build` (b12020, 2026-10-31: has the ubuntu-cuda-12.8-x64 and -13.4-x64
+# archives plus their cudart archives). Never b{None}.
+DEFAULT_LLAMA_BUILD = 12020
+# mlx-lm the agent's opt-in auto-install puts in its own venv: an exact release (newest on
+# PyPI on 2026-10-31, uploaded 2026-10-16), never "latest". Raise it deliberately.
+MLX_LM_VERSION = "0.32.2"
+
+
+def llama_install_tag(min_build: Any) -> str:
+    try:
+        mb = int(min_build) if min_build else 0
+    except (TypeError, ValueError):
+        mb = 0
+    return f"b{max(mb, DEFAULT_LLAMA_BUILD)}"
+
+
+def llama_need_text(min_build: Any) -> str:
+    """'llama-server b6000+' or 'llama-server' (never 'bNone+')."""
+    return f"llama-server b{int(min_build)}+" if min_build else "llama-server"
 
 
 # Official llama.cpp Linux x86_64 CUDA release archives, newest CUDA first. Blackwell
@@ -395,6 +446,95 @@ def llama_install_command(
             "so the build number is real)"
         )
     return ["bash", "-c", script], script
+
+
+# `bench --preset --install-backend` (only `llm-speed agent` with auto-install on passes
+# it): exit codes the agent reports as `backend_missing` / `backend_install_failed`.
+BACKEND_MISSING_RC = 12
+BACKEND_INSTALL_FAILED_RC = 13
+
+
+def is_prebuilt_install(text: str) -> bool:
+    return str(prebuilt_root()) in text and "sudo" not in text
+
+
+def mlx_install_argv() -> list[str] | None:
+    """mlx-lm into this CLI's own environment (the agent's pipx / uv / venv), never the
+    system or user site: None outside a virtual environment."""
+    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
+        return None
+    return [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--only-binary=:all:",  # R-124: wheels only, no sdist build code
+        "--no-input",
+        "--disable-pip-version-check",
+        f"mlx-lm=={MLX_LM_VERSION}",
+    ]
+
+
+def mlx_install_hint() -> str:
+    spec = f"mlx-lm=={MLX_LM_VERSION}"
+    return f"pipx inject llm-speed {spec}   (or: python -m pip install {spec} in this Python)"
+
+
+def auto_install_llama(
+    facts: dict[str, Any], min_build: Any, cmd: list[str] | None, text: str
+) -> tuple[int | None, str | None, dict | None]:
+    """`bench --preset --install-backend` (agent auto-install on), Security Desk R-123:
+    only the pinned official prebuilt (cli/llama_prebuilt.py: sha256-checked archives,
+    safe unpack, atomic move), never a version the preset picks. Returns (exit code or
+    None, llama-server full path, its version info)."""
+    if llama_prebuilt.newer_than_pin(min_build):
+        say(
+            f"  agent auto-install installs only the pinned llama.cpp "
+            f"{llama_prebuilt.PINNED_TAG}; this preset needs b{min_build}. "
+            "Install it by hand with the command above."
+        )
+        return BACKEND_MISSING_RC, None, None
+    if not (cmd and is_prebuilt_install(text)):
+        # only the official prebuilt under ~/.local/share (no sudo, brew, source build)
+        say(
+            "  agent auto-install covers the official llama.cpp prebuilt (NVIDIA "
+            "x86_64 Linux / WSL2) only; install it by hand with the command above."
+        )
+        return BACKEND_MISSING_RC, None, None
+    cuda = pick_prebuilt_cuda(facts.get("cuda_driver_api"))
+    say(
+        f"  agent auto-install is on: installing the pinned official prebuilt "
+        f"{llama_prebuilt.PINNED_TAG} (CUDA {cuda})"
+    )
+    try:
+        server = llama_prebuilt.install(str(cuda), prebuilt_root(), say=say)
+    except llama_prebuilt.InstallError as exc:
+        say(f"  install failed: {exc}")
+        return BACKEND_INSTALL_FAILED_RC, None, None
+    path = str(server)
+    info = fs.llama_version(path)
+    if not llama_build_ok(path, info, min_build):
+        say("  the installed llama-server does not report the pinned build")
+        return BACKEND_INSTALL_FAILED_RC, None, None
+    os.environ["LLAMA_SERVER"] = path  # the sweep runs exactly this file, not PATH's
+    return None, path, info
+
+
+def install_mlx_lm() -> int | None:
+    """Agent auto-install of mlx-lm. None = no safe target (not in a venv)."""
+    argv = mlx_install_argv()
+    if argv is None:
+        say(
+            "  agent auto-install: this Python is not a virtual environment, so mlx-lm "
+            f"is not installed automatically (pipx inject llm-speed mlx-lm=={MLX_LM_VERSION})"
+        )
+        return None
+    say("  agent auto-install is on: " + " ".join(argv[1:]))
+    rc = subprocess.run(argv, check=False).returncode
+    importlib.invalidate_caches()
+    if rc != 0:
+        say(f"  mlx-lm install exited {rc}")
+    return rc
 
 
 def ask_yes_no(question: str, *, assume_yes: bool = False) -> bool:
@@ -726,7 +866,7 @@ def cmd_preset(args) -> int:
             getattr(args, "llama_server", None), min_build
         )
         bn = (info or {}).get("build_number")
-        ok = bool(path and bn and min_build and bn >= int(min_build))
+        ok = llama_build_ok(path, info, min_build)
         if path and not ok and not getattr(args, "force", False):
             why = preset.get("min_llama_build_why", "")
             if bn and bn > 1:
@@ -740,9 +880,17 @@ def cmd_preset(args) -> int:
                 )
             path = None
         if not path:
-            cmd, text = llama_install_command(facts, f"b{min_build}")
-            say(f"  llama-server b{min_build}+ not found. Install it with:\n    {text}")
-            if cmd and ask_yes_no(
+            cmd, text = llama_install_command(facts, llama_install_tag(min_build))
+            say(
+                f"  {llama_need_text(min_build)} not found. Install it with:\n    {text}"
+            )
+            auto = getattr(args, "install_backend", False) is True
+            if auto:
+                rc, path, info = auto_install_llama(facts, min_build, cmd, text)
+                if rc is not None:
+                    return rc
+                bn = (info or {}).get("build_number")
+            elif cmd and ask_yes_no(
                 "  Run this install command now?",
                 assume_yes=getattr(args, "yes", False),
             ):
@@ -754,7 +902,7 @@ def cmd_preset(args) -> int:
                     getattr(args, "llama_server", None), min_build
                 )
                 bn = (info or {}).get("build_number")
-                if not (path and bn and bn >= int(min_build)):
+                if not llama_build_ok(path, info, min_build):
                     say(
                         "  still no llama-server at the required build; see the command above"
                     )
@@ -769,8 +917,15 @@ def cmd_preset(args) -> int:
                 f"commit {(info or {}).get('commit')} ({', '.join((info or {}).get('flags') or []) or 'cpu'})"
             )
     if any(e.get("backend") == "mlx" for e in live):
+        if (
+            importlib.util.find_spec("mlx_lm") is None
+            and getattr(args, "install_backend", False) is True
+        ):
+            rc = install_mlx_lm()
+            if rc is not None and rc != 0:
+                return BACKEND_INSTALL_FAILED_RC
         if importlib.util.find_spec("mlx_lm") is None:
-            hint = "pipx inject llm-speed mlx-lm   (or: pip install -U mlx-lm in this Python)"
+            hint = mlx_install_hint()
             say(
                 f"  mlx-lm is not installed in this Python; MLX steps will be skipped. Install with:\n    {hint}"
             )
@@ -836,6 +991,16 @@ def cmd_preset(args) -> int:
         say(
             f"Interrupted. Rerun to resume: llm-speed bench --preset {name}"
             + (" --with-control" if getattr(args, "with_control", False) else "")
+        )
+        return rc
+    floor = getattr(sweep, "floor_abort", None)
+    if floor:
+        # 0.0.13 ssd_stream: a step stopped below the free-disk / RAM floor. Nothing is
+        # uploaded from this run (results stay saved locally).
+        say(
+            f"Stopped: {floor} (free disk on the models disk or available RAM fell "
+            "below the ssd_stream floor). Nothing was uploaded. Free space or memory, "
+            f"then rerun: llm-speed bench --preset {name}"
         )
         return rc
     if upload_stage(args, attempts, rows, rdir, name, sweep_id, preset) == (

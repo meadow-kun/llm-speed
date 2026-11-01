@@ -54,6 +54,9 @@ except ImportError:  # pragma: no cover (Windows later)
 # Exit code of `bench --preset` when the queue refused the job's signed agent_job (400
 # "invalid agent_job"); same value as cli/commands/preset.py AGENT_JOB_REFUSED_RC.
 AGENT_JOB_REFUSED_RC = 86
+# `bench --preset --install-backend` exits (cli/commands/preset.py, same values).
+BACKEND_MISSING_RC = 12
+BACKEND_INSTALL_FAILED_RC = 13
 # Logged once per uploading job whose claim had no upload_nonce (spec rev 3, section 1.1).
 # Neutral wording only: how the server labels or classifies runs is decided server-side and
 # never described by the CLI (guarded by tests/cli/test_agent_nonce.py). Never the value.
@@ -408,6 +411,15 @@ def status_for_exit(rc: int) -> tuple[str, str | None]:
         return "cancelled", "interrupted"
     if rc == 2:
         return "failed", "preflight_failed"
+    if rc == BACKEND_MISSING_RC:
+        return "failed", "backend_missing"
+    if rc == BACKEND_INSTALL_FAILED_RC:
+        return "failed", "backend_install_failed"
+    from ..ssd_stream import FLOOR_RC
+
+    for reason, code in FLOOR_RC.items():  # 14 disk_below_floor, 15 ram_below_floor
+        if rc == code:
+            return "failed", reason
     if rc == AGENT_JOB_REFUSED_RC:
         return (
             "failed",
@@ -669,6 +681,8 @@ class Runner:
         if preset.get("preset") == "selftest":
             self._selftest(job, lease, overrides)
             return
+        if self._backend_missing(job, lease, preset, overrides):
+            return
         self._run(
             job,
             lease,
@@ -677,6 +691,38 @@ class Runner:
             upload=bool(job.get("upload", True)),
             max_runtime_min=job.get("max_runtime_min"),
         )
+
+    def _backend_missing(
+        self, job: dict, lease: dict, preset: dict, overrides: dict
+    ) -> bool:
+        """0.0.13: the backend the job needs, looked up the way the child will (this
+        service's PATH, `llama_server`, the prebuilt dir). Missing and auto-install off:
+        fail it `backend_missing` before anything is downloaded. Never prompts."""
+        from . import backends
+
+        need = backends.needed(preset, self._facts().get("kind"), overrides)
+        if not need:
+            return False
+        found = backends.job_probe(self.settings, preset.get("min_llama_build"))
+        miss = backends.missing(need, found)
+        write_status(backends={"found": found, "missing": miss, "at": utcnow()})
+        if not backends.blocking(need, miss):
+            return False
+        if self.settings.auto_install_backends is True:
+            log.info(
+                "job %s: %s not found; auto-install is on, the job installs it",
+                job.get("job_id"),
+                ", ".join(miss),
+            )
+            return False
+        log.warning(
+            "job %s failed: %s not found and auto-install is off "
+            "(llm-speed agent auto-install on)",
+            job.get("job_id"),
+            ", ".join(miss),
+        )
+        self.report(job, lease, "failed", "backend_missing")
+        return True
 
     @staticmethod
     def _signed_disabled(name: str, version: int, sha256: str) -> dict:
