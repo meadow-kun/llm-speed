@@ -8,6 +8,15 @@ name: installer-gate
 # `llm-speed doctor --help`. Nothing benchmarks, submits or uploads, every row
 # runs in a throwaway HOME, and no secrets are used (read-only token).
 #
+# Auto-update rows (every installer, every OS): each job checks out the
+# release tag, builds the candidate wheel in the job and passes it with
+# --auto-update-wheel / -AutoUpdateWheel. pip, pipx and uv install it, the
+# script makes NEW.post1 from it, and the background updater must move to
+# NEW.post1 and print its one-time notice. Homebrew does the same through a
+# throwaway local tap (llm-speed-gate/local, created and removed in the job,
+# never meadow-kun/tap) whose formula is switched to NEW.post1, so the updater
+# runs `brew upgrade` for real.
+#
 # Triggers: a published release (the tag, minus "v", is the new version) and
 # manual dispatch (empty version = the latest on PyPI). The mirror release is
 # published just before the PyPI upload and the Homebrew tap bump, so the
@@ -82,7 +91,7 @@ jobs:
     name: installers (${{ matrix.os }})
     needs: resolve
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -94,10 +103,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: scripts
+          # The release tag: its scripts and the source the candidate wheel is built from.
+          ref: v${{ needs.resolve.outputs.new }}
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
+      - name: Build the candidate wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip wheel --no-deps -w "$RUNNER_TEMP/au-dist" .
+          ls "$RUNNER_TEMP/au-dist/llm_speed-$NEW_VERSION-py3-none-any.whl"
       - name: Installer gate (bash, with Homebrew)
         if: runner.os != 'Windows'
         shell: bash
@@ -108,11 +124,13 @@ jobs:
           fi
           INSTALLER_GATE_ROOT="$RUNNER_TEMP/installer-gate-runs" PYTHON=python \
             bash scripts/check-installers.sh --bootstrap-tools --summary "$GITHUB_STEP_SUMMARY" \
+            --auto-update-wheel "$RUNNER_TEMP/au-dist/llm_speed-$NEW_VERSION-py3-none-any.whl" \
             "$NEW_VERSION" "$PREV_VERSION"
       - name: Installer gate (PowerShell)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $env:INSTALLER_GATE_ROOT = Join-Path $env:RUNNER_TEMP 'installer-gate-runs'
-          ./scripts/check-installers.ps1 -New $env:NEW_VERSION -Prev $env:PREV_VERSION -BootstrapTools -Python python -Summary $env:GITHUB_STEP_SUMMARY
+          $wheel = Join-Path $env:RUNNER_TEMP "au-dist/llm_speed-$($env:NEW_VERSION)-py3-none-any.whl"
+          ./scripts/check-installers.ps1 -New $env:NEW_VERSION -Prev $env:PREV_VERSION -BootstrapTools -Python python -Summary $env:GITHUB_STEP_SUMMARY -AutoUpdateWheel $wheel
           exit $LASTEXITCODE

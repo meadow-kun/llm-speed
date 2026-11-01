@@ -395,7 +395,15 @@ def cmd_run(args) -> int:
             except ValueError as e:
                 print(f"bad --{key.replace('_', '-')}: {e}")
                 return 2
-    return Runner(client, s).run_forever(once=getattr(args, "once", False))
+    from .. import autoupdate
+
+    once = getattr(args, "once", False)
+    return Runner(
+        client,
+        s,
+        updater=None if once else autoupdate.agent_between_jobs,
+        restarter=autoupdate.restart_agent,
+    ).run_forever(once=once)
 
 
 def cmd_pause(args) -> int:

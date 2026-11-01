@@ -15,6 +15,20 @@
   .github/workflows/installer-gate.yml on the public mirror meadow-kun/llm-speed.
   Standalone: needs only pwsh, Python and the installers, never a source checkout.
 
+  Scenario autoupdate (0.0.14+, CLI.md "Auto-update"):
+  - with -AutoUpdateWheel W (pre-release): install the candidate W
+    (llm_speed-NEW-py3-none-any.whl, deps from PyPI) unpinned, copy it to NEW.post1
+    (make-update-test-wheel.py next to this script), run `llm-speed about` in its
+    own console (auto-update is off without one) with the test-only hook
+    LLM_SPEED_UPDATE_TEST=1 + LLM_SPEED_UPDATE_TEST_WHEEL=file:///<NEW.post1 wheel>
+    and the CI variables removed, wait for the detached background update (on
+    Windows it starts once that llm-speed has exited, so the running .exe is not
+    locked), then check `--version` is NEW.post1 and the next run prints
+    `Updated llm-speed NEW -> NEW.post1`.
+  - otherwise (release): install PREV as in the upgrade row and run
+    `llm-speed update` instead of the upgrade command. N/A when PREV has no updater
+    (< 0.0.14) or the rows are pinned; N/A is neither a pass nor a failure.
+
   Run root: $env:INSTALLER_GATE_ROOT, else ~/.cache/llm-speed-installer-gate
   (Join-Path $HOME '.cache/llm-speed-installer-gate', the same as the bash
   script; on Windows $HOME is the user profile). Never /tmp.
@@ -32,6 +46,8 @@ param(
   [Parameter(Mandatory = $true)][string]$New,
   [Parameter(Mandatory = $true)][string]$Prev,
   [string[]]$Only = @('pip', 'pipx', 'uv'),
+  [string[]]$Scenarios = @('fresh', 'upgrade', 'autoupdate'),
+  [string]$AutoUpdateWheel = '',
   [switch]$BootstrapTools,
   [switch]$DryRun,
   [switch]$Keep,
@@ -51,6 +67,25 @@ $Only = @($Only | ForEach-Object { $_ -split '[ ,]+' } | Where-Object { $_ })
 foreach ($i in $Only) {
   if ($i -notin @('pip', 'pipx', 'uv')) { Write-Error "check-installers: unknown installer '$i' (brew: use the bash script)"; exit 2 }
 }
+
+$Scenarios = @($Scenarios | ForEach-Object { $_ -split '[ ,]+' } | Where-Object { $_ })
+foreach ($i in $Scenarios) {
+  if ($i -notin @('fresh', 'upgrade', 'autoupdate')) { Write-Error "check-installers: unknown scenario '$i'"; exit 2 }
+}
+if ($AutoUpdateWheel) {
+  if ((Split-Path -Leaf $AutoUpdateWheel) -ne "llm_speed-$New-py3-none-any.whl") {
+    Write-Error "check-installers: -AutoUpdateWheel must be llm_speed-$New-py3-none-any.whl"; exit 2
+  }
+  if (-not $DryRun -and -not (Test-Path -PathType Leaf $AutoUpdateWheel)) { Write-Error "check-installers: no such wheel $AutoUpdateWheel"; exit 2 }
+  if (Test-Path $AutoUpdateWheel) { $AutoUpdateWheel = (Resolve-Path $AutoUpdateWheel).Path }
+}
+$Bump = "$New.post1"
+# Rows use their sandbox's own config; a caller's settings must not leak in.
+foreach ($n in 'LLM_SPEED_CONFIG', 'LLM_SPEED_CACHE', 'LLM_SPEED_DISABLE_AUTOUPDATE', 'LLM_SPEED_UPDATE_TEST', 'LLM_SPEED_UPDATE_TEST_WHEEL') {
+  Remove-Item "Env:$n" -ErrorAction SilentlyContinue
+}
+$CiVars = @('CI', 'CONTINUOUS_INTEGRATION', 'GITHUB_ACTIONS', 'GITLAB_CI', 'BUILDKITE', 'CIRCLECI', 'TRAVIS', 'JENKINS_URL',
+  'TEAMCITY_VERSION', 'TF_BUILD', 'BITBUCKET_BUILD_NUMBER', 'CODEBUILD_BUILD_ID', 'DRONE', 'APPVEYOR', 'SEMAPHORE', 'BUILD_BUILDID')
 
 $OnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or $IsWindows
 $BinSub = if ($OnWindows) { 'Scripts' } else { 'bin' }
@@ -169,10 +204,10 @@ function Test-Prev($bin, $py) {
   return (($m -eq $Prev) -and (Test-Path $bin))
 }
 
-function Test-Installed($inst, $scen, $bin, $py) {
+function Test-Installed($inst, $scen, $bin, $py, $want = $New) {
   $from = $script:From; $script:From = ''
   if ($DryRun) {
-    Write-Host "  [dry-run] $bin --version   (must print $Pkg $New)"
+    Write-Host "  [dry-run] $bin --version   (must print $Pkg $want)"
     Write-Host "  [dry-run] $bin doctor --help"
     Add-Result $inst $scen 'DRY-RUN' '' 'not run'; return
   }
@@ -184,15 +219,104 @@ function Test-Installed($inst, $scen, $bin, $py) {
   $docOk = $false
   if (Test-Path $bin) { $docOk = X $bin doctor --help }
   if (-not $docOk) { Add-Result $inst $scen 'FAIL' "$from$ver" "doctor --help failed (log $script:Log)"; return }
-  if ($ver -eq $New) { Add-Result $inst $scen 'PASS' "$from$ver" ''; return }
+  if ($ver -eq $want) { Add-Result $inst $scen 'PASS' "$from$ver" ''; return }
   $meta = Get-MetaVersion $py
-  if (-not $ver -and $meta -eq $New) { Add-Result $inst $scen 'FAIL-soft' "${from}metadata $meta" '--version missing or unparsable' }
-  else { Add-Result $inst $scen 'FAIL' "$from$ver / metadata $meta" "want $New (log $script:Log)" }
+  if (-not $ver -and $meta -eq $want) { Add-Result $inst $scen 'FAIL-soft' "${from}metadata $meta" '--version missing or unparsable' }
+  else { Add-Result $inst $scen 'FAIL' "$from$ver / metadata $meta" "want $want (log $script:Log)" }
+}
+
+# 0.0.14+ ships the self-updater.
+function Test-HasUpdater($v) {
+  $n = @([regex]::Matches($v, '\d+') | Select-Object -First 3 | ForEach-Object { [int]$_.Value })
+  while ($n.Count -lt 3) { $n += 0 }
+  return ([version]::new($n[0], $n[1], $n[2]) -ge [version]::new(0, 0, 14))
+}
+function Get-AutoUpdateNA {
+  if ($Pinned) { return 'NEW is not the PyPI latest: `llm-speed update` goes to the latest' }
+  if (-not (Test-HasUpdater $Prev)) { return "PREV $Prev has no self-updater (it ships in 0.0.14); runs from PREV >= 0.0.14" }
+  return ''
+}
+# Runs `llm-speed about` in its own console (stdout a terminal), without the CI
+# variables; returns its stderr.
+function Invoke-Console($bin, [hashtable]$extra = @{}) {
+  $err = Join-Path $script:SB 'console.err'
+  $saved = @{}
+  foreach ($n in $CiVars + @($extra.Keys)) { $saved[$n] = [Environment]::GetEnvironmentVariable($n) }
+  try {
+    foreach ($n in $CiVars) { [Environment]::SetEnvironmentVariable($n, $null) }
+    foreach ($k in $extra.Keys) { [Environment]::SetEnvironmentVariable($k, $extra[$k]) }
+    if ($OnWindows) {
+      Start-Process -FilePath $bin -ArgumentList 'about' -Wait -RedirectStandardError $err | Out-Null
+      $e = if (Test-Path $err) { Get-Content -Raw $err } else { '' }
+    } else {
+      $code = 'import os,pty,subprocess,sys' + "`n" + 'm,s=pty.openpty()' + "`n" +
+        'r=subprocess.run(sys.argv[1:],stdin=subprocess.DEVNULL,stdout=s,stderr=subprocess.PIPE,timeout=300)' + "`n" +
+        'os.close(s); os.close(m); sys.stdout.write(r.stderr.decode("utf-8","replace"))'
+      $e = (& $Python -c $code $bin about | Out-String)
+    }
+  } finally {
+    foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
+  }
+  Add-Content -Path $script:Log -Value "console stderr: $e"
+  return "$e"
+}
+function Invoke-AutoUpdateLocal($inst) {
+  Enter-Sandbox $inst 'autoupdate'
+  $sb = $script:SB
+  try {
+    $dir = Split-Path -Parent $AutoUpdateWheel
+    switch ($inst) {
+      'pip' { $py = "$sb/venv/$BinSub/python$Exe"; $bin = "$sb/venv/$BinSub/llm-speed$Exe"
+              $ok = (X $Python -m venv "$sb/venv") -and (X $py -m pip install --find-links $dir $Pkg) }
+      'pipx' { $py = "$sb/pipx/venvs/$Pkg/$BinSub/python$Exe"; $bin = "$sb/bin/llm-speed$Exe"
+               $ok = X pipx install --python $Python $Pkg "--pip-args=--find-links=$dir" }
+      'uv' { $py = "$sb/uvtools/$Pkg/$BinSub/python$Exe"; $bin = "$sb/bin/llm-speed$Exe"
+             $ok = X uv tool install --python $Python --find-links $dir $Pkg }
+    }
+    if (-not $ok) { Add-Result $inst 'autoupdate' 'FAIL' '' "could not install the candidate wheel (log $script:Log)"; return }
+    if (-not $DryRun) {
+      $m = Get-MetaVersion $py
+      if ($m -ne $New) { Add-Result $inst 'autoupdate' 'FAIL' $m "candidate is not $New (log $script:Log)"; return }
+      $script:From = "$m -> "
+    }
+    if (-not (X $Python (Join-Path $PSScriptRoot 'make-update-test-wheel.py') $AutoUpdateWheel "$sb/bump")) {
+      Add-Result $inst 'autoupdate' 'FAIL' '' "could not make the $Bump test wheel (log $script:Log)"; return
+    }
+    $wheel = (Join-Path "$sb/bump" "llm_speed-$Bump-py3-none-any.whl")
+    # the hook takes only a fully resolved path (no symlinked directory)
+    if (Test-Path $wheel) { $wheel = (& $Python -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' $wheel | Out-String).Trim() }
+    $uri = ([System.Uri]::new($wheel)).AbsoluteUri
+    if ($DryRun) {
+      Write-Host "  [dry-run] $bin about   (own console, LLM_SPEED_UPDATE_TEST=1, LLM_SPEED_UPDATE_TEST_WHEEL=$uri)"
+      Write-Host "  [dry-run] wait up to 300s for $bin --version to print $Pkg $Bump"
+      Write-Host "  [dry-run] $bin about   (must print 'Updated llm-speed $New -> $Bump' once)"
+    } else {
+      Invoke-Console $bin @{ LLM_SPEED_UPDATE_TEST = '1'; LLM_SPEED_UPDATE_TEST_WHEEL = $uri } | Out-Null
+      $ver = ''
+      for ($i = 0; $i -lt 150; $i++) {
+        $out = (& $bin --version 2>$null | Out-String).Trim()
+        if ($out -match '^llm-speed\s+(\S+)') { $ver = $Matches[1] }
+        if ($ver -eq $Bump) { break }
+        Start-Sleep -Seconds 2
+      }
+      Add-Content -Path $script:Log -Value "background update: $ver"
+      $notice = Invoke-Console $bin
+      if ($notice -notmatch [regex]::Escape("Updated llm-speed $New -> $Bump")) {
+        Add-Result $inst 'autoupdate' 'FAIL' $ver "no one-time 'Updated llm-speed $New -> $Bump' notice (log $script:Log)"; return
+      }
+    }
+    Test-Installed $inst 'autoupdate (local)' $bin $py $Bump
+  } finally { Exit-Sandbox }
 }
 
 function Invoke-Row($inst, $scen) {
   if ($inst -ne 'pip' -and -not (Get-Command $inst -ErrorAction SilentlyContinue)) {
     Add-Result $inst $scen 'SKIP' '' "$inst not installed (try -BootstrapTools)"; return
+  }
+  if ($scen -eq 'autoupdate') {
+    if ($AutoUpdateWheel) { Invoke-AutoUpdateLocal $inst; return }
+    $na = Get-AutoUpdateNA
+    if ($na) { Add-Result $inst $scen 'N/A' '' $na; return }
   }
   Enter-Sandbox $inst $scen
   $sb = $script:SB
@@ -205,7 +329,8 @@ function Invoke-Row($inst, $scen) {
           if (-not (X $py -m pip install $SpecNew)) { Add-Result pip $scen 'FAIL' '' "pip install$Sfx failed (log $script:Log)"; return }
         } else {
           if (-not ((X $py -m pip install "$Pkg==$Prev") -and (Test-Prev $bin $py))) { Add-Result pip $scen 'FAIL' '' "could not install PREV $Prev"; return }
-          if (-not (X $py -m pip install -U $SpecNew)) { Add-Result pip $scen 'FAIL' '' "pip install -U$Sfx failed (log $script:Log)"; return }
+          $up = if ($scen -eq 'autoupdate') { X $bin update } else { X $py -m pip install -U $SpecNew }
+          if (-not $up) { Add-Result pip $scen 'FAIL' '' "pip install -U$Sfx failed (log $script:Log)"; return }
         }
       }
       'pipx' {
@@ -215,7 +340,7 @@ function Invoke-Row($inst, $scen) {
         } else {
           if (-not ((X pipx install --python $Python "$Pkg==$Prev") -and (Test-Prev $bin $py))) { Add-Result pipx $scen 'FAIL' '' "could not install PREV $Prev"; return }
           # pipx upgrade cannot target a version; runpip is the pinned equivalent.
-          $ok = if ($Pinned) { X pipx runpip $Pkg install -U "$Pkg==$New" } else { X pipx upgrade $Pkg }
+          $ok = if ($Pinned) { X pipx runpip $Pkg install -U "$Pkg==$New" } elseif ($scen -eq 'autoupdate') { X $bin update } else { X pipx upgrade $Pkg }
           if (-not $ok) { Add-Result pipx $scen 'FAIL' '' "pipx upgrade$Sfx failed (log $script:Log)"; return }
         }
       }
@@ -231,6 +356,7 @@ function Invoke-Row($inst, $scen) {
           if (-not ($ok -and (Test-Prev $bin $py))) { Add-Result uv $scen 'FAIL' '' "could not install PREV $Prev"; return }
           $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
           $ok = if ($Pinned -or -not $NewUploaded) { X uv tool install --python $Python --reinstall "$Pkg==$New" }
+                elseif ($scen -eq 'autoupdate') { X $bin update }
                 else { X uv tool upgrade --exclude-newer $now $Pkg }
           if (-not $ok) { Add-Result uv $scen 'FAIL' '' "uv tool upgrade$Sfx failed (log $script:Log)"; return }
         }
@@ -240,7 +366,7 @@ function Invoke-Row($inst, $scen) {
   } finally { Exit-Sandbox }
 }
 
-foreach ($inst in $Only) { foreach ($scen in 'fresh', 'upgrade') { Write-Host "== $inst $scen"; Invoke-Row $inst $scen } }
+foreach ($inst in $Only) { foreach ($scen in $Scenarios) { Write-Host "== $inst $scen"; Invoke-Row $inst $scen } }
 if (-not $DryRun -and -not $Keep -and (Test-Path $Run)) { Remove-Item -Recurse -Force -Path $Run -ErrorAction SilentlyContinue }
 
 Write-Host ''
@@ -251,6 +377,8 @@ if ($DryRun) { $verdict = 'dry run: nothing was installed'; $rc = 0 }
 elseif ($fails -gt 0) { $verdict = "installer gate: FAIL ($fails failing, $skips skipped)"; $rc = 1 }
 elseif ($skips -gt 0) { $verdict = "installer gate: NOT DONE ($skips skipped; a SKIP is not a pass)"; $rc = 3 }
 else { $verdict = 'installer gate: PASS'; $rc = 0 }
+$nas = @($Results | Where-Object { $_.Status -eq 'N/A' }).Count
+if ($nas -gt 0) { $verdict = "$verdict; $nas N/A (not applicable to this pair, see Detail)" }
 Write-Host $verdict
 if ($Summary) {
   $md = @("#### $([System.Environment]::OSVersion.Platform) (pwsh $($PSVersionTable.PSVersion)): $Prev -> $New (PyPI latest: $Latest)", '',

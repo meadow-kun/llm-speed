@@ -13,7 +13,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from . import tokens, wsl
-from .pyflags import isolation_flags
+from .pyflags import isolation_flags, stable_python
 from .settings import agent_dir, logs_dir
 
 LABEL = "com.llm-speed.agent"
@@ -37,8 +37,10 @@ WINDOWS_MESSAGE = (
 def program_args() -> list[str]:
     # R-71 / R-74: -I in a venv, else -P (3.11+), so a stray `cli` package in the working
     # directory can't stand in for the agent (the service cwd is pinned to / as well).
+    # 0.0.14: Homebrew's versioned Cellar path becomes <brew prefix>/opt/llm-speed/...,
+    # which survives `brew upgrade` + cleanup (launchd, systemd and the WSL2 task).
     return [
-        os.path.abspath(sys.executable),
+        stable_python(),
         *isolation_flags(),
         "-m",
         PACKAGE,
@@ -337,3 +339,45 @@ def service_state() -> str:
     except OSError:
         return "unknown"
     return "unsupported"
+
+
+STALE_MARK = "/Cellar/llm-speed/"
+
+
+def refresh_registration() -> list[str]:
+    """0.0.14: rewrite an installed launchd plist / systemd unit that still runs the agent
+    from a versioned Homebrew Cellar path (registered by 0.0.13 or older), so the next
+    start uses the stable opt path. Called after a successful update; `agent install`
+    rewrites it anyway. Never stops or restarts the running agent (a job may be running):
+    systemd gets `daemon-reload` (future starts only); launchd reads the new plist at the
+    next load (login / reboot / `llm-speed agent restart`). The WSL2 task keeps no local
+    copy: `llm-speed agent install` registers it again. Returns what changed."""
+    kind = platform_kind()
+    done: list[str] = []
+    try:
+        if kind == "launchd":
+            p, new = plist_path(), render_plist()
+        elif kind == "systemd":
+            p, new = unit_path(), render_unit()
+        else:
+            return done
+        if not p.is_file() or p.is_symlink():
+            return done
+        old = p.read_text(encoding="utf-8")
+        if STALE_MARK not in old or STALE_MARK in new or old == new:
+            return done
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(new, encoding="utf-8")
+        os.replace(tmp, p)
+        done.append(f"rewrote {p} (Homebrew Cellar path -> opt/llm-speed)")
+        if kind == "systemd":
+            subprocess.run(
+                ["systemctl", "--user", "daemon-reload"],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+            done.append("systemctl --user daemon-reload")
+    except (OSError, subprocess.SubprocessError) as e:
+        done.append(f"could not refresh the service file: {e}")
+    return done

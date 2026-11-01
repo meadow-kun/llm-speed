@@ -444,11 +444,17 @@ class Runner:
         preset_loader=None,
         flags: frozenset[str] | None = None,
         facts: dict | None = None,
+        updater: Callable[[], str | None] | None = None,
+        restarter: Callable[[str], int] | None = None,
     ):
         self.client, self.settings = client, settings
         self.launcher, self.sleep, self.gate_runner = launcher, sleep, gate_runner
         self.preset_keys, self.flags, self.facts = preset_keys, flags, facts
         self.preset_loader = preset_loader or preset_schema.packaged_preset
+        # Auto-update (0.0.14): `agent run` passes cli.autoupdate's hooks; tests and
+        # --once leave them off. Only called between jobs (see run_forever).
+        self.updater, self.restarter = updater, restarter
+        self.in_job = False
         self.backoff = 5.0
         self.next_wait: float | None = None  # set by handle() when a job is handed back
         self.stopped_reason: str | None = None
@@ -592,7 +598,14 @@ class Runner:
             )
             return self.poll_after(claim.control)
         self.next_wait = None
-        self.handle(claim.job, claim.lease or {})
+        from ..autoupdate import InUse
+
+        self.in_job = True
+        try:
+            with InUse():  # R-136: no update by another llm-speed during this job
+                self.handle(claim.job, claim.lease or {})
+        finally:
+            self.in_job = False
         wait, self.next_wait = self.next_wait, None
         return wait if wait is not None else 1.0
 
@@ -1041,7 +1054,26 @@ class Runner:
             wait = self.cycle()
             if once:
                 return 0 if not self.stopped_reason else 1
+            rc = self.update_between_jobs()
+            if rc is not None:
+                return rc
             self.sleep(wait)
+
+    def update_between_jobs(self) -> int | None:
+        """Auto-update, only here: after a cycle has finished (claim handled, job
+        reported or handed back), never while a job runs. After an update the agent
+        restarts itself; the return value is the exit code if it couldn't re-exec."""
+        if self.updater is None or self.in_job:
+            return None
+        try:
+            new = self.updater()
+        except Exception as e:  # noqa: BLE001 - an update problem never stops the agent
+            log.warning("update check failed: %s", e)
+            return None
+        if not new:
+            return None
+        write_status(state="restarting", reason=f"updated to llm-speed {new}")
+        return (self.restarter or (lambda v: 0))(new)
 
     def _recover(self) -> None:
         """After a crash/reboot: stop our own orphaned preset child (never anything else);
