@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -70,6 +70,8 @@ CACHE_NAME = "update-check.json"
 LOCK_NAME = "update.lock"
 INUSE_NAME = "in-use"  # R-136: one <pid> file per running bench / job / command
 BUSY_RETRY_S = 3600
+INUSE_TRIES = 20  # R-140: marker create/lock attempts, INUSE_RETRY_S apart
+INUSE_RETRY_S = 0.05
 
 # Exit code of `agent run` when an update was installed but the in-place re-exec could not
 # happen: non-zero, so systemd (Restart=on-failure), launchd (KeepAlive SuccessfulExit=false)
@@ -126,10 +128,14 @@ def parse_version(v: Any):
 class _RegexVersion:
     key: tuple
     pre: bool
+    text: str = field(default="", compare=False)
 
     @property
     def is_prerelease(self) -> bool:
         return self.pre
+
+    def __str__(self) -> str:  # the canonical version, like packaging's Version
+        return self.text
 
 
 def _regex_version(v: str):
@@ -145,7 +151,14 @@ def _regex_version(v: str):
     if dev is not None and pre_rank == 3 and post < 0:
         pre_rank = -1  # 1.0.dev1 < 1.0a1 < 1.0
     key = (rel, pre_rank, pre_n, post, 10**9 if dev is None else dev)
-    return _RegexVersion(key, m.group(2) is not None or dev is not None)
+    text = ".".join(str(int(x)) for x in m.group(1).split("."))
+    if m.group(2):
+        text += f"{m.group(2)}{pre_n}"
+    if post >= 0:
+        text += f".post{post}"
+    if dev is not None:
+        text += f".dev{dev}"
+    return _RegexVersion(key, m.group(2) is not None or dev is not None, text)
 
 
 def is_prerelease(pv) -> bool:
@@ -362,14 +375,18 @@ def pick_version(data: Any, *, prereleases: bool) -> str | None:
             continue
         if is_prerelease(pv) and not prereleases:
             continue
-        ok.append((pv, str(pv)))  # R-138: canonical form to the installer
+        canon = str(pv)  # R-138: canonical form to the installer
+        if parse_version(canon) is None:  # never hand on anything we can't re-read
+            continue
+        ok.append((pv, canon))
     head = info.get("version")
     if not ok:
         # no releases block: fall back to info.version alone (not yanked, not pre)
         pv = parse_version(head)
         if pv is None or info.get("yanked") or (is_prerelease(pv) and not prereleases):
             return None
-        return str(pv)
+        canon = str(pv)
+        return canon if parse_version(canon) is not None else None
     ok.sort()
     return ok[-1][1]
 
@@ -660,6 +677,14 @@ def _try_lock(f) -> bool:
     return True
 
 
+def _same_file(f, p: Path) -> bool:
+    """The open file `f` is still the file at `p` (not removed or replaced)."""
+    try:
+        return os.path.samestat(os.fstat(f.fileno()), os.stat(p, follow_symlinks=False))
+    except OSError:
+        return False
+
+
 class InUse:
     """Marks this process as running llm-speed code (a command, a bench, an agent job):
     <config>/in-use/<pid>, held open and locked for as long as the process runs. The
@@ -673,22 +698,52 @@ class InUse:
         self.f = None
 
     def __enter__(self) -> InUse:
+        """Create and lock the marker. R-140: the file is kept only if, once locked, it
+        is still the one at the path (a cleaner may have removed it in between); a file
+        with our name that someone else has locked is a stale one from a reused PID that
+        a cleaner is looking at. Retries for about a second, then runs unmarked."""
         try:
             d = self.dir or (_config_dir() / INUSE_NAME)
             d.mkdir(parents=True, exist_ok=True)
-            p = d / str(os.getpid())
-            fd = os.open(
-                p,
-                os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            f = os.fdopen(fd, "r+")
-            if not _try_lock(f):
-                f.close()
-                return self
-            self.path, self.f = p, f
         except OSError as exc:
             log.debug("in-use marker not written: %s", exc)
+            return self
+        p = d / str(os.getpid())
+        for attempt in range(INUSE_TRIES):
+            try:
+                fd = os.open(
+                    p, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+                )
+            except OSError as exc:
+                log.debug("in-use marker open failed: %s", exc)
+                time.sleep(INUSE_RETRY_S)
+                continue
+            f = os.fdopen(fd, "r+")
+            if _try_lock(f):
+                if _same_file(f, p):
+                    try:
+                        f.seek(0)
+                        f.truncate()
+                        f.write(str(os.getpid()))
+                        f.flush()
+                    except OSError:
+                        pass
+                    self.path, self.f = p, f
+                    return self
+            elif attempt >= 1:
+                # still locked by someone else: no live process can own our PID's
+                # marker, so it is a stale file a cleaner holds. Replace it; the
+                # cleaner re-checks the path before it unlinks and leaves ours alone.
+                try:
+                    if _same_file(f, p):
+                        p.unlink()
+                except OSError:
+                    pass
+            f.close()
+            time.sleep(INUSE_RETRY_S)
+        log.debug(
+            "in-use marker not held after %d tries; running unmarked", INUSE_TRIES
+        )
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -738,8 +793,10 @@ def busy_pids(ignore: tuple[int, ...] = (), directory: Path | None = None) -> li
             if not _try_lock(f):
                 out.append(pid)  # its owner still runs
                 continue
-            try:
-                p.unlink()  # stale: the owner exited without removing it
+            try:  # stale: the owner exited. Unlink only while locked, and only the
+                # file we locked (R-140): it may have been replaced meanwhile.
+                if _same_file(f, p):
+                    p.unlink()
             except OSError:
                 pass
     return out

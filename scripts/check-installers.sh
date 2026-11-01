@@ -219,6 +219,27 @@ drop_sandbox() {
   fi
 }
 
+# The installed version per the tool venv's metadata. Isolated (-I: no cwd or
+# script dir on sys.path, no PYTHON* env, no user site) and run from the row's
+# sandbox, so a source checkout's llm_speed.egg-info can't shadow the install.
+meta_version() {
+  [ -x "$1" ] || return 0
+  (cd "$SB" 2>/dev/null || cd /; "$1" -I -c "import importlib.metadata as m; print(m.version('$PKG'))" 2>/dev/null) || true
+}
+
+# Removes formula $1 with every installed version (brew upgrade under
+# HOMEBREW_NO_INSTALL_CLEANUP keeps the old keg, and a plain `brew uninstall`
+# removes only the newest), then checks that no llm-speed keg is left.
+brew_rm() {
+  x brew uninstall --force --formula "$1"
+  [ "$DRY" = 1 ] && return 0
+  if brew list --formula "$PKG" >/dev/null 2>&1; then
+    echo "  warning: $PKG still installed after brew uninstall --force (log $LOG)"
+    echo "brew_rm: $PKG still installed" >>"$LOG"
+    return 1
+  fi
+}
+
 # Verifies the installed CLI in the current sandbox. $1=installer $2=scenario
 # $3=llm-speed binary $4=python of the tool's venv (for the metadata fallback).
 verify() {
@@ -246,7 +267,7 @@ verify() {
   fi
   meta=""
   if [ -n "$py" ] && [ -x "$py" ]; then
-    meta="$("$py" -c "import importlib.metadata as m; print(m.version('$PKG'))" 2>/dev/null)" || meta=""
+    meta="$(meta_version "$py")"
   fi
   if [ -z "$ver" ] && [ "$meta" = "$want" ]; then
     record "$inst" "$scen" FAIL-soft "${from}metadata $meta" "--version missing or unparsable"
@@ -259,7 +280,7 @@ verify() {
 prev_ok() {
   local bin="$1" py="$2" meta
   [ "$DRY" = 1 ] && return 0
-  meta="$("$py" -c "import importlib.metadata as m; print(m.version('$PKG'))" 2>/dev/null)" || meta=""
+  meta="$(meta_version "$py")"
   echo "PREV installed: ${meta:-none}" >>"$LOG"
   FROM="${meta:-?} -> "
   [ "$meta" = "$PREV" ] && [ -x "$bin" ]
@@ -309,7 +330,7 @@ row_autoupdate_local() {
          sx uv tool install --python "$PYTHON" --find-links "$dir" "$PKG" ;;
   esac || { record "$inst" autoupdate FAIL "" "could not install the candidate wheel (log $LOG)"; drop_sandbox; return; }
   if [ "$DRY" = 0 ]; then
-    ver="$("$py" -c "import importlib.metadata as m; print(m.version('$PKG'))" 2>/dev/null)" || ver=""
+    ver="$(meta_version "$py")"
     [ "$ver" = "$NEW" ] || { record "$inst" autoupdate FAIL "${ver:-?}" "candidate is not $NEW (log $LOG)"; drop_sandbox; return; }
     FROM="$ver -> "
   fi
@@ -521,12 +542,12 @@ row_brew_autoupdate_local() {
     echo "notice: $notice" >>"$LOG"
     if ! printf '%s\n' "$notice" | grep -qx "Updated llm-speed $NEW -> $BUMP"; then
       record brew autoupdate FAIL "${ver:-?}" "no one-time 'Updated llm-speed $NEW -> $BUMP' notice (log $LOG)"
-      x brew uninstall --formula "$GATE_TAP/$PKG"; x brew untap "$GATE_TAP"; drop_sandbox; return
+      brew_rm "$GATE_TAP/$PKG"; x brew untap "$GATE_TAP"; drop_sandbox; return
     fi
   fi
   WANT="$BUMP"
   verify brew "autoupdate (local tap)" "$prefix/bin/llm-speed" "$prefix/opt/$PKG/libexec/bin/python"
-  x brew uninstall --formula "$GATE_TAP/$PKG"
+  brew_rm "$GATE_TAP/$PKG"
   x brew untap "$GATE_TAP"
   drop_sandbox
 }
@@ -560,7 +581,7 @@ row_brew() {
   x brew tap "$TAP" || { record brew "$scen" FAIL "" "brew tap $TAP failed (log $LOG)"; drop_sandbox; return; }
   prefix="$(brew --prefix 2>/dev/null || echo "<brew prefix>")"
   if [ "$scen" = fresh ]; then
-    x brew install "$TAP/$PKG" || { record brew "$scen" FAIL "" "brew install failed (log $LOG)"; x brew uninstall --formula "$PKG"; drop_sandbox; return; }
+    x brew install "$TAP/$PKG" || { record brew "$scen" FAIL "" "brew install failed (log $LOG)"; brew_rm "$PKG"; drop_sandbox; return; }
   else
     # The tap keeps one formula: install PREV from the tap's history, then go
     # back to the tap's main and run the documented `brew upgrade`.
@@ -590,10 +611,10 @@ row_brew() {
       sx "$prefix/bin/llm-speed" update
     else
       x brew upgrade "$TAP/$PKG"
-    fi || { record brew "$scen" FAIL "" "brew $scen failed (log $LOG)"; x brew uninstall --formula "$PKG"; drop_sandbox; return; }
+    fi || { record brew "$scen" FAIL "" "brew $scen failed (log $LOG)"; brew_rm "$PKG"; drop_sandbox; return; }
   fi
   verify brew "$scen" "$prefix/bin/llm-speed" "$prefix/opt/$PKG/libexec/bin/python"
-  x brew uninstall --formula "$PKG"
+  brew_rm "$PKG"
   drop_sandbox
 }
 

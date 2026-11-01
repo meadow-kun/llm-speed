@@ -191,8 +191,13 @@ function Exit-Sandbox {
 
 function Get-MetaVersion($py) {
   if (-not (Test-Path $py)) { return '' }
-  $v = & $py -c "import importlib.metadata as m; print(m.version('$Pkg'))" 2>$null
-  if ($LASTEXITCODE -eq 0) { return "$v".Trim() } else { return '' }
+  # Isolated (-I) and from the row's sandbox, so a source checkout's
+  # llm_speed.egg-info in the current directory can't shadow the install.
+  $here = if ($script:SB -and (Test-Path $script:SB)) { $script:SB } else { [System.IO.Path]::GetTempPath() }
+  Push-Location $here
+  try { $v = & $py -I -c "import importlib.metadata as m; print(m.version('$Pkg'))" 2>$null; $rc = $LASTEXITCODE }
+  finally { Pop-Location }
+  if ($rc -eq 0) { return "$v".Trim() } else { return '' }
 }
 
 $script:From = ''
