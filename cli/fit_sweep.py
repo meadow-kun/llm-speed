@@ -794,9 +794,17 @@ class Sweep:
             cmd += ["--n-cpu-moe", str(entry["n_cpu_moe"])]
         if entry.get("reasoning") in ("on", "off", "auto"):
             cmd += ["--reasoning", entry["reasoning"]]
-        cmd += list(self.plan.get("server_args", DEFAULT_SERVER_ARGS)) + list(
+        extra = list(self.plan.get("server_args", DEFAULT_SERVER_ARGS)) + list(
             entry.get("server_args", [])
         )
+        if entry.get("ssd_stream") is True:
+            from cli import ssd_stream
+
+            # weights stream from disk: never --no-mmap / --mlock (the schema refuses
+            # them too); allowlisted tensors pinned to CPU, exact names only
+            extra = [a for a in extra if a not in ssd_stream.FORBIDDEN_SERVER_ARGS]
+            extra += ssd_stream.cpu_tensor_args(entry.get("cpu_tensors") or [])
+        cmd += extra
         return cmd
 
     def bench_cmd(self, entry: dict, wl: str, artifact: Path) -> list[str]:
@@ -837,7 +845,8 @@ class Sweep:
     def declared_server_args(cmd: list[str]) -> str:
         """The server flags the CLI can't see in external mode (ctx, -ngl, --n-cpu-moe,
         ...), declared to it via $LLM_SPEED_LLAMA_ARGS so the run records them."""
-        skip_with_value = {"-m", "--model", "--alias", "--host", "--port"}
+        # -ot (ssd_stream cpu_tensors) is recorded as extras.cpu_tensors instead
+        skip_with_value = {"-m", "--model", "--alias", "--host", "--port", "-ot"}
         out, i = [], 1
         while i < len(cmd):
             if cmd[i] in skip_with_value:
@@ -993,6 +1002,7 @@ class Sweep:
         base = f"http://127.0.0.1:{port}"
         status = None
         deadline = t0 + float(self.plan.get("health_timeout_s", 900))
+        floor_check = self._load_floor_check(entry)
         try:
             while True:
                 if proc.poll() is not None:
@@ -1002,6 +1012,11 @@ class Sweep:
                     break
                 if time.monotonic() > deadline:
                     status = "load_timeout"
+                    break
+                why = floor_check() if floor_check else None
+                if why:  # 0.0.13 ssd_stream (R-127): floors while the model loads too
+                    status = "floor_abort"
+                    rec["floor_abort"] = why
                     break
                 time.sleep(0.5)
             rec["load_seconds"] = round(time.monotonic() - t0, 1)
@@ -1033,10 +1048,22 @@ class Sweep:
                     LLAMA_CPP_MODELS_DIR=str(self.model_path(entry).parent.resolve()),
                     LLM_SPEED_LLAMA_ARGS=self.declared_server_args(cmd),
                     **{k: str(v) for k, v in (c.get("env") or {}).items()},
+                    **self._ssd_env(entry, proc.pid),
+                    **self._storage_env(entry),
                 )
                 bcmd = self.bench_cmd(entry, wl, artifact)
                 rec["bench_cmd"] = bcmd
-                rec.update(self._run_bench(bcmd, env, adir, artifact))
+                rec.update(
+                    self._run_bench(
+                        bcmd,
+                        env,
+                        adir,
+                        artifact,
+                        floors_path=self.model_path(entry).parent
+                        if entry.get("ssd_stream") is True
+                        else None,
+                    )
+                )
                 if proc.poll() is not None:
                     rec["server_died_during_bench"] = True
         finally:
@@ -1045,7 +1072,11 @@ class Sweep:
         rec["log_signals"] = [
             ln.strip()[:240] for ln in tail(srv_log, 4000) if LOG_SIGNAL_RE.search(ln)
         ][-30:]
-        if status is not None:
+        if status == "floor_abort":
+            rec["status"], rec["fits"] = rec["floor_abort"], None
+            rec["finished_at"] = now_utc()
+            log(f"  {rec['status']} while llama-server was loading; step aborted")
+        elif status is not None:
             rec["server_rc"] = proc.returncode
             rec["status"] = self._classify_log(srv_log) or (
                 "load_timeout" if status == "load_timeout" else "server_crashed"
@@ -1092,8 +1123,76 @@ class Sweep:
         self._status_from_bench(rec, None)
         return rec
 
+    def _load_floor_check(self, entry: dict):
+        """ssd_stream entries: a callable that returns disk_below_floor / ram_below_floor
+        (checked at most every ssd_stream.POLL_S) while llama-server loads; else None."""
+        if entry.get("ssd_stream") is not True:
+            return None
+        from cli import ssd_stream
+
+        disk_floor, ram_floor = ssd_stream.floors_from_env()
+        path = self.model_path(entry).parent
+        last = [0.0]
+
+        def check() -> str | None:
+            now = time.monotonic()
+            if now - last[0] < ssd_stream.POLL_S:
+                return None
+            last[0] = now
+            return ssd_stream.floor_breach(
+                path, disk_floor_gb=disk_floor, ram_floor_gb=ram_floor
+            )
+
+        return check
+
+    @staticmethod
+    def _ssd_env(entry: dict, pid: int | None) -> dict:
+        from cli import ssd_stream
+
+        return ssd_stream.bench_env(entry, pid)
+
+    def _storage_env(self, entry: dict) -> dict:
+        """0.0.13 opt-in storage block (cli/storage_info.py, R-131): the bench child talks
+        to our llama-server by URL, so for an ssd_stream entry tell it which GGUF the
+        server reads, for the drive probe only. Always set (empty for other entries) so
+        a value in the caller's environment never applies. Never uploaded or logged."""
+        from cli.storage_info import MODEL_PATH_ENV
+
+        if entry.get("ssd_stream") is not True:
+            return {MODEL_PATH_ENV: ""}
+        return {MODEL_PATH_ENV: str(self.model_path(entry).resolve())}
+
+    def _wait_with_floors(self, p: subprocess.Popen, timeout: float, path: Path):
+        """0.0.13 ssd_stream: wait for the bench child, checking free disk on the models
+        disk and available RAM every few seconds. Below a floor: kill the child before it
+        writes its run (nothing from this step can be uploaded) and return the reason."""
+        from cli import ssd_stream
+
+        disk_floor, ram_floor = ssd_stream.floors_from_env()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return p.wait(timeout=ssd_stream.POLL_S), None
+            except subprocess.TimeoutExpired:
+                pass
+            why = ssd_stream.floor_breach(
+                path, disk_floor_gb=disk_floor, ram_floor_gb=ram_floor
+            )
+            if why:
+                p.kill()
+                p.wait(timeout=30)
+                return "aborted", why
+            if time.monotonic() > deadline:
+                raise subprocess.TimeoutExpired(p.args, timeout)
+
     def _run_bench(
-        self, bcmd, env, adir: Path, artifact: Path, sampler: MemSampler | None = None
+        self,
+        bcmd,
+        env,
+        adir: Path,
+        artifact: Path,
+        sampler: MemSampler | None = None,
+        floors_path: Path | None = None,
     ) -> dict:
         out: dict = {}
         t0 = time.monotonic()
@@ -1108,7 +1207,14 @@ class Sweep:
             if sampler is not None:
                 sampler.pid = p.pid
             try:
-                rc = p.wait(timeout=float(self.plan.get("bench_timeout_s", 3600)))
+                if floors_path is not None:
+                    rc, why = self._wait_with_floors(
+                        p, float(self.plan.get("bench_timeout_s", 3600)), floors_path
+                    )
+                    if why:
+                        out["floor_abort"] = why
+                else:
+                    rc = p.wait(timeout=float(self.plan.get("bench_timeout_s", 3600)))
             except subprocess.TimeoutExpired:
                 p.kill()
                 rc = "timeout"
@@ -1121,6 +1227,9 @@ class Sweep:
                 raise
         out["bench_seconds"] = round(time.monotonic() - t0, 1)
         out["bench_rc"] = rc
+        if out.get("floor_abort"):
+            # never keep (or upload) a run from an aborted step
+            artifact.unlink(missing_ok=True)
         payload = decode_jws_payload(artifact) if artifact.exists() else None
         out["artifact"] = str(artifact) if artifact.exists() else None
         if payload:
@@ -1140,6 +1249,11 @@ class Sweep:
     def _status_from_bench(self, rec: dict, srv_log: Path | None) -> None:
         res = rec.get("cli_results") or []
         errs = [r for r in res if r.get("error")]
+        if rec.get("floor_abort"):
+            rec["status"] = rec["floor_abort"]  # disk_below_floor / ram_below_floor
+            rec["fits"] = None
+            rec["finished_at"] = now_utc()
+            return
         if rec.get("bench_rc") == "timeout":
             rec["status"] = "bench_timeout"
         elif rec.get("server_died_during_bench"):
@@ -1418,6 +1532,7 @@ class Sweep:
         done_cells = 0
         durations: list[float] = []
         self.interrupted = False
+        self.floor_abort: str | None = None
 
         def record(rec):
             counts[rec["status"]] = counts.get(rec["status"], 0) + 1
@@ -1460,7 +1575,14 @@ class Sweep:
                         p
                         and not str(p.get("status", "")).startswith("skipped")
                         and p.get("status")
-                        not in ("missing", "download_failed", "interrupted")
+                        not in (
+                            "missing",
+                            "download_failed",
+                            "interrupted",
+                            # 0.0.13 ssd_stream floors: retried on the next run
+                            "disk_below_floor",
+                            "ram_below_floor",
+                        )
                         and not entry.get("control")
                     ):
                         failed = failed or f"ctx {c['ctx']} {p['status']} (earlier run)"
@@ -1580,6 +1702,16 @@ class Sweep:
                         ):
                             self.upload(rec)
                         record(rec)
+                        if rec["status"] in ("disk_below_floor", "ram_below_floor"):
+                            from cli import ssd_stream
+
+                            log(
+                                f"STOP: {rec['status']} during {entry['id']} ctx "
+                                f"{c['ctx']}; the step was aborted and nothing from it "
+                                "is kept. Free space / memory, then rerun to resume."
+                            )
+                            self.floor_abort = rec["status"]
+                            return ssd_stream.FLOOR_RC[rec["status"]]
                         if rec["status"] not in ("ok", "partial"):
                             failed = f"ctx {c['ctx']} {rec['status']}"
                 finally:

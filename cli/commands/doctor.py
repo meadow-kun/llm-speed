@@ -113,8 +113,52 @@ def agent_token_checks() -> list[Check]:
             detail=f"enrolled as {s.machine_id} but no token found ({where})",
             remediation="ask your queue admin to revoke this machine, then run "
             "`llm-speed agent install --force` to pair again",
-        )
+        ),
     ]
+
+
+def agent_backend_checks() -> list[Check]:
+    try:
+        from ..agent.settings import Settings
+
+        s = Settings.load()
+    except (OSError, ValueError, TypeError):
+        return []
+    return [agent_backend_check(s)] if s.machine_id else []
+
+
+def agent_backend_check(s) -> Check:
+    """0.0.13: is llama.cpp findable the way the agent service looks (its PATH, no
+    shell $LLAMA_SERVER, `agent config llama_server`, the prebuilt dir)? WARN only."""
+    from ..agent import backends
+
+    try:
+        found = backends.status_probe(s)
+    except OSError as e:
+        return Check(
+            id="agent.backend",
+            title="agent backend (as the service sees it)",
+            status=WARN,
+            detail=f"could not check: {e}",
+        )
+    ll = found.get("llama.cpp")
+    auto = s.auto_install_backends is True
+    return Check(
+        id="agent.backend",
+        title="agent backend (as the service sees it)",
+        status=OK if ll else WARN,
+        detail=backends.describe(found),
+        remediation=None
+        if ll
+        else (
+            "the agent installs the official prebuilt when a job needs it (auto-install on)"
+            if auto
+            else "the agent's jobs fail `backend_missing`: install llama.cpp where the "
+            "service finds it (`llm-speed bench --preset <name>` offers the official "
+            "build; or `llm-speed agent config llama_server /abs/path/llama-server`), "
+            "or allow installs: `llm-speed agent auto-install on`"
+        ),
+    )
 
 
 def _on_windows_drive(p: str) -> bool:
@@ -281,7 +325,12 @@ def run_doctor(
     """Run the doctor flow. Returns an exit code (0 ready, 1 not ready)."""
     cons = console or get_console()
     do_checks = run_checks_fn or (
-        lambda: run_checks(api_base=api_base) + agent_token_checks() + wsl_checks()
+        lambda: (
+            run_checks(api_base=api_base)
+            + agent_token_checks()
+            + agent_backend_checks()
+            + wsl_checks()
+        )
     )
     confirm_fn = confirm or _default_confirm
     if interactive is None:

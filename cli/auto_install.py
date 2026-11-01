@@ -15,7 +15,8 @@ distro):
 
 * ``ollama``    - macOS: ``brew install ollama``; Linux: official one-liner;
   Windows: skipped (no headless install path the user trusts).
-* ``mlx_lm``    - ``pip install --user mlx-lm`` (Apple Silicon only).
+* ``mlx_lm``    - ``pip install [--user] mlx-lm==MLX_LM_VERSION`` (Apple Silicon only;
+  ``--user`` only outside a virtual environment).
 * ``llama.cpp`` - macOS: ``brew install llama.cpp``; Linux: ``apt-get install
   llama.cpp`` if apt is present.
 """
@@ -172,11 +173,13 @@ def plan_for(backend: str) -> InstallPlan:
                 available=False,
                 skip_reason="MLX requires macOS on arm64",
             )
+        argv = _pip_argv(_mlx_spec())
         return InstallPlan(
             backend="mlx",
-            description="Install mlx-lm via pip (--user)",
-            command=f"{sys.executable} -m pip install --user mlx-lm",
-            argv=[sys.executable, "-m", "pip", "install", "--user", "mlx-lm"],
+            description="Install mlx-lm via pip"
+            + (" (--user)" if "--user" in argv else ""),
+            command=" ".join(argv),
+            argv=argv,
             license="MIT",
             auto_installable=True,
         )
@@ -284,6 +287,27 @@ def pull_model_plan_for(backend: str, model: str | None = None) -> InstallPlan:
     )
 
 
+def _mlx_spec() -> str:
+    # R-125: the same reviewed mlx-lm release the agent installs
+    from .commands.preset import MLX_LM_VERSION
+
+    return f"mlx-lm=={MLX_LM_VERSION}"
+
+
+def _pip_argv(spec: str) -> list[str]:
+    """pip install argv; --user only outside a virtual environment (pip refuses it
+    inside pipx / uv / venvs)."""
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    return [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        *([] if in_venv else ["--user"]),
+        spec,
+    ]
+
+
 # Optional Python extras → the pip package that provides them.
 _EXTRA_PACKAGES = {
     "mlx": "mlx-lm",
@@ -311,11 +335,15 @@ def extra_plan_for(extra: str) -> InstallPlan:
             available=False,
             skip_reason=f"unknown extra {extra!r}",
         )
+    if pkg == "mlx-lm":
+        pkg = _mlx_spec()
+    argv = _pip_argv(pkg)
     return InstallPlan(
         backend=extra,
-        description=f"Install {pkg} via pip (--user)",
-        command=f"{sys.executable} -m pip install --user {pkg}",
-        argv=[sys.executable, "-m", "pip", "install", "--user", pkg],
+        description=f"Install {pkg} via pip"
+        + (" (--user)" if "--user" in argv else ""),
+        command=" ".join(argv),
+        argv=argv,
         license="Apache-2.0/MIT",
         auto_installable=True,
     )

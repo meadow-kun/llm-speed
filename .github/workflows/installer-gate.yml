@@ -1,0 +1,118 @@
+name: installer-gate
+
+# Installer release gate for the public llm-speed CLI. On Linux, macOS and
+# Windows it installs the published package from PyPI with pip (fresh venv),
+# pipx and uv tool, plus Homebrew from meadow-kun/tap on Linux and macOS: a
+# fresh install of the new version and an upgrade from the previous one with
+# the documented command. Each must report `llm-speed --version` == new and run
+# `llm-speed doctor --help`. Nothing benchmarks, submits or uploads, every row
+# runs in a throwaway HOME, and no secrets are used (read-only token).
+#
+# Triggers: a published release (the tag, minus "v", is the new version) and
+# manual dispatch (empty version = the latest on PyPI). The mirror release is
+# published just before the PyPI upload and the Homebrew tap bump, so the
+# resolve job first waits for PyPI and the tap to reach the version
+# (wait_minutes). If the tap still lags, the brew rows FAIL saying so: re-run
+# by dispatch once the tap is bumped.
+#
+# This file is part of the reviewed CLI export (tools/export_public_cli.py in
+# the private source repo); edit it there, not here.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to check (empty = latest on PyPI)"
+        required: false
+        default: ""
+        type: string
+      prev:
+        description: "Upgrade from this version (empty = the PyPI release before it)"
+        required: false
+        default: ""
+        type: string
+      wait_minutes:
+        description: "Minutes to wait for PyPI and the Homebrew tap to reach the version"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-gate-${{ github.event.release.tag_name || inputs.version || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    outputs:
+      new: ${{ steps.versions.outputs.new }}
+      prev: ${{ steps.versions.outputs.prev }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+      - id: versions
+        name: Resolve and wait for PyPI and the tap
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event.release.tag_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_PREV: ${{ inputs.prev }}
+          IN_WAIT: ${{ inputs.wait_minutes }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = release ]; then
+            args=(--new "$TAG" --require-latest --wait-minutes 120)
+          else
+            args=(--new "$IN_VERSION" --prev "$IN_PREV" --wait-minutes "${IN_WAIT:-0}")
+          fi
+          python3 scripts/installer-gate-versions.py "${args[@]}" \
+            --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+
+  installers:
+    name: installers (${{ matrix.os }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      NEW_VERSION: ${{ needs.resolve.outputs.new }}
+      PREV_VERSION: ${{ needs.resolve.outputs.prev }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Installer gate (bash, with Homebrew)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          INSTALLER_GATE_ROOT="$RUNNER_TEMP/installer-gate-runs" PYTHON=python \
+            bash scripts/check-installers.sh --bootstrap-tools --summary "$GITHUB_STEP_SUMMARY" \
+            "$NEW_VERSION" "$PREV_VERSION"
+      - name: Installer gate (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:INSTALLER_GATE_ROOT = Join-Path $env:RUNNER_TEMP 'installer-gate-runs'
+          ./scripts/check-installers.ps1 -New $env:NEW_VERSION -Prev $env:PREV_VERSION -BootstrapTools -Python python -Summary $env:GITHUB_STEP_SUMMARY
+          exit $LASTEXITCODE

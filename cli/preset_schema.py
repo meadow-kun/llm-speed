@@ -15,6 +15,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from . import ssd_stream
+
 SCHEMA_PATH = Path(__file__).parent / "schemas" / "llm-speed-preset-1.schema.json"
 PRESETS_DIR = Path(__file__).parent / "presets"
 
@@ -171,6 +173,11 @@ def _semantic_errors(p: dict) -> list[str]:
             errs.append(f"$.models.{mid}: llama.cpp entries need 'file'")
         if m.get("backend") == "mlx" and "dir" not in m:
             errs.append(f"$.models.{mid}: mlx entries need 'dir'")
+        # 0.0.13 ssd_stream (bytes cap, required / forbidden keys); same rules in
+        # worker/src/ssd-stream.ts.
+        errs += ssd_stream.semantic_errors(
+            f"$.models.{mid}", m, list(p.get("server_args") or [])
+        )
     for prof, d in (p.get("profiles") or {}).items():
         for key in ("entries", "fallback", "control"):
             for mid in d.get(key, []):

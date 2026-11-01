@@ -337,6 +337,13 @@ def build_uploadable_report(
     captured JWS envelope cannot be replayed against the leaderboard.
     """
     fp_dict = to_uploadable_dict(report.fingerprint, strict_anon=strict_anon)
+    # 0.0.13 opt-in storage block: only on runs that stream weights from disk
+    # (some result has extras.ssd_stream == True). Dropped from any other run.
+    if "storage" in fp_dict:
+        from .storage_info import run_streams_from_disk
+
+        if not run_streams_from_disk(report.results):
+            fp_dict.pop("storage", None)
     results_out: list[dict[str, Any]] = []
     for r in report.results:
         rd = dataclasses.asdict(r)

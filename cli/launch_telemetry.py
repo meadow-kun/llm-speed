@@ -37,6 +37,11 @@ UPLOADED_EXTRAS_KEYS = (
     # keys the backend could not take. Numbers and fixed key names only.
     "sampling",
     "sampling_ignored",
+    # 0.0.13 (cli/ssd_stream.py UPLOADED_EXTRAS_KEYS): ssd_stream preset entries only.
+    "ssd_stream",
+    "cpu_tensors",
+    "peak_rss_bytes",
+    "disk_read_bytes",
 )
 
 # ---------------------------------------------------------------------------

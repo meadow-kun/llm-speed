@@ -765,6 +765,16 @@ def to_uploadable_dict(fp: Fingerprint, *, strict_anon: bool = False) -> dict[st
     }
     if not strict_anon:
         payload["fingerprint_hash"] = fp.fingerprint_hash
+        # 0.0.13 opt-in storage-drive block (cli/storage_info.py). Present only when the
+        # user turned it on for this run; re-validated to the exact six keys here, and
+        # never under --strict-anon.
+        storage = (fp.extras or {}).get("storage")
+        if storage is not None:
+            from .storage_info import validate_block
+
+            checked = validate_block(storage)
+            if checked is not None:
+                payload["storage"] = checked
     return payload
 
 

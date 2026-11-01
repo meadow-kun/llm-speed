@@ -1,6 +1,6 @@
 [project]
 name = "llm-speed"
-version = "0.0.12"
+version = "0.0.13"
 description = "Benchmark any LLM on any hardware. CLI for the llm-speed.com flywheel."
 requires-python = ">=3.10"
 authors = [{name = "meadow-kun", email = "2424351+meadow-kun@users.noreply.github.com"}]
@@ -57,7 +57,7 @@ dependencies = [
 
 [project.optional-dependencies]
 seed = ["praw>=7.7,<8"]
-mlx = ["mlx-lm>=0.18"]
+mlx = ["mlx-lm==0.32.2"]
 vllm = ["vllm>=0.6"]
 exllamav2 = ["exllamav2>=0.2"]
 # `llm-speed mcp` boots a Model Context Protocol stdio server so AI

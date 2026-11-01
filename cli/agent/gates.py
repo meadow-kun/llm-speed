@@ -425,14 +425,30 @@ def preset_needs(
 
     # memory
     if kind:
-        largest = max(live, key=lambda e: int(e.get("bytes") or 0))
-        needs.largest_entry = largest["id"]
-        needs.largest_mib = int(largest.get("bytes") or 0) / MIB
         margin = settings.vram_margin_gb if kind == "nvidia" else settings.mem_margin_gb
         head = (preset.get("memory_headroom_mib") or {}).get(
             kind, DEFAULT_HEADROOM_MIB[kind]
         )
-        needs.headroom_mib = float(margin) * 1024 if margin is not None else float(head)
+        headroom = float(margin) * 1024 if margin is not None else float(head)
+
+        def entry_need(e: dict) -> float:
+            # 0.0.13 ssd_stream: the preset states the VRAM the run needs (weights
+            # stream from disk), used as is; others: file size + headroom.
+            if e.get("ssd_stream") is True and e.get("vram_need_gib"):
+                return float(e["vram_need_gib"]) * 1024
+            return int(e.get("bytes") or 0) / MIB + headroom
+
+        largest = max(live, key=entry_need)
+        needs.largest_entry = largest["id"]
+        if largest.get("ssd_stream") is True and largest.get("vram_need_gib"):
+            needs.largest_mib = float(largest["vram_need_gib"]) * 1024
+            needs.headroom_mib = 0.0
+            needs.notes.append(
+                f"{largest['id']}: ssd_stream, needs {largest['vram_need_gib']} GiB VRAM"
+            )
+        else:
+            needs.largest_mib = int(largest.get("bytes") or 0) / MIB
+            needs.headroom_mib = headroom
         if kind == "nvidia" and facts.get("gpu_memory_total_mib"):
             needs.capacity_mib = float(facts["gpu_memory_total_mib"])
         elif kind == "apple" and facts.get("ram_gb"):
@@ -453,7 +469,17 @@ def preset_needs(
 
     # disk
     missing = 0
+    floor = 0
     for e in live:
+        if e.get("ssd_stream") is True and e.get("min_free_disk_gb"):
+            # 0.0.13: checked here, before the job is taken and anything downloads
+            # (the file is too large to just try): its min_free_disk_gb while it still
+            # has bytes to fetch.
+            todo = max(0, int(e.get("bytes") or 0) - present_bytes(e, mdir, mlx))
+            if todo:
+                floor = max(floor, int(float(e["min_free_disk_gb"]) * 1e9))
+                missing += todo
+            continue
         if e.get("min_free_disk_gb"):
             needs.self_gated.append(e["id"])
             continue
@@ -465,7 +491,7 @@ def preset_needs(
     )
     needs.download_bytes = missing
     needs.disk_margin_bytes = int(margin_gb * 1e9)
-    needs.disk_bytes = missing + needs.disk_margin_bytes
+    needs.disk_bytes = max(missing + needs.disk_margin_bytes, floor)
     if settings.need_free_disk_gb is not None:
         needs.disk_bytes = int(float(settings.need_free_disk_gb) * 1e9)
         needs.notes.append("disk need set by the machine's config")

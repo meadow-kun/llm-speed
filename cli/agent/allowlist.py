@@ -91,6 +91,7 @@ FORBIDDEN_FLAGS = {
     "--llama-server",
     "--models-dir",
     "--resume",
+    "--install-backend",  # only from the local auto_install_backends setting
 }
 
 
@@ -414,6 +415,10 @@ def build_argv(
             "--llama-server",
             os.path.abspath(os.path.expanduser(settings.llama_server)),
         ]
+    if settings.auto_install_backends is True:
+        # 0.0.13, local opt-in only (`llm-speed agent auto-install on`): the child may
+        # install the official llama.cpp prebuilt / mlx-lm when the job needs it.
+        argv.append("--install-backend")
     if not (upload and settings.upload):
         argv.append("--no-upload")
     argv.append("--strict-anon")  # agent uploads are always strict-anon
