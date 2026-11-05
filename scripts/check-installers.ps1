@@ -101,6 +101,11 @@ $Results = New-Object System.Collections.Generic.List[object]
 function Add-Result($inst, $scen, $status, $ver, $detail) {
   $Results.Add([pscustomobject]@{ Installer = $inst; Scenario = $scen; Status = $status; Version = $ver; Detail = $detail })
   Write-Host "  -> $inst ${scen}: $status $ver $detail"
+  if ($status -in 'FAIL', 'FAIL-soft' -and $script:Log -and (Test-Path $script:Log)) {
+    Write-Host "::group::$inst $scen row log (last 200 lines)"
+    Get-Content -Path $script:Log -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+    Write-Host "::endgroup::"
+  }
 }
 
 $script:Log = $null
@@ -372,7 +377,6 @@ function Invoke-Row($inst, $scen) {
 }
 
 foreach ($inst in $Only) { foreach ($scen in $Scenarios) { Write-Host "== $inst $scen"; Invoke-Row $inst $scen } }
-if (-not $DryRun -and -not $Keep -and (Test-Path $Run)) { Remove-Item -Recurse -Force -Path $Run -ErrorAction SilentlyContinue }
 
 Write-Host ''
 $Results | Format-Table -AutoSize Installer, Scenario, Status, Version, Detail | Out-String -Width 200 | Write-Host
@@ -382,6 +386,14 @@ if ($DryRun) { $verdict = 'dry run: nothing was installed'; $rc = 0 }
 elseif ($fails -gt 0) { $verdict = "installer gate: FAIL ($fails failing, $skips skipped)"; $rc = 1 }
 elseif ($skips -gt 0) { $verdict = "installer gate: NOT DONE ($skips skipped; a SKIP is not a pass)"; $rc = 3 }
 else { $verdict = 'installer gate: PASS'; $rc = 0 }
+# Keep *.log on failure for upload-artifact; otherwise remove the run root.
+if (-not $DryRun -and -not $Keep -and (Test-Path $Run)) {
+  if ($fails -gt 0) {
+    Get-ChildItem -Path $Run -Directory -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+  } else {
+    Remove-Item -Recurse -Force -Path $Run -ErrorAction SilentlyContinue
+  }
+}
 $nas = @($Results | Where-Object { $_.Status -eq 'N/A' }).Count
 if ($nas -gt 0) { $verdict = "$verdict; $nas N/A (not applicable to this pair, see Detail)" }
 Write-Host $verdict
