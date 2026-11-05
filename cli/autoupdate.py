@@ -29,10 +29,12 @@ only one of the two variables) is ignored and PyPI is used.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -68,9 +70,9 @@ CONFIG_KEY = "auto_update"
 PRERELEASE_KEY = "auto_update_prereleases"
 CACHE_NAME = "update-check.json"
 LOCK_NAME = "update.lock"
-INUSE_NAME = "in-use"  # R-136: one <pid> file per running bench / job / command
+INUSE_NAME = "in-use"  # R-136/R-141: one <pid>-<token> file per running command
 BUSY_RETRY_S = 3600
-INUSE_TRIES = 20  # R-140: marker create/lock attempts, INUSE_RETRY_S apart
+INUSE_TRIES = 20  # create/lock attempts, INUSE_RETRY_S apart (not for permanent errors)
 INUSE_RETRY_S = 0.05
 
 # Exit code of `agent run` when an update was installed but the in-place re-exec could not
@@ -98,7 +100,8 @@ _KEEP_ENV = {
 }
 
 _VER_RE = re.compile(
-    r"^(\d+(?:\.\d+){0,3})(?:(a|b|rc)(\d+))?(?:\.post(\d+))?(?:\.dev(\d+))?$"
+    r"^(\d+(?:\.\d+){0,3})(?:(a|b|rc)(\d+))?(?:\.post(\d+))?(?:\.dev(\d+))?$",
+    re.ASCII,  # R-142: reject non-ASCII digits (e.g. fullwidth ０)
 )
 
 # ------------------------------------------------------------------ versions
@@ -687,10 +690,20 @@ def _same_file(f, p: Path) -> bool:
 
 class InUse:
     """Marks this process as running llm-speed code (a command, a bench, an agent job):
-    <config>/in-use/<pid>, held open and locked for as long as the process runs. The
-    updater never replaces the install while another marker is locked. The kernel drops
+    <config>/in-use/<pid>-<token>, held open and locked for as long as the process runs.
+    The updater never replaces the install while another marker is locked. The kernel drops
     the lock when the process exits, so a marker left by a dead (or since reused) PID is
-    unlocked and counts as stale."""
+    unlocked and counts as stale. R-141: the name includes a random token (O_EXCL) so a
+    cleaner that still holds a bare <pid> file from 0.0.14/0.0.15 cannot unlink ours."""
+
+    # open() errors that will not clear on retry (don't spend ~1 s spinning)
+    _PERMANENT_OPEN = (
+        errno.ELOOP,
+        errno.EACCES,
+        errno.EROFS,
+        errno.ENOTDIR,
+        getattr(errno, "EPERM", errno.EACCES),
+    )
 
     def __init__(self, directory: Path | None = None) -> None:
         self.dir = directory
@@ -698,48 +711,44 @@ class InUse:
         self.f = None
 
     def __enter__(self) -> InUse:
-        """Create and lock the marker. R-140: the file is kept only if, once locked, it
-        is still the one at the path (a cleaner may have removed it in between); a file
-        with our name that someone else has locked is a stale one from a reused PID that
-        a cleaner is looking at. Retries for about a second, then runs unmarked."""
+        """Create and lock a unique marker. R-141: O_EXCL|O_NOFOLLOW on
+        <pid>-<token_hex(8)>; no replace-stale-same-PID step. Permanent open errors
+        abort immediately; other failures retry for about a second, then run unmarked."""
         try:
             d = self.dir or (_config_dir() / INUSE_NAME)
             d.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             log.debug("in-use marker not written: %s", exc)
             return self
-        p = d / str(os.getpid())
-        for attempt in range(INUSE_TRIES):
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        for _attempt in range(INUSE_TRIES):
+            p = d / f"{os.getpid()}-{secrets.token_hex(8)}"
             try:
-                fd = os.open(
-                    p, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
-                )
+                fd = os.open(p, flags, 0o600)
             except OSError as exc:
+                if getattr(exc, "errno", None) in self._PERMANENT_OPEN:
+                    log.debug("in-use marker open failed permanently: %s", exc)
+                    return self
                 log.debug("in-use marker open failed: %s", exc)
                 time.sleep(INUSE_RETRY_S)
                 continue
             f = os.fdopen(fd, "r+")
-            if _try_lock(f):
-                if _same_file(f, p):
-                    try:
-                        f.seek(0)
-                        f.truncate()
-                        f.write(str(os.getpid()))
-                        f.flush()
-                    except OSError:
-                        pass
-                    self.path, self.f = p, f
-                    return self
-            elif attempt >= 1:
-                # still locked by someone else: no live process can own our PID's
-                # marker, so it is a stale file a cleaner holds. Replace it; the
-                # cleaner re-checks the path before it unlinks and leaves ours alone.
+            if _try_lock(f) and _same_file(f, p):
                 try:
-                    if _same_file(f, p):
-                        p.unlink()
+                    f.seek(0)
+                    f.truncate()
+                    f.write(str(os.getpid()))
+                    f.flush()
                 except OSError:
                     pass
+                self.path, self.f = p, f
+                return self
+            # lock lost or file replaced: drop this attempt and try a new name
             f.close()
+            try:
+                p.unlink()
+            except OSError:
+                pass
             time.sleep(INUSE_RETRY_S)
         log.debug(
             "in-use marker not held after %d tries; running unmarked", INUSE_TRIES
@@ -765,9 +774,20 @@ class InUse:
                 pass
 
 
+def _marker_pid(name: str) -> int | None:
+    """PID from a marker filename: bare <pid> (0.0.14/0.0.15) or <pid>-<token> (R-141)."""
+    if name.isdigit():
+        return int(name)
+    prefix, sep, rest = name.partition("-")
+    if not sep or not prefix.isdigit() or not rest:
+        return None
+    return int(prefix)
+
+
 def busy_pids(ignore: tuple[int, ...] = (), directory: Path | None = None) -> list[int]:
     """Live llm-speed processes other than us (and `ignore`). A marker whose lock can be
-    taken belongs to a process that has exited: it is removed."""
+    taken belongs to a process that has exited: it is removed. Accepts bare <pid> files
+    from 0.0.14/0.0.15 and <pid>-<token> files from 0.0.16+ (R-141)."""
     out: list[int] = []
     d = directory or (_config_dir() / INUSE_NAME)
     try:
@@ -775,9 +795,9 @@ def busy_pids(ignore: tuple[int, ...] = (), directory: Path | None = None) -> li
     except OSError:
         return out
     for n in names:
-        if not n.isdigit():
+        pid = _marker_pid(n)
+        if pid is None:
             continue
-        pid = int(n)
         if pid == os.getpid() or pid in ignore:
             continue
         p = d / n
@@ -786,12 +806,13 @@ def busy_pids(ignore: tuple[int, ...] = (), directory: Path | None = None) -> li
         except FileNotFoundError:
             continue
         except OSError:  # can't open it (Windows: held open): fall back to the PID
-            if _pid_alive(pid):
+            if _pid_alive(pid) and pid not in out:
                 out.append(pid)
             continue
         with os.fdopen(fd, "r+") as f:
             if not _try_lock(f):
-                out.append(pid)  # its owner still runs
+                if pid not in out:
+                    out.append(pid)  # its owner still runs
                 continue
             try:  # stale: the owner exited. Unlink only while locked, and only the
                 # file we locked (R-140): it may have been replaced meanwhile.

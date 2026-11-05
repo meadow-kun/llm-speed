@@ -290,7 +290,7 @@ versioned).
 - **We don't persist client IPs.** Not in the database, not in application logs.
   Inbound request metadata (User-Agent, request path, response code) is logged
   at the Cloudflare-platform level per [Cloudflare's privacy policy](https://www.cloudflare.com/privacypolicy/).
-  We don't export, query, or retain those edge logs.
+  We don't export or keep those logs. Each day our scripts ask Cloudflare for total request counts by page and by browser or app type, so we can count AI crawlers and visits from AI assistants. We keep only the counts and never look up IP addresses.
 - **Rate-limiting uses an ephemeral hashed-IP counter.** The hash is salted with
   a value that rotates daily and is held in memory only — never written to
   storage, never returned in any response. Cross-day correlation by IP is not
@@ -324,7 +324,7 @@ for the llm-speed Custom GPT.
 | Accounts / sign-in | none. No OAuth, no API key, no cookies |
 | What we store | nothing. The lookups don't write to our database and we don't log tool inputs ourselves |
 | Rate limiting | the same daily-salted, in-memory hashed-IP counter as above (§4), held for one minute; the requester is normally OpenAI's or Anthropic's server, not your device |
-| Platform logs | Cloudflare logs request metadata at the edge per its privacy policy, and our Worker's platform logging samples about 1 in 10 API requests (method, path and query string, status, timing) for debugging, kept for Cloudflare's short default retention. For the web-request version the query string contains the model and hardware names you asked about. We don't export or combine these logs |
+| Platform logs | Cloudflare, which runs our servers, logs basic request details on its side under its own privacy policy. Our own server keeps no request logs; we only see total request and error counts. |
 | Links in answers | links back to llm-speed.com carry `utm_source=chatgpt-app` or `utm_source=chatgpt-gpt` so our cookieless analytics (§8) can count visits from each surface. They identify the surface, never you |
 | What the answers contain | only already-published benchmark data: measured runs (labelled as measured by llm-speed or community-submitted) and fit tests. No hardware fingerprints, public keys or file paths |
 | The assistant provider | OpenAI and Anthropic handle your conversation under their own privacy policies. We have no access to it |
@@ -563,6 +563,10 @@ Do Not Track (`1`) and Global Privacy Control disable this counter. You can also
 block `/api/hardware-interest`; the retailer link continues to work. QA counts are
 kept separate. Visiting the retailer is your choice and its own privacy policy
 applies once you follow the link.
+
+### Retailer links
+
+Some pages link to stores like Newegg or Amazon. These are plain links with no affiliate tag, and we earn nothing from them. We count how many times each link is clicked per day, and that's all. Nothing about you is saved.
 
 ---
 

@@ -115,7 +115,7 @@ jobs:
           # Built from a copy outside the checkout: an in-tree build leaves
           # llm_speed.egg-info (NEW) behind, which shadows the installed version
           # in metadata checks run from the checkout (0.0.14 gate run).
-          python -c 'import shutil, sys; shutil.copytree(".", sys.argv[1], ignore=shutil.ignore_patterns(".git", "build", "*.egg-info"))' "$RUNNER_TEMP/au-src"
+          python -c 'import shutil, sys; shutil.copytree(".", sys.argv[1], symlinks=True, ignore=shutil.ignore_patterns(".git", "build", "*.egg-info"))' "$RUNNER_TEMP/au-src"
           python -m pip wheel --no-deps -w "$RUNNER_TEMP/au-dist" "$RUNNER_TEMP/au-src"
           rm -rf "$RUNNER_TEMP/au-src"
           ls "$RUNNER_TEMP/au-dist/llm_speed-$NEW_VERSION-py3-none-any.whl"
@@ -146,3 +146,12 @@ jobs:
           $wheel = Join-Path $env:RUNNER_TEMP "au-dist/llm_speed-$($env:NEW_VERSION)-py3-none-any.whl"
           & (Join-Path $env:GITHUB_WORKSPACE 'scripts/check-installers.ps1') -New $env:NEW_VERSION -Prev $env:PREV_VERSION -BootstrapTools -Python python -Summary $env:GITHUB_STEP_SUMMARY -AutoUpdateWheel $wheel
           exit $LASTEXITCODE
+
+      - name: Upload installer-gate row logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer-gate-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/installer-gate-runs/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14

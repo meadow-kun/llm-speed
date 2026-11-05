@@ -136,7 +136,19 @@ RUN="$ROOT/run-$NEW-$(date +%Y%m%d%H%M%S)-$$"
 
 FROM=""
 RESULTS=()   # "installer|scenario|status|version|detail"
-record() { RESULTS+=("$1|$2|$3|$4|$5"); echo "  -> $1 $2: $3 ${4:+($4)} $5"; }
+record() {
+  RESULTS+=("$1|$2|$3|$4|$5"); echo "  -> $1 $2: $3 ${4:+($4)} $5"
+  # On failure, surface the row log in Actions (and keep it for the artifact).
+  case "$3" in
+    FAIL|FAIL-soft)
+      if [ -n "${LOG:-}" ] && [ "$LOG" != /dev/null ] && [ -f "$LOG" ]; then
+        echo "::group::$1 $2 row log (last 200 lines)"
+        tail -n 200 "$LOG" || true
+        echo "::endgroup::"
+      fi
+      ;;
+  esac
+}
 
 # Runs a command, or prints it in --dry-run. Output goes to the row log.
 LOG=/dev/null
@@ -147,7 +159,14 @@ x() {
 }
 
 cleanup() {
-  if [ "$KEEP" = 0 ] && [ "$DRY" = 0 ] && [ -d "$RUN" ]; then rm -rf "$RUN"; fi
+  if [ "$KEEP" = 0 ] && [ "$DRY" = 0 ] && [ -d "$RUN" ]; then
+    # On failure leave *.log for the workflow's upload-artifact step; drop sandboxes.
+    if [ "${fails:-0}" -gt 0 ]; then
+      find "$RUN" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+    else
+      rm -rf "$RUN"
+    fi
+  fi
 }
 trap cleanup EXIT
 
@@ -364,10 +383,92 @@ row_autoupdate_local() {
   drop_sandbox
 }
 
+# Pre-release row: force the regex / PyPI-JSON version path by blocking `packaging`
+# inside the candidate venv (sitecustomize). The test-wheel hook is NOT set, so
+# latest_version goes through pick_version(JSON) instead of the wheel file name.
+# On 0.0.14 this printed _RegexVersion(...) and never updated; 0.0.15+ must pass.
+row_autoupdate_fallback_nopkg() {
+  local py bin site ver notice
+  [ -n "$AU_WHEEL" ] || return 0
+  new_sandbox pip "autoupdate-fallback"
+  py="$SB/venv/bin/python"; bin="$SB/venv/bin/llm-speed"
+  if ! { x "$PYTHON" -m venv "$SB/venv" && sx "$py" -m pip install --find-links "$(dirname "$AU_WHEEL")" "$PKG"; }; then
+    record pip "autoupdate-fallback" FAIL "" "could not install the candidate wheel (log $LOG)"; drop_sandbox; return
+  fi
+  if [ "$DRY" = 0 ]; then
+    ver="$(meta_version "$py")"
+    [ "$ver" = "$NEW" ] || { record pip "autoupdate-fallback" FAIL "${ver:-?}" "candidate is not $NEW (log $LOG)"; drop_sandbox; return; }
+  fi
+  # Block packaging for every interpreter started from this venv.
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry-run] plant sitecustomize that raises on import packaging"
+    echo "  [dry-run] $py -c 'pick_version(PyPI JSON) with packaging blocked'"
+    echo "  [dry-run] $bin update --check   (must not print _RegexVersion)"
+    record pip "autoupdate-fallback" DRY-RUN "" "not run"
+    drop_sandbox
+    return
+  fi
+  site="$("$py" -c 'import site; print(site.getsitepackages()[0])')"
+  # Remove the installed packaging package, then plant a blocker module so
+  # `import packaging` fails before any finder can load the real one.
+  x "$py" -m pip uninstall -y packaging || true
+  rm -rf "$site"/packaging "$site"/packaging-*.dist-info "$site"/packaging-*.egg-info
+  mkdir -p "$site/packaging"
+  cat >"$site/packaging/__init__.py" <<'SC'
+# installer-gate: force cli.autoupdate's regex fallback (no packaging).
+raise ImportError("installer-gate: packaging blocked")
+SC
+  cat >"$site/sitecustomize.py" <<'SC'
+# Belt-and-suspenders: also refuse packaging via meta_path.
+import sys
+class _NoPackaging:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "packaging" or fullname.startswith("packaging."):
+            raise ImportError("installer-gate: packaging blocked")
+        return None
+sys.meta_path.insert(0, _NoPackaging())
+SC
+  # Prove we are on the JSON / regex path (would fail on 0.0.14's _RegexVersion repr).
+  if ! x "$py" - <<'PY'
+import json, urllib.request
+from cli import autoupdate as au
+try:
+    import packaging.version  # noqa: F401
+    raise SystemExit("packaging still importable")
+except ImportError:
+    pass
+assert isinstance(au.parse_version("0.0.15"), au._RegexVersion)
+data = json.load(urllib.request.urlopen("https://pypi.org/pypi/llm-speed/json", timeout=30))
+v = au.pick_version(data, prereleases=False)
+assert isinstance(v, str) and v and "_RegexVersion" not in v, repr(v)
+assert au.parse_version(v) is not None
+assert str(au.parse_version(v)) == v
+print("fallback-ok", v)
+PY
+  then
+    record pip "autoupdate-fallback" FAIL "" "forced packaging-fallback check failed (log $LOG)"
+    drop_sandbox; return
+  fi
+  # update --check must also print a plain version (hits latest_version -> pick_version).
+  notice="$(HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" XDG_DATA_HOME="$SB/data" \
+    "$bin" update --check 2>&1)" || true
+  echo "update --check: $notice" >>"$LOG"
+  if printf '%s\n' "$notice" | grep -q '_RegexVersion'; then
+    record pip "autoupdate-fallback" FAIL "" "update --check still prints _RegexVersion (log $LOG)"
+    drop_sandbox; return
+  fi
+  record pip "autoupdate-fallback" PASS "${NEW}" "packaging blocked; JSON/regex path ok"
+  drop_sandbox
+}
+
 row_pip() {
   local scen="$1" na
   if [ "$scen" = autoupdate ]; then
-    if [ -n "$AU_WHEEL" ]; then row_autoupdate_local pip; return; fi
+    if [ -n "$AU_WHEEL" ]; then
+      row_autoupdate_local pip
+      row_autoupdate_fallback_nopkg
+      return
+    fi
     na="$(au_na)"; [ -z "$na" ] || { record pip "$scen" N/A "" "$na"; return; }
   fi
   new_sandbox pip "$scen"
@@ -459,12 +560,14 @@ BREW_TAPPED_BY_US=0
 gate_formula() {
   local ver="$1" whl="$2" wh="$3" pv="$4" sha
   sha="$("$PYTHON" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$whl")"
+  # using: :nounzip: a .whl is a zip; without it brew unpacks the wheel as source.
+  # find-links $wh must be under HOMEBREW_CACHE (readable in the macOS sandbox).
   cat <<RB
 # installer-gate test formula: local tap $GATE_TAP only, never published
 class LlmSpeed < Formula
   desc "llm-speed installer-gate test build (local tap, never published)"
   homepage "https://llm-speed.com"
-  url "file://$whl"
+  url "file://$whl", using: :nounzip
   version "$ver"
   sha256 "$sha"
   license "Apache-2.0"
@@ -493,8 +596,12 @@ row_brew_autoupdate_local() {
     record brew autoupdate SKIP "" "$PKG already installed in this brew; not touching it"; return
   fi
   new_sandbox brew autoupdate
+  # HOMEBREW_CACHE: the gate formula's --find-links path must live here so the
+  # macOS sandbox-exec (0.0.15 job: brew install failed in ~24s; Linux passed)
+  # can read the wheelhouse during `def install`. using: :nounzip is set in
+  # gate_formula. NO_INSTALL_FROM_API: force the local tap formula, not the API.
   export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ANALYTICS=1 \
-    HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_CACHE="$SB/cache/brew"
+    HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_FROM_API=1 HOMEBREW_CACHE="$SB/cache/brew"
   prefix="$(brew --prefix 2>/dev/null || echo "<brew prefix>")"
   pv=3.12
   if [ "$DRY" = 0 ]; then
@@ -504,7 +611,8 @@ row_brew_autoupdate_local() {
     [ -n "$pv" ] || { record brew autoupdate FAIL "" "no Homebrew python@3.x (log $LOG)"; drop_sandbox; return; }
   fi
   brew_py="$prefix/opt/python@$pv/bin/python$pv"
-  wh="$SB/wheelhouse"
+  # Under HOMEBREW_CACHE so macOS sandbox can read it in `brew install`.
+  wh="$HOMEBREW_CACHE/llm-speed-gate-wheels"
   [ "$DRY" = 1 ] || mkdir -p "$wh"
   x "$PYTHON" "$HERE/make-update-test-wheel.py" "$AU_WHEEL" "$wh" ||
     { record brew autoupdate FAIL "" "could not make the $BUMP test wheel (log $LOG)"; drop_sandbox; return; }
@@ -516,7 +624,8 @@ row_brew_autoupdate_local() {
   taprepo="$(brew --repository "$GATE_TAP" 2>/dev/null || echo "<gate tap>")"
   if [ "$DRY" = 1 ]; then echo "  [dry-run] write $taprepo/Formula/$PKG.rb ($NEW, $AU_WHEEL)"
   else gate_formula "$NEW" "$wh/$(basename "$AU_WHEEL")" "$wh" "$pv" >"$taprepo/Formula/$PKG.rb"; fi
-  if ! x brew install "$GATE_TAP/$PKG"; then
+  # --verbose --debug: capture brew's real error in the row log (0.0.15 deleted it).
+  if ! x brew install --verbose --debug "$GATE_TAP/$PKG"; then
     record brew autoupdate FAIL "" "brew install of the candidate failed (log $LOG)"
     x brew untap "$GATE_TAP"; drop_sandbox; return
   fi

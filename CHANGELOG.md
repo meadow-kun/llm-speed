@@ -1,5 +1,13 @@
 # CLI changelog
 
+## 0.0.16 — 2026-11-05
+
+- **`packaging` is a runtime dependency (`packaging>=23`).** Auto-update prefers `packaging.version`; the ASCII-only regex fallback remains for installs that somehow lack it, and the installer gate has a pip row that blocks `packaging` to keep that path honest.
+- **Security Desk R-142 (Info): version regex is ASCII-only.** `_VER_RE` compiles with `re.ASCII` so fullwidth / Arabic-Indic digits never parse as a release version.
+- **Security Desk R-141 (Info): in-use markers are `<pid>-<token>`.** Created with `O_EXCL|O_NOFOLLOW`; `busy_pids` still accepts bare `<pid>` files from 0.0.14/0.0.15. The replace-stale-same-PID step is gone. Permanent `open` errors (`ELOOP`, `EACCES`, `EROFS`, `ENOTDIR`) abort immediately instead of spinning for about a second.
+- **Installer gate:** row logs are kept on failure and printed (last 200 lines) inside a `::group::`; the mirror workflow uploads them with `actions/upload-artifact` when the job fails. The wheel build copies the tree with `symlinks=True`. A new `pip autoupdate-fallback` row blocks `packaging` via `sitecustomize` and asserts the PyPI JSON / regex path (not the wheel file name).
+- **macOS brew auto-update row:** the local tap formula's wheelhouse now lives under `HOMEBREW_CACHE` (readable in the macOS sandbox) and the `file://` wheel URL uses `using: :nounzip`; `brew install` runs with `--verbose --debug` so a failure keeps the real brew error in the row log. (0.0.15 failed only on macOS; Linux passed.)
+
 ## 0.0.15 — 2026-11-01
 
 - **Upgrade note:** Machines on 0.0.14 need one manual upgrade to 0.0.15 (`pipx upgrade llm-speed`, `uv tool upgrade llm-speed`, `brew upgrade meadow-kun/tap/llm-speed` or `pip install -U llm-speed`); after that, auto-update keeps them current.
