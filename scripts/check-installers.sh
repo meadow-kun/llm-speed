@@ -388,7 +388,7 @@ row_autoupdate_local() {
 # latest_version goes through pick_version(JSON) instead of the wheel file name.
 # On 0.0.14 this printed _RegexVersion(...) and never updated; 0.0.15+ must pass.
 row_autoupdate_fallback_nopkg() {
-  local py bin site ver notice
+  local py bin site ver notice rc
   [ -n "$AU_WHEEL" ] || return 0
   new_sandbox pip "autoupdate-fallback"
   py="$SB/venv/bin/python"; bin="$SB/venv/bin/llm-speed"
@@ -429,7 +429,9 @@ class _NoPackaging:
 sys.meta_path.insert(0, _NoPackaging())
 SC
   # Prove we are on the JSON / regex path (would fail on 0.0.14's _RegexVersion repr).
-  if ! x "$py" - <<'PY'
+  # R-144: -I from inside $SB, so neither the checkout nor PYTHONPATH can shadow
+  # the installed candidate.
+  if ! (cd "$SB" && x "$py" -I - <<'PY'
 import json, urllib.request
 from cli import autoupdate as au
 try:
@@ -445,14 +447,24 @@ assert au.parse_version(v) is not None
 assert str(au.parse_version(v)) == v
 print("fallback-ok", v)
 PY
-  then
+  ); then
     record pip "autoupdate-fallback" FAIL "" "forced packaging-fallback check failed (log $LOG)"
     drop_sandbox; return
   fi
   # update --check must also print a plain version (hits latest_version -> pick_version).
-  notice="$(HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" XDG_DATA_HOME="$SB/data" \
-    "$bin" update --check 2>&1)" || true
-  echo "update --check: $notice" >>"$LOG"
+  # R-144: it must exit 0 and print a plain version.
+  rc=0
+  notice="$(cd "$SB" && HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" XDG_DATA_HOME="$SB/data" \
+    "$bin" update --check 2>&1)" || rc=$?
+  echo "update --check (exit $rc): $notice" >>"$LOG"
+  if [ "$rc" != 0 ]; then
+    record pip "autoupdate-fallback" FAIL "" "update --check exited $rc (log $LOG)"
+    drop_sandbox; return
+  fi
+  if ! printf '%s\n' "$notice" | grep -Eq '[0-9]+\.[0-9]+\.[0-9]+'; then
+    record pip "autoupdate-fallback" FAIL "" "update --check printed no version (log $LOG)"
+    drop_sandbox; return
+  fi
   if printf '%s\n' "$notice" | grep -q '_RegexVersion'; then
     record pip "autoupdate-fallback" FAIL "" "update --check still prints _RegexVersion (log $LOG)"
     drop_sandbox; return
@@ -586,6 +598,31 @@ RB
 real_path() { if [ -e "$1" ]; then "$PYTHON" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; else printf '%s\n' "$1"; fi; }
 
 GATE_TAP="llm-speed-gate/local"
+MAIN_TAP_HIDDEN=0
+# The bare name `llm-speed` must resolve to one tap only: with $TAP also tapped,
+# brew's macOS linkage fix-up raises TapFormulaAmbiguityError (0.0.16 gate run
+# 41983786741). Untap $TAP for this row; brew_au_done re-taps it if it was there
+# before the gate. Renaming the gate formula would change the keg/opt path the
+# updater and verify() check, so the row would no longer test the real layout.
+brew_hide_main_tap() {
+  [ "$DRY" = 0 ] || { echo "  [dry-run] brew untap $TAP (if tapped; re-tapped after the row)"; return 0; }
+  brew tap | grep -qx "$TAP" || return 0
+  x brew untap "$TAP" || return 1
+  if [ "$BREW_TAPPED_BY_US" = 1 ]; then BREW_TAPPED_BY_US=0; else MAIN_TAP_HIDDEN=1; fi
+}
+# Cleanup for every exit of the local-tap row: force-remove a (half-)installed
+# gate keg first (a plain untap refuses while it is installed), untap the gate
+# tap, re-tap $TAP if we hid it, and drop the row-only env so later rows and
+# the summary run with brew's defaults.
+brew_au_done() {
+  if [ "$DRY" = 1 ] || brew list --formula "$GATE_TAP/$PKG" >/dev/null 2>&1; then
+    x brew uninstall --force "$GATE_TAP/$PKG" || true
+  fi
+  x brew untap "$GATE_TAP" || true
+  if [ "$MAIN_TAP_HIDDEN" = 1 ]; then x brew tap "$TAP" || true; MAIN_TAP_HIDDEN=0; fi
+  unset HOMEBREW_NO_INSTALL_FROM_API
+  drop_sandbox
+}
 # Pre-release brew autoupdate row: a local tap (`brew tap-new --no-git`, never
 # meadow-kun/tap) whose formula installs the candidate wheel, then is switched
 # to NEW.post1; the background updater must run `brew upgrade` to it.
@@ -608,26 +645,27 @@ row_brew_autoupdate_local() {
     pv=""
     for v in 3.13 3.12 3.11; do [ -x "$prefix/opt/python@$v/bin/python$v" ] && { pv="$v"; break; }; done
     if [ -z "$pv" ]; then x brew install python@3.12 && pv=3.12; fi
-    [ -n "$pv" ] || { record brew autoupdate FAIL "" "no Homebrew python@3.x (log $LOG)"; drop_sandbox; return; }
+    [ -n "$pv" ] || { record brew autoupdate FAIL "" "no Homebrew python@3.x (log $LOG)"; brew_au_done; return; }
   fi
   brew_py="$prefix/opt/python@$pv/bin/python$pv"
   # Under HOMEBREW_CACHE so macOS sandbox can read it in `brew install`.
   wh="$HOMEBREW_CACHE/llm-speed-gate-wheels"
   [ "$DRY" = 1 ] || mkdir -p "$wh"
   x "$PYTHON" "$HERE/make-update-test-wheel.py" "$AU_WHEEL" "$wh" ||
-    { record brew autoupdate FAIL "" "could not make the $BUMP test wheel (log $LOG)"; drop_sandbox; return; }
+    { record brew autoupdate FAIL "" "could not make the $BUMP test wheel (log $LOG)"; brew_au_done; return; }
   bump="$wh/llm_speed-$BUMP-py3-none-any.whl"
   if ! { x cp "$AU_WHEEL" "$wh/" && x "$brew_py" -m pip download -q --only-binary=:all: -d "$wh" "$AU_WHEEL"; }; then
-    record brew autoupdate FAIL "" "could not fetch dependency wheels (log $LOG)"; drop_sandbox; return
+    record brew autoupdate FAIL "" "could not fetch dependency wheels (log $LOG)"; brew_au_done; return
   fi
-  x brew tap-new --no-git "$GATE_TAP" || { record brew autoupdate FAIL "" "brew tap-new failed (log $LOG)"; drop_sandbox; return; }
+  brew_hide_main_tap || { record brew autoupdate FAIL "" "could not untap $TAP (bare-name ambiguity) (log $LOG)"; brew_au_done; return; }
+  x brew tap-new --no-git "$GATE_TAP" || { record brew autoupdate FAIL "" "brew tap-new failed (log $LOG)"; brew_au_done; return; }
   taprepo="$(brew --repository "$GATE_TAP" 2>/dev/null || echo "<gate tap>")"
   if [ "$DRY" = 1 ]; then echo "  [dry-run] write $taprepo/Formula/$PKG.rb ($NEW, $AU_WHEEL)"
   else gate_formula "$NEW" "$wh/$(basename "$AU_WHEEL")" "$wh" "$pv" >"$taprepo/Formula/$PKG.rb"; fi
   # --verbose --debug: capture brew's real error in the row log (0.0.15 deleted it).
   if ! x brew install --verbose --debug "$GATE_TAP/$PKG"; then
     record brew autoupdate FAIL "" "brew install of the candidate failed (log $LOG)"
-    x brew untap "$GATE_TAP"; drop_sandbox; return
+    brew_au_done; return
   fi
   if [ "$DRY" = 0 ]; then
     ver="$("$prefix/bin/llm-speed" --version 2>/dev/null | sed -n 's/^llm-speed[[:space:]]\{1,\}//p')"
@@ -651,14 +689,13 @@ row_brew_autoupdate_local() {
     echo "notice: $notice" >>"$LOG"
     if ! printf '%s\n' "$notice" | grep -qx "Updated llm-speed $NEW -> $BUMP"; then
       record brew autoupdate FAIL "${ver:-?}" "no one-time 'Updated llm-speed $NEW -> $BUMP' notice (log $LOG)"
-      brew_rm "$GATE_TAP/$PKG"; x brew untap "$GATE_TAP"; drop_sandbox; return
+      brew_rm "$GATE_TAP/$PKG"; brew_au_done; return
     fi
   fi
   WANT="$BUMP"
   verify brew "autoupdate (local tap)" "$prefix/bin/llm-speed" "$prefix/opt/$PKG/libexec/bin/python"
   brew_rm "$GATE_TAP/$PKG"
-  x brew untap "$GATE_TAP"
-  drop_sandbox
+  brew_au_done
 }
 
 row_brew() {

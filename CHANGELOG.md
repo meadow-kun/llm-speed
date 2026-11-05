@@ -1,5 +1,13 @@
 # CLI changelog
 
+## 0.0.17 — unreleased
+
+- **Security Desk R-143 (Info): stricter in-use marker names.** `_marker_pid` accepts only `re.fullmatch(r"([0-9]{1,10})(?:-[0-9a-f]{16})?", name, re.ASCII)` (bare `<pid>` from 0.0.14/0.0.15 or `<pid>-<token_hex(8)>`); `_pid_alive` treats an out-of-range PID (`OverflowError` / `ValueError`) as not alive instead of raising.
+- **Installer gate, macOS brew auto-update row (0.0.16 gate run 41983786741):** brew's macOS linkage fix-up looked up the bare name `llm-speed`, which existed in both `meadow-kun/tap` and the local gate tap, and raised `TapFormulaAmbiguityError`; cleanup then could not untap the gate tap because the half-installed keg was left behind. The row now untaps `meadow-kun/tap` for its duration (re-tapping it afterwards only if it was there before the gate), and every exit runs `brew uninstall --force llm-speed-gate/local/llm-speed` before untapping. `HOMEBREW_NO_INSTALL_FROM_API` is unset after the row (KFM-037).
+- **Installer gate, Windows:** `check-installers.ps1` gains the `pip autoupdate-fallback` row (packaging blocked), matching the shell gate.
+- **Security Desk R-144 (Info):** the fallback row's inline python runs with `-I` from inside the row sandbox, and `update --check` must exit 0 and print a version (shell and PowerShell).
+- **Tests:** the mirror workflow's `installers` job must never reference `secrets.` or `GITHUB_TOKEN` (its row logs are public artifacts).
+
 ## 0.0.16 — 2026-11-05
 
 - **`packaging` is a runtime dependency (`packaging>=23`).** Auto-update prefers `packaging.version`; the ASCII-only regex fallback remains for installs that somehow lack it, and the installer gate has a pip row that blocks `packaging` to keep that path honest.

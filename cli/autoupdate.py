@@ -775,13 +775,11 @@ class InUse:
 
 
 def _marker_pid(name: str) -> int | None:
-    """PID from a marker filename: bare <pid> (0.0.14/0.0.15) or <pid>-<token> (R-141)."""
-    if name.isdigit():
-        return int(name)
-    prefix, sep, rest = name.partition("-")
-    if not sep or not prefix.isdigit() or not rest:
-        return None
-    return int(prefix)
+    """PID from a marker filename: bare <pid> (0.0.14/0.0.15) or <pid>-<token_hex(8)>
+    (R-141). R-143: ASCII digits only, at most 10 of them, and the token must be exactly
+    16 lowercase hex digits; anything else is not a marker."""
+    m = re.fullmatch(r"([0-9]{1,10})(?:-[0-9a-f]{16})?", name, re.ASCII)
+    return int(m.group(1)) if m else None
 
 
 def busy_pids(ignore: tuple[int, ...] = (), directory: Path | None = None) -> list[int]:
@@ -1102,6 +1100,8 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    except (OverflowError, ValueError):  # R-143: PID out of range for this OS
+        return False
     return True
 
 

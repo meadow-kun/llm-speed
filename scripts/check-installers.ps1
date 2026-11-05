@@ -319,12 +319,91 @@ function Invoke-AutoUpdateLocal($inst) {
   } finally { Exit-Sandbox }
 }
 
+# Pre-release row (mirrors check-installers.sh row_autoupdate_fallback_nopkg):
+# block `packaging` in the candidate venv so cli.autoupdate takes the regex /
+# PyPI-JSON path. On 0.0.14 that path printed _RegexVersion(...) and never updated.
+# R-144: the inline python runs -I from inside the sandbox, and `update --check`
+# must exit 0 and print a version.
+$FallbackPy = @'
+import json, urllib.request
+from cli import autoupdate as au
+try:
+    import packaging.version  # noqa: F401
+    raise SystemExit("packaging still importable")
+except ImportError:
+    pass
+assert isinstance(au.parse_version("0.0.15"), au._RegexVersion)
+data = json.load(urllib.request.urlopen("https://pypi.org/pypi/llm-speed/json", timeout=30))
+v = au.pick_version(data, prereleases=False)
+assert isinstance(v, str) and v and "_RegexVersion" not in v, repr(v)
+assert au.parse_version(v) is not None
+assert str(au.parse_version(v)) == v
+print("fallback-ok", v)
+'@
+$BlockerInit = @'
+# installer-gate: force cli.autoupdate's regex fallback (no packaging).
+raise ImportError("installer-gate: packaging blocked")
+'@
+$BlockerSite = @'
+# Belt-and-suspenders: also refuse packaging via meta_path.
+import sys
+class _NoPackaging:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "packaging" or fullname.startswith("packaging."):
+            raise ImportError("installer-gate: packaging blocked")
+        return None
+sys.meta_path.insert(0, _NoPackaging())
+'@
+function Invoke-AutoUpdateFallback {
+  $scen = 'autoupdate-fallback'
+  Enter-Sandbox pip $scen
+  $sb = $script:SB
+  try {
+    $dir = Split-Path -Parent $AutoUpdateWheel
+    $py = "$sb/venv/$BinSub/python$Exe"; $bin = "$sb/venv/$BinSub/llm-speed$Exe"
+    if (-not ((X $Python -m venv "$sb/venv") -and (X $py -m pip install --find-links $dir $Pkg))) {
+      Add-Result pip $scen 'FAIL' '' "could not install the candidate wheel (log $script:Log)"; return
+    }
+    if ($DryRun) {
+      Write-Host "  [dry-run] plant packaging blocker + sitecustomize in $sb/venv"
+      Write-Host "  [dry-run] (cd $sb) $py -I -   (pick_version(PyPI JSON) with packaging blocked)"
+      Write-Host "  [dry-run] (cd $sb) $bin update --check   (exit 0, prints a version, no _RegexVersion)"
+      Add-Result pip $scen 'DRY-RUN' '' 'not run'; return
+    }
+    $m = Get-MetaVersion $py
+    if ($m -ne $New) { Add-Result pip $scen 'FAIL' $m "candidate is not $New (log $script:Log)"; return }
+    Push-Location $sb
+    try { $site = (& $py -I -c 'import site; print(site.getsitepackages()[-1])' | Out-String).Trim() } finally { Pop-Location }
+    X $py -m pip uninstall -y packaging | Out-Null
+    Get-ChildItem -Path $site -Filter 'packaging*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+    New-Item -ItemType Directory -Force -Path (Join-Path $site 'packaging') | Out-Null
+    Set-Content -Path (Join-Path (Join-Path $site 'packaging') '__init__.py') -Value $BlockerInit
+    Set-Content -Path (Join-Path $site 'sitecustomize.py') -Value $BlockerSite
+    $pyFile = Join-Path $sb 'fallback-check.py'
+    Set-Content -Path $pyFile -Value $FallbackPy
+    Push-Location $sb
+    try { $ok = X $py -I $pyFile } finally { Pop-Location }
+    if (-not $ok) { Add-Result pip $scen 'FAIL' '' "forced packaging-fallback check failed (log $script:Log)"; return }
+    Push-Location $sb
+    try { $notice = (& $bin update --check 2>&1 | Out-String); $rc = $LASTEXITCODE } finally { Pop-Location }
+    Add-Content -Path $script:Log -Value "update --check (exit $rc): $notice"
+    if ($rc -ne 0) { Add-Result pip $scen 'FAIL' '' "update --check exited $rc (log $script:Log)"; return }
+    if ($notice -match '_RegexVersion') { Add-Result pip $scen 'FAIL' '' "update --check still prints _RegexVersion (log $script:Log)"; return }
+    if ($notice -notmatch '\d+\.\d+\.\d+') { Add-Result pip $scen 'FAIL' '' "update --check printed no version (log $script:Log)"; return }
+    Add-Result pip $scen 'PASS' $New 'packaging blocked; JSON/regex path ok'
+  } finally { Exit-Sandbox }
+}
+
 function Invoke-Row($inst, $scen) {
   if ($inst -ne 'pip' -and -not (Get-Command $inst -ErrorAction SilentlyContinue)) {
     Add-Result $inst $scen 'SKIP' '' "$inst not installed (try -BootstrapTools)"; return
   }
   if ($scen -eq 'autoupdate') {
-    if ($AutoUpdateWheel) { Invoke-AutoUpdateLocal $inst; return }
+    if ($AutoUpdateWheel) {
+      Invoke-AutoUpdateLocal $inst
+      if ($inst -eq 'pip') { Invoke-AutoUpdateFallback }
+      return
+    }
     $na = Get-AutoUpdateNA
     if ($na) { Add-Result $inst $scen 'N/A' '' $na; return }
   }
