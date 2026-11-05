@@ -334,6 +334,27 @@ r=subprocess.run(sys.argv[1:],stdin=subprocess.DEVNULL,stdout=s,stderr=subproces
 os.close(s); os.close(m)
 sys.stdout.write(r.stderr.decode("utf-8","replace")); sys.exit(r.returncode)' "$@"
 }
+# Waits (up to 120s) until the background updater has recorded its result in
+# the sandbox's update cache. The version flips before that: brew switches the
+# opt link mid-`brew upgrade` and only then finishes (linkage check, summary);
+# the updater writes the one-time notice after the installer exits and the
+# version reads back. Asking for the notice in between raced it (0.0.17 gate
+# run 41996688182: brew "notice: " empty on Linux and macOS; KFM-038).
+wait_update_recorded() {
+  local cache="$SB/home/.config/llm-speed/update-check.json" j res=""
+  if [ "$DRY" = 1 ]; then echo "  [dry-run] wait up to 120s for $cache last_result=updated"; return 0; fi
+  for j in $(seq 1 60); do
+    res="$("$PYTHON" -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+print(d.get("last_result",""), "notice" if isinstance(d.get("notice"),dict) else "-")' "$cache" 2>/dev/null)"
+    [ "$res" = "updated notice" ] && break
+    sleep 2
+  done
+  echo "update cache after ${j}x2s: ${res:-missing}" >>"$LOG"
+  [ "$res" = "updated notice" ]
+}
+
 # Pre-release autoupdate row with the local candidate wheel. $1=installer
 row_autoupdate_local() {
   local inst="$1" py bin bump dir ver i notice
@@ -360,6 +381,7 @@ row_autoupdate_local() {
   LLM_SPEED_UPDATE_TEST=1 LLM_SPEED_UPDATE_TEST_WHEEL="file://$(real_path "$bump")" sx tty_run "$bin" about
   if [ "$DRY" = 1 ]; then
     echo "  [dry-run] wait up to 300s for $bin --version to print $PKG $BUMP"
+    wait_update_recorded
   else
     for i in $(seq 1 150); do
       ver="$(HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" "$bin" --version 2>/dev/null | sed -n 's/^llm-speed[[:space:]]\{1,\}//p')"
@@ -367,6 +389,7 @@ row_autoupdate_local() {
       sleep 2
     done
     echo "background update after ${i}x2s: ${ver:-?}" >>"$LOG"
+    wait_update_recorded || echo "warning: updater result not recorded yet" >>"$LOG"
   fi
   # The next run prints the one-time notice; the run after it doesn't.
   if [ "$DRY" = 1 ]; then
@@ -473,12 +496,23 @@ PY
   drop_sandbox
 }
 
+# A row that returns (or aborts) without calling record is a FAIL, never a
+# silent pass (0.0.17 Windows: the fallback row vanished and the job passed).
+guarded() {
+  local inst="$1" scen="$2" n; shift 2
+  n=${#RESULTS[@]}
+  "$@"
+  if [ "${#RESULTS[@]}" -eq "$n" ]; then
+    record "$inst" "$scen" FAIL "" "row ended without a result (log ${LOG:-?})"
+  fi
+}
+
 row_pip() {
   local scen="$1" na
   if [ "$scen" = autoupdate ]; then
     if [ -n "$AU_WHEEL" ]; then
-      row_autoupdate_local pip
-      row_autoupdate_fallback_nopkg
+      guarded pip autoupdate row_autoupdate_local pip
+      guarded pip autoupdate-fallback row_autoupdate_fallback_nopkg
       return
     fi
     na="$(au_na)"; [ -z "$na" ] || { record pip "$scen" N/A "" "$na"; return; }
@@ -677,6 +711,7 @@ row_brew_autoupdate_local() {
   LLM_SPEED_UPDATE_TEST=1 LLM_SPEED_UPDATE_TEST_WHEEL="file://$(real_path "$bump")" sx tty_run "$prefix/bin/llm-speed" about
   if [ "$DRY" = 1 ]; then
     echo "  [dry-run] wait up to 300s for $prefix/bin/llm-speed --version to print $PKG $BUMP"
+    wait_update_recorded
     echo "  [dry-run] tty_run $prefix/bin/llm-speed about   (must print 'Updated llm-speed $NEW -> $BUMP' once)"
   else
     for i in $(seq 1 150); do
@@ -685,6 +720,7 @@ row_brew_autoupdate_local() {
       sleep 2
     done
     echo "background update after ${i}x2s: ${ver:-?}" >>"$LOG"
+    wait_update_recorded || echo "warning: updater result not recorded yet" >>"$LOG"
     notice="$(HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" XDG_DATA_HOME="$SB/data" tty_run "$prefix/bin/llm-speed" about 2>&1)"
     echo "notice: $notice" >>"$LOG"
     if ! printf '%s\n' "$notice" | grep -qx "Updated llm-speed $NEW -> $BUMP"; then
@@ -767,7 +803,7 @@ row_brew() {
 for inst in $ONLY; do
   for scen in $SCENARIOS; do
     echo "== $inst $scen"
-    "row_$inst" "$scen"
+    guarded "$inst" "$scen" "row_$inst" "$scen"
   done
 done
 if [ "$BREW_TAPPED_BY_US" = 1 ]; then LOG=/dev/null; x brew untap "$TAP"; fi

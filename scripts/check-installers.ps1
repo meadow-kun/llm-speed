@@ -110,8 +110,13 @@ function Add-Result($inst, $scen, $status, $ver, $detail) {
 
 $script:Log = $null
 # Runs a native command (or prints it in -DryRun); output goes to the row log.
+# A plain function on purpose (no param block / [Parameter()]): an advanced
+# function binds native flags such as `-I` against PowerShell's common
+# parameters (-InformationAction/-InformationVariable) and throws "parameter
+# name 'I' is ambiguous" before the command runs (0.0.17 gate, KFM-039).
 function X {
-  param([string]$Cmd, [Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdArgs)
+  $Cmd = [string]$args[0]
+  $CmdArgs = @($args | Select-Object -Skip 1 | ForEach-Object { [string]$_ })
   if ($DryRun) { Write-Host "  [dry-run] $Cmd $($CmdArgs -join ' ')"; return $true }
   if ($script:Log) { Add-Content -Path $script:Log -Value "+ $Cmd $($CmdArgs -join ' ')" }
   $out = & $Cmd @CmdArgs 2>&1
@@ -400,8 +405,8 @@ function Invoke-Row($inst, $scen) {
   }
   if ($scen -eq 'autoupdate') {
     if ($AutoUpdateWheel) {
-      Invoke-AutoUpdateLocal $inst
-      if ($inst -eq 'pip') { Invoke-AutoUpdateFallback }
+      Invoke-Guarded $inst 'autoupdate' { Invoke-AutoUpdateLocal $inst }
+      if ($inst -eq 'pip') { Invoke-Guarded pip 'autoupdate-fallback' { Invoke-AutoUpdateFallback } }
       return
     }
     $na = Get-AutoUpdateNA
@@ -455,7 +460,20 @@ function Invoke-Row($inst, $scen) {
   } finally { Exit-Sandbox }
 }
 
-foreach ($inst in $Only) { foreach ($scen in $Scenarios) { Write-Host "== $inst $scen"; Invoke-Row $inst $scen } }
+# A row that throws or returns without Add-Result is a FAIL, never a silent
+# pass (0.0.17: the fallback row aborted on a binding error and the job passed).
+function Invoke-Guarded($inst, $scen, [scriptblock]$Body) {
+  $n = $Results.Count
+  try { & $Body }
+  catch { Add-Result $inst $scen 'FAIL' '' "row aborted: $($_.Exception.Message) (log $script:Log)" }
+  if ($Results.Count -eq $n) { Add-Result $inst $scen 'FAIL' '' "row ended without a result (log $script:Log)" }
+}
+foreach ($inst in $Only) {
+  foreach ($scen in $Scenarios) {
+    Write-Host "== $inst $scen"
+    Invoke-Guarded $inst $scen { Invoke-Row $inst $scen }
+  }
+}
 
 Write-Host ''
 $Results | Format-Table -AutoSize Installer, Scenario, Status, Version, Detail | Out-String -Width 200 | Write-Host

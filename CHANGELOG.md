@@ -1,6 +1,14 @@
 # CLI changelog
 
-## 0.0.17 — unreleased
+## 0.0.18 — unreleased
+
+- **Installer gate, brew auto-update row (0.0.17 gate run 41996688182, Linux and macOS):** the update to `.post1` happened but the gate asked for the one-time notice too early. Brew switches the `opt/llm-speed` link partway through `brew upgrade`, so `--version` already reported the new version while the background updater was still waiting for brew to exit, reading the version back, and writing the notice. The pip/pipx/uv autoupdate rows and the brew row now wait (up to 120 s) for the sandbox's `update-check.json` to record `last_result: updated` with a notice before running `llm-speed about` (KFM-038). This was a gate race, not a CLI bug; a CLI test pins that a command run during an in-flight update doesn't drop the notice.
+- **Installer gate, Windows (KFM-039):** `check-installers.ps1`'s `X` helper is now a plain function. As an advanced function it bound `-I` against PowerShell's common parameters and threw "the parameter name 'I' is ambiguous" (-InformationAction/-InformationVariable), which aborted the `pip autoupdate-fallback` row without any result. The job still passed.
+- **Installer gate, both scripts:** each row runs inside a guard; a row that throws or ends without recording a result is now a FAIL ("row aborted" / "row ended without a result").
+- **Security Desk R-145 (Info):** the no-secrets test also checks the raw mirror workflow text, so a workflow-level `env:` using `secrets.` is caught.
+- **Tests:** `test_brew_restart_uses_the_opt_link` no longer depends on the interpreter being named `python` (check.sh runs `python3`).
+
+## 0.0.17 — 2026-11-05
 
 - **Security Desk R-143 (Info): stricter in-use marker names.** `_marker_pid` accepts only `re.fullmatch(r"([0-9]{1,10})(?:-[0-9a-f]{16})?", name, re.ASCII)` (bare `<pid>` from 0.0.14/0.0.15 or `<pid>-<token_hex(8)>`); `_pid_alive` treats an out-of-range PID (`OverflowError` / `ValueError`) as not alive instead of raising.
 - **Installer gate, macOS brew auto-update row (0.0.16 gate run 41983786741):** brew's macOS linkage fix-up looked up the bare name `llm-speed`, which existed in both `meadow-kun/tap` and the local gate tap, and raised `TapFormulaAmbiguityError`; cleanup then could not untap the gate tap because the half-installed keg was left behind. The row now untaps `meadow-kun/tap` for its duration (re-tapping it afterwards only if it was there before the gate), and every exit runs `brew uninstall --force llm-speed-gate/local/llm-speed` before untapping. `HOMEBREW_NO_INSTALL_FROM_API` is unset after the row (KFM-037).
