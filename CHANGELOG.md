@@ -1,6 +1,10 @@
 # CLI changelog
 
-## 0.0.18 — unreleased
+## 0.0.19 — 2026-11-07
+
+- **Hotfix: allow `AtomicChat/Ripple-65B-Preview-GGUF` in the shared preset schema.** This is an exact, case-sensitive repository exception, not an allowlist entry for the AtomicChat organization. The Worker and CLI share this schema: a Worker-only fix would still leave 0.0.18 agents refusing the signed preset at signed-preset validation. Tests assert that this repository is accepted and a sibling repository, plus case variants, remain rejected. Both alternatives are grouped under one start anchor and an absolute end (Security R-150), so partial matches, prefixes, suffixes, extra path segments and trailing newlines are rejected without weakening the existing organization rules.
+
+## 0.0.18 — 2026-11-05
 
 - **Installer gate, brew auto-update row (0.0.17 gate run 41996688182, Linux and macOS):** the update to `.post1` happened but the gate asked for the one-time notice too early. Brew switches the `opt/llm-speed` link partway through `brew upgrade`, so `--version` already reported the new version while the background updater was still waiting for brew to exit, reading the version back, and writing the notice. The pip/pipx/uv autoupdate rows and the brew row now wait (up to 120 s) for the sandbox's `update-check.json` to record `last_result: updated` with a notice before running `llm-speed about` (KFM-038). This was a gate race, not a CLI bug; a CLI test pins that a command run during an in-flight update doesn't drop the notice.
 - **Installer gate, Windows (KFM-039):** `check-installers.ps1`'s `X` helper is now a plain function. As an advanced function it bound `-I` against PowerShell's common parameters and threw "the parameter name 'I' is ambiguous" (-InformationAction/-InformationVariable), which aborted the `pip autoupdate-fallback` row without any result. The job still passed.
