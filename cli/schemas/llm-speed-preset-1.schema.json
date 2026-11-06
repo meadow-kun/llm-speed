@@ -237,7 +237,7 @@
         "repo": {
           "type": "string",
           "maxLength": 120,
-          "pattern": "^(RecursiveSI|unsloth|ggml-org|bartowski|mlx-community|lmstudio-community|Qwen|meta-llama|mistralai|google|microsoft|deepseek-ai|nvidia|openai|ibm-granite|allenai|THUDM|zai-org|moonshotai|MiniMaxAI|LiquidAI|HuggingFaceTB)/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"
+          "pattern": "^((RecursiveSI|unsloth|ggml-org|bartowski|mlx-community|lmstudio-community|Qwen|meta-llama|mistralai|google|microsoft|deepseek-ai|nvidia|openai|ibm-granite|allenai|THUDM|zai-org|moonshotai|MiniMaxAI|LiquidAI|HuggingFaceTB)/[A-Za-z0-9][A-Za-z0-9._-]{0,95}|AtomicChat/Ripple-65B-Preview-GGUF)(?![\\s\\S])"
         },
         "revision": {
           "type": "string",
