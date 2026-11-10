@@ -217,6 +217,18 @@ def path_bytes(p: Path) -> int:
     return 0
 
 
+def _record_filename(entry: dict) -> str | None:
+    """Basename stored on a sweep row: the first shard of a split, else the file.
+    One name, never a path (fit_attempts.model_file). The full shard list is
+    recorded on the attempt's model_file info, not in this column."""
+    from cli.gguf_split import SplitSpecError, primary_basename
+
+    try:
+        return primary_basename(entry)
+    except (SplitSpecError, KeyError):
+        return entry.get("file") or entry.get("dir")
+
+
 def decode_jws_payload(artifact: Path) -> dict | None:
     """Read the CLI's signed artifact ({"jws": "<h>.<p>.<s>"}) without verifying."""
     try:
@@ -498,9 +510,32 @@ def expected_bytes(entry: dict) -> int | None:
     tree = hf_tree(entry["repo"], entry.get("revision", "main"))
     if entry.get("backend") == "mlx":
         return sum(x.get("size", 0) for x in tree) or None
+    from cli.gguf_split import (
+        SplitSpecError,
+        primary_basename,
+        shard_names_for_entry,
+        sum_tree_bytes,
+    )
+
+    try:
+        names = shard_names_for_entry(entry)
+    except SplitSpecError:
+        names = None
+    if names:
+        return sum_tree_bytes(names, tree)
+    try:
+        fname = primary_basename(entry)
+    except (SplitSpecError, KeyError):
+        fname = None
+    if not isinstance(fname, str) or not fname:
+        return None
     for x in tree:
-        if x["path"] == entry.get("file"):
-            return x.get("size")
+        path = str(x.get("path") or "")
+        if path == fname or path.rsplit("/", 1)[-1] == fname:
+            size = x.get("size")
+            return (
+                size if isinstance(size, int) and not isinstance(size, bool) else None
+            )
     return None
 
 
@@ -541,17 +576,55 @@ def hf_cache_hit(entry: dict) -> Path | None:
         ):
             return snap
         return None
-    f = snap / entry.get("file", "")
+    from cli.gguf_split import (
+        SplitSpecError,
+        on_disk_bytes,
+        primary_basename,
+        shard_names_for_entry,
+    )
+
+    try:
+        names = shard_names_for_entry(entry)
+    except SplitSpecError:
+        return None
+    if names:
+        # Every shard, under its real name (the snapshot symlink, not the blob).
+        if not all((snap / n).is_file() for n in names):
+            return None
+        first = snap / names[0]
+        have = on_disk_bytes(entry, first)
+        if exp is None or have >= exp:
+            return first
+        return None
+    try:
+        fname = primary_basename(entry)
+    except (SplitSpecError, KeyError):
+        return None
+    f = snap / fname
     if f.is_file() and (exp is None or f.stat().st_size >= exp):
         return f
     return None
+
+
+def _download_names(entry: dict) -> list[str]:
+    """GGUF basenames to fetch. A split set is every shard. A one-item ``files``
+    object contributes its ``file`` name, never ``str`` of the whole entry."""
+    from cli.gguf_split import SplitSpecError, primary_basename, shard_names_for_entry
+
+    try:
+        names = shard_names_for_entry(entry)
+    except SplitSpecError:
+        names = None
+    if names:
+        return names
+    return [primary_basename(entry)]
 
 
 def download_cmd(entry: dict, dest_dir: Path) -> list[str]:
     cli = _hf_cli() or ["hf", "download"]
     cmd = cli + [entry["repo"]]
     if entry.get("backend") != "mlx":
-        cmd.append(entry["file"])
+        cmd += _download_names(entry)
     cmd += ["--revision", entry.get("revision", "main"), "--local-dir", str(dest_dir)]
     return cmd
 
@@ -581,10 +654,29 @@ def stdlib_download(entry: dict, dest_dir: Path, *, progress=_progress) -> None:
     """Fallback download (no hf tooling). Resumes a partial file with an HTTP Range request
     and shows a progress bar. Writes to <file>.part and renames when complete."""
     rev = entry.get("revision", "main")
+    split = False
     if entry.get("backend") == "mlx":
         files = [(x["path"], x.get("size")) for x in hf_tree(entry["repo"], rev)]
     else:
-        files = [(entry["file"], entry.get("bytes"))]
+        names = _download_names(entry)
+        split = len(names) > 1
+        sizes: dict[str, int | None] = {}
+        if split:
+            # `entry["bytes"]` is the whole set. A per-shard resume needs each
+            # shard's own size; a missing size just downloads the file.
+            try:
+                for row in hf_tree(entry["repo"], rev):
+                    base = str(row.get("path") or "").rsplit("/", 1)[-1]
+                    size = row.get("size")
+                    if (
+                        base in names
+                        and isinstance(size, int)
+                        and not isinstance(size, bool)
+                    ):
+                        sizes[base] = size
+            except Exception:  # noqa: BLE001
+                sizes = {}
+        files = [(n, sizes.get(n) if split else entry.get("bytes")) for n in names]
     for rel, size in files:
         target = dest_dir / rel
         if target.exists() and (not size or target.stat().st_size >= size):
@@ -621,6 +713,10 @@ def stdlib_download(entry: dict, dest_dir: Path, *, progress=_progress) -> None:
                             done - have, (total - have) if total else None, t0, rel
                         )
         except urllib.error.HTTPError as e:
+            if e.code == 404 and split:
+                raise RuntimeError(
+                    f"split GGUF shard not found on Hugging Face: {Path(rel).name}"
+                ) from e
             if e.code != 416:  # 416 = the .part file is already complete
                 raise
         part.replace(target)
@@ -642,7 +738,8 @@ def download(entry: dict, dest_dir: Path) -> None:
         if entry.get("backend") == "mlx":
             huggingface_hub.snapshot_download(**kw)
         else:
-            huggingface_hub.hf_hub_download(filename=entry["file"], **kw)
+            for name in _download_names(entry):
+                huggingface_hub.hf_hub_download(filename=name, **kw)
         return
     if _hf_cli():
         rc = subprocess.run(download_cmd(entry, dest_dir)).returncode
@@ -771,10 +868,15 @@ class Sweep:
             return self._resolved[entry["id"]]
         if entry.get("backend") == "mlx":
             return self.mlx_dir / entry.get("dir", entry["repo"].split("/")[-1])
-        return self.models_dir / entry["file"]
+        from cli.gguf_split import primary_basename
+
+        return self.models_dir / primary_basename(entry)
 
     def server_cmd(self, entry: dict, c: dict, port: int) -> list[str]:
-        mp = self.model_path(entry)
+        from cli.gguf_split import llama_model_path
+
+        # First shard, filename intact. llama.cpp opens the other parts itself.
+        mp = llama_model_path(self.model_path(entry))
         cmd = [
             self.server_bin,
             "-m",
@@ -809,7 +911,11 @@ class Sweep:
 
     def bench_cmd(self, entry: dict, wl: str, artifact: Path) -> list[str]:
         backend = entry.get("backend", "llama.cpp")
-        model = self._mlx_ids.get(entry["id"]) or str(self.model_path(entry).resolve())
+        from cli.gguf_split import llama_model_path
+
+        model = self._mlx_ids.get(entry["id"]) or str(
+            llama_model_path(self.model_path(entry))
+        )
         cmd = (
             self.cli_prefix
             + [
@@ -896,7 +1002,7 @@ class Sweep:
             "control": bool(entry.get("control")),
             "repo": entry.get("repo"),
             "revision": entry.get("revision"),
-            "file": entry.get("file") or entry.get("dir"),
+            "file": _record_filename(entry),
             "ctx": (c or {}).get("ctx"),
             "ngl": entry.get("ngl", self.plan.get("ngl", 999))
             if entry.get("backend", "llama.cpp") == "llama.cpp"
@@ -1337,9 +1443,11 @@ class Sweep:
         return hf_cache_hit(entry)
 
     def disk_need(self, entry: dict) -> int:
+        from cli.gguf_split import on_disk_bytes
+
         exp = expected_bytes_offline(entry) or 0
         mp = self.model_path(entry)
-        have = path_bytes(mp) if mp.exists() else 0
+        have = on_disk_bytes(entry, mp)
         need = max(0, exp - have) + int(
             float(self.plan.get("disk_margin_gb", 5)) * 1024**3
         )
@@ -1351,7 +1459,19 @@ class Sweep:
         """Returns (state, info). state: present | downloaded | missing | skipped_disk | download_failed.
 
         Reuses a complete file in models_dir or the HF cache; resumes a partial file;
-        checks free disk before every download."""
+        checks free disk before every download. A split GGUF is present only when
+        every shard is."""
+        from cli.gguf_split import (
+            MissingShardError,
+            SplitSpecError,
+            on_disk_bytes,
+            shard_names_for_entry,
+        )
+
+        try:
+            names = shard_names_for_entry(entry)
+        except SplitSpecError as exc:
+            return "missing", {"path": entry.get("file") or "", "error": str(exc)}
         cached = self.hf_cache_hit(entry)
         if cached is not None and not self.model_path(entry).exists():
             self._resolved[entry["id"]] = cached
@@ -1359,15 +1479,33 @@ class Sweep:
                 self._mlx_ids[entry["id"]] = entry["repo"]
         mp = self.model_path(entry)
         exp = expected_bytes(entry)
-        info = {"path": mp.name, "expected_bytes": exp}
-        have = path_bytes(mp) if mp.exists() else 0
-        if mp.exists() and (exp is None or have >= exp):
+        info: dict = {"path": mp.name, "expected_bytes": exp}
+        if names:
+            info["shards"] = list(names)
+        if names:
+            parts = [mp.parent / n for n in names]
+            missing = [p for p in parts if not p.is_file()]
+            have = on_disk_bytes(entry, mp)
+        elif mp.is_dir():
+            parts = [mp]
+            missing = [] if mp.exists() else [mp]
+            have = path_bytes(mp) if mp.exists() else 0
+        else:
+            parts = [mp]
+            missing = [] if mp.is_file() else [mp]
+            have = path_bytes(mp) if mp.is_file() else 0
+        if not missing and (exp is None or have >= exp):
             info["bytes"] = have
             info["source"] = (
                 "hf_cache" if entry["id"] in self._resolved else "models_dir"
             )
+            bad = self._hash_error(entry, mp, info)
+            if bad is not None:
+                return bad
             return "present", info
         if not getattr(self.args, "download", False):
+            if missing and names:
+                info["error"] = str(MissingShardError(missing))
             return "missing", info
         mp.parent.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(mp.parent).free
@@ -1399,19 +1537,49 @@ class Sweep:
             info["error"] = str(exc)[:300]
             return "download_failed", info
         info["download_seconds"] = round(time.monotonic() - t0)
-        info["bytes"] = path_bytes(mp)
-        if (
-            entry.get("sha256")
-            and mp.is_file()
-            and not getattr(self.args, "no_verify", False)
-        ):
-            log(f"sha256 {mp.name} ...")
-            got = sha256_file(mp)
-            info["sha256_ok"] = got == entry["sha256"]
-            if not info["sha256_ok"]:
-                info["error"] = f"sha256 mismatch: {got}"
-                return "download_failed", info
+        if names:
+            have = on_disk_bytes(entry, mp)
+        elif mp.is_dir():
+            have = path_bytes(mp) if mp.exists() else 0
+        else:
+            have = path_bytes(mp) if mp.is_file() else 0
+        info["bytes"] = have
+        missing = [p for p in parts if not p.is_file()]
+        if missing and names:
+            info["error"] = str(MissingShardError(missing))
+            return "download_failed", info
+        bad = self._hash_error(entry, mp, info)
+        if bad is not None:
+            return bad
         return "downloaded", info
+
+    def _hash_error(self, entry: dict, mp: Path, info: dict) -> tuple[str, dict] | None:
+        """Check GGUF pins before this model is treated as ready.
+
+        ``sha256_ok`` is set only after every required digest comparison
+        succeeded. An invalid, missing, conflicting, or mismatched pin fails
+        closed and does not start llama-server. ``--no-verify`` skips the byte
+        comparison only; it never records the run as hash-verified, and a
+        malformed pin still fails closed.
+        """
+        from cli.gguf_split import SplitSpecError, pin_errors, verify_pins
+
+        problems = pin_errors(entry)
+        if problems:
+            info["error"] = problems[0]
+            log(f"sha256 {problems[0]}")
+            return "download_failed", info
+        if getattr(self.args, "no_verify", False):
+            return None
+        try:
+            compared = verify_pins(entry, mp)
+        except SplitSpecError as exc:
+            info["error"] = str(exc)
+            log(f"sha256 {exc}")
+            return "download_failed", info
+        if compared:
+            info["sha256_ok"] = True
+        return None
 
     def cleanup_model(
         self, entry: dict, state: str, next_entries: list[dict] | None = None
@@ -1430,7 +1598,9 @@ class Sweep:
                 free = shutil.disk_usage(mp.parent).free
             except OSError:
                 free = 0
-            size = path_bytes(mp) if mp.exists() else 0
+            from cli.gguf_split import on_disk_bytes
+
+            size = on_disk_bytes(entry, mp) if not mp.is_dir() else path_bytes(mp)
             needs = [
                 self.disk_need(e)
                 for e in (next_entries or [])
@@ -1448,25 +1618,35 @@ class Sweep:
                 return
             need = helped[0]
             log(
-                f"DELETE {mp} ({path_bytes(mp) / 1e9:.1f} GB, downloaded by this run) to make room for the "
+                f"DELETE {mp} ({size / 1e9:.1f} GB, downloaded by this run) to make room for the "
                 f"next model ({need / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free)"
             )
         else:
             log(f"DELETE {mp}")
         if mp.is_dir():
             shutil.rmtree(mp, ignore_errors=True)
+            victims = []
         else:
+            from cli.gguf_split import SplitSpecError, shard_names_for_entry
+
             try:
-                mp.unlink()
-            except FileNotFoundError:
-                pass
+                names = shard_names_for_entry(entry)
+            except SplitSpecError:
+                names = None
+            victims = [mp.parent / n for n in names] if names else [mp]
+            for victim in victims:
+                try:
+                    victim.unlink()
+                except FileNotFoundError:
+                    pass
         hfc = mp.parent / ".cache" / "huggingface"
         if entry.get("backend") != "mlx" and hfc.exists():
-            for f in hfc.rglob(mp.name + "*"):
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
+            for name in [p.name for p in victims] or [mp.name]:
+                for f in hfc.rglob(name + "*"):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
 
     # ---- upload
     def upload(self, rec: dict) -> None:
@@ -1617,7 +1797,9 @@ class Sweep:
                     )
                     done_cells += len(todo)
                     continue
-                exp = expected_bytes_offline(entry)
+                from cli.gguf_split import weight_bytes
+
+                exp = weight_bytes(entry, self.model_path(entry))
                 if (
                     self.facts.get("kind") == "nvidia"
                     and entry.get("backend", "llama.cpp") == "llama.cpp"
@@ -1625,6 +1807,7 @@ class Sweep:
                     and exp
                     and exp > vram_mib * 2**20
                     and entry.get("n_cpu_moe") is None
+                    and entry.get("ssd_stream") is not True
                 ):
                     record(
                         self.base_record(
@@ -1639,6 +1822,33 @@ class Sweep:
                 state, minfo = self.ensure_model(entry)
                 if state in ("missing", "skipped_disk", "download_failed"):
                     record(self.base_record(entry, None, state, model_file=minfo))
+                    done_cells += len(todo)
+                    continue
+                # The files on disk are the model. A per-shard `bytes` must not
+                # let the sum past the VRAM check once every shard is here.
+                actual = minfo.get("bytes")
+                if (
+                    self.facts.get("kind") == "nvidia"
+                    and entry.get("backend", "llama.cpp") == "llama.cpp"
+                    and vram_mib
+                    and isinstance(actual, int)
+                    and not isinstance(actual, bool)
+                    and actual > vram_mib * 2**20
+                    and entry.get("n_cpu_moe") is None
+                    and entry.get("ssd_stream") is not True
+                ):
+                    record(
+                        self.base_record(
+                            entry,
+                            None,
+                            "skipped_vram",
+                            note=(
+                                f"file {actual} bytes > {vram_mib:.0f} MiB VRAM "
+                                "(no CPU offload configured)"
+                            ),
+                            model_file=minfo,
+                        )
+                    )
                     done_cells += len(todo)
                     continue
                 try:
@@ -1743,9 +1953,20 @@ class Sweep:
         )
         total = 0
         for e in entries:
+            from cli.gguf_split import SplitSpecError, shard_names_for_entry
+
             mp = self.model_path(e)
             exp = e.get("bytes")
             total = max(total, exp or 0)
+            try:
+                shard_names = shard_names_for_entry(e)
+            except SplitSpecError:
+                shard_names = None
+            present = (
+                all((mp.parent / n).is_file() for n in shard_names)
+                if shard_names
+                else mp.exists()
+            )
             tag = (
                 " [control]"
                 if e.get("control")
@@ -1753,7 +1974,7 @@ class Sweep:
             )
             print(
                 f"== {e['id']}{tag}  {e.get('backend', 'llama.cpp')}  {e.get('quant')}  "
-                f"{(exp or 0) / 1e9:.1f} GB  present={mp.exists()}"
+                f"{(exp or 0) / 1e9:.1f} GB  present={present}"
             )
             if e.get("min_ram_gb") and ram and ram < e["min_ram_gb"]:
                 print(f"   SKIP: needs {e['min_ram_gb']} GB RAM")

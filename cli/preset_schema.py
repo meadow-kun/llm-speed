@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from . import ssd_stream
+from . import gguf_split, ssd_stream
 
 SCHEMA_PATH = Path(__file__).parent / "schemas" / "llm-speed-preset-1.schema.json"
 PRESETS_DIR = Path(__file__).parent / "presets"
@@ -169,8 +169,11 @@ def _semantic_errors(p: dict) -> list[str]:
     errs: list[str] = []
     models = p.get("models", {})
     for mid, m in models.items():
-        if m.get("backend") == "llama.cpp" and "file" not in m:
-            errs.append(f"$.models.{mid}: llama.cpp entries need 'file'")
+        if m.get("backend") == "llama.cpp" and "file" not in m and not m.get("files"):
+            errs.append(f"$.models.{mid}: llama.cpp entries need 'file' or 'files'")
+        if m.get("backend") == "llama.cpp" and ("file" in m or m.get("files")):
+            for problem in gguf_split.pin_errors(m):
+                errs.append(f"$.models.{mid}: {problem}")
         if m.get("backend") == "mlx" and "dir" not in m:
             errs.append(f"$.models.{mid}: mlx entries need 'dir'")
         # 0.0.13 ssd_stream (bytes cap, required / forbidden keys); same rules in
@@ -228,7 +231,8 @@ PLACEHOLDER_LLAMA_BUILD = 999999  # sentinel "build not known yet"
 def placeholder_markers(p: Any) -> list[str]:
     """Why a preset is still a staging placeholder (empty = real). Markers: a top-level
     `_placeholder` note, the word DUMMY in any string, a revision/sha256 made of one
-    repeated character, a single-file llama.cpp entry without sha256, a model of
+    repeated character, a llama.cpp entry without sha256 (one hash for a single
+    file, one hash per shard for a split), a model of
     <= 1024 bytes, or min_llama_build >= 999999.
     Used by the agent (never advertised or run), `bench --preset` (refused) and
     tools/release_guard.py (release refused), so dummy values can't ship or upload."""
@@ -262,10 +266,9 @@ def placeholder_markers(p: Any) -> list[str]:
         for k, m in (models if isinstance(models, dict) else {}).items():
             if not isinstance(m, dict):
                 continue
-            if m.get("backend") == "llama.cpp" and "file" in m and not m.get("sha256"):
-                out.append(
-                    f"$.models.{k} has no sha256"
-                )  # every single-file GGUF must be pinned
+            if m.get("backend") == "llama.cpp":
+                for problem in gguf_split.pin_errors(m):
+                    out.append(f"$.models.{k}: {problem}")
             size = m.get("bytes")
             if (
                 isinstance(size, int)

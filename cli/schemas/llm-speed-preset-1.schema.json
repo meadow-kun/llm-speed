@@ -244,16 +244,14 @@
           "pattern": "^[0-9a-f]{40}$"
         },
         "file": {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,150}\\.gguf$"
+          "$ref": "#/$defs/gguf_name"
         },
         "files": {
           "type": "array",
           "minItems": 1,
           "maxItems": 64,
           "items": {
-            "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,150}\\.gguf$"
+            "$ref": "#/$defs/gguf_shard"
           }
         },
         "dir": {
@@ -267,7 +265,7 @@
         },
         "sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
         },
         "requires_gpu_regex": {
           "type": "string",
@@ -403,6 +401,27 @@
       "patternProperties": {
         "^_[a-z_]{1,30}$": {
           "$ref": "#/$defs/note"
+        }
+      }
+    },
+    "gguf_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,150}\\.gguf$"
+    },
+    "gguf_shard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "sha256"
+      ],
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/gguf_name"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
         }
       }
     },

@@ -364,14 +364,22 @@ def models_dirs(settings: Settings) -> tuple[Path, Path]:
 
 def present_bytes(entry: dict, models_dir: Path, mlx_dir: Path) -> int:
     """Bytes of this entry already on disk (models dir or a complete Hugging Face cache copy)."""
+    from ..gguf_split import on_disk_bytes, primary_basename
+
     exp = int(entry.get("bytes") or 0)
-    if fit_sweep.hf_cache_hit(entry) is not None:
-        return exp
+    hit = fit_sweep.hf_cache_hit(entry)
+    if hit is not None:
+        have = on_disk_bytes(entry, hit) or fit_sweep.path_bytes(hit)
+        return min(have, exp) if exp else have
     if entry.get("backend") == "mlx":
         p = mlx_dir / entry.get("dir", str(entry.get("repo", "")).split("/")[-1])
+        have = fit_sweep.path_bytes(p) if p.exists() else 0
     else:
-        p = models_dir / str(entry.get("file", ""))
-    have = fit_sweep.path_bytes(p) if p.exists() else 0
+        try:
+            p = models_dir / primary_basename(entry)
+        except KeyError:
+            p = models_dir / str(entry.get("file", ""))
+        have = on_disk_bytes(entry, p)
     return min(have, exp) if exp else have
 
 

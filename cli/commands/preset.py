@@ -174,7 +174,16 @@ def build_plan(
         if override is not None:
             m["contexts"] = list(override)
         m.setdefault("contexts", list(preset["contexts"]))
-        size_mib = (m.get("bytes") or 0) / MIB
+        if m.get("backend", "llama.cpp") == "llama.cpp":
+            from ..gguf_split import primary_basename, weight_bytes
+
+            try:
+                size = weight_bytes(m, models_dir / primary_basename(m)) or 0
+            except KeyError:
+                size = m.get("bytes") or 0
+        else:
+            size = m.get("bytes") or 0
+        size_mib = size / MIB
         # 0.0.13 ssd_stream: the file streams from disk (mmap + --n-cpu-moe), so its size
         # isn't held against VRAM; the agent gate uses its vram_need_gib instead.
         if budget is not None and size_mib > budget and m.get("ssd_stream") is not True:

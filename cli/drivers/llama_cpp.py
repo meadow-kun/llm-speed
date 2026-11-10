@@ -11,6 +11,11 @@ list_models scans well-known GGUF locations:
   - $LLAMA_CPP_MODELS_DIR (if set)
   - ~/.cache/llama.cpp/
   - ~/.cache/huggingface/hub/   (HF snapshot store; *.gguf live under blobs/)
+
+A split GGUF (``<name>-00001-of-00003.gguf``) is one model: every shard must be
+present, ``-m`` is the first shard, and the recorded size is the sum. The HF
+blob symlink is kept so the shard filename survives (llama.cpp finds the other
+parts by that name).
 """
 
 from __future__ import annotations
@@ -33,6 +38,14 @@ from typing import Any
 import httpx
 
 from ..config import CACHE_DIR
+from ..gguf_split import (
+    MissingShardError,
+    keep_gguf_filename,
+    llama_model_path,
+    require_complete,
+    shard_list_label,
+    shard_set_for,
+)
 from ..launch_telemetry import (
     ReasoningTracker,
     label_server_args,
@@ -201,7 +214,10 @@ def _find_gguf_files(roots: list[Path]) -> list[Path]:
             # rglob is fine — these caches are bounded.
             for p in root.rglob("*.gguf"):
                 if p.is_file():
-                    rp = p.resolve()
+                    # Keep a split shard's filename. Resolving an HF blob
+                    # symlink turns it into blobs/<hash>, and llama.cpp then
+                    # loads that one file instead of the set.
+                    rp = keep_gguf_filename(p)
                     seen[str(rp)] = rp
         except OSError as exc:
             LOG.debug("scan %s failed: %s", root, exc)
@@ -343,26 +359,43 @@ class LlamaCppDriver:
         roots.append(Path.home() / ".cache" / "huggingface" / "hub")
 
         out: list[ModelRef] = []
+        seen_sets: set[tuple] = set()
         for path in _find_gguf_files(roots):
-            fname = path.name
-            quant = _quant_from_name(fname)
-            name = _strip_quant(fname)
-            digest = _digest_prefix(path)
-            try:
-                size_bytes = path.stat().st_size
-            except OSError:
-                size_bytes = None
+            ss = shard_set_for(path)
+            if ss is not None:
+                key = (str(ss.directory), ss.prefix, ss.count, ss.suffix.lower())
+                if key in seen_sets:
+                    continue
+                seen_sets.add(key)
+                # An incomplete download is not a model. Passing the path
+                # explicitly still raises a missing-shard error.
+                if not ss.complete():
+                    continue
+                path = ss.first
+                fname = ss.prefix + ss.suffix
+                size_bytes: int | None = ss.total_bytes()
+                digest = _digest_prefix(path)
+                extras = {
+                    "path": str(path),
+                    "size_bytes": size_bytes,
+                    "gguf_shards": list(ss.names),
+                }
+            else:
+                fname = path.name
+                digest = _digest_prefix(path)
+                try:
+                    size_bytes = path.stat().st_size
+                except OSError:
+                    size_bytes = None
+                extras = {"path": str(path), "size_bytes": size_bytes}
             out.append(
                 ModelRef(
                     backend=self.name,
                     identifier=str(path),
-                    name=name,
-                    quant=quant,
+                    name=_strip_quant(fname),
+                    quant=_quant_from_name(fname),
                     digest=digest,
-                    extras={
-                        "path": str(path),
-                        "size_bytes": size_bytes,
-                    },
+                    extras=extras,
                 )
             )
         return out
@@ -387,8 +420,12 @@ class LlamaCppDriver:
         assert self._server is not None
         assert self._client is not None
 
+        loaded = shard_set_for(Path(model.identifier))
         payload: dict[str, Any] = {
-            "model": Path(model.identifier).name,
+            # The server was started on the first shard; that is the model name.
+            "model": loaded.first.name
+            if loaded is not None
+            else Path(model.identifier).name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_output_tokens,
             "stream": bool(stream),
@@ -593,15 +630,22 @@ class LlamaCppDriver:
         binary = _which("llama-server")
         if not binary:
             raise RuntimeError("llama-server not on PATH")
-        if not Path(model_path).exists():
+        model_file = Path(model_path)
+        try:
+            ss = require_complete(model_file)
+        except MissingShardError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if ss is None and not model_file.exists():
             raise RuntimeError(f"model not found: {model_path}")
+        # First shard, with the split filename intact (not the HF blob hash).
+        model_arg = str(llama_model_path(model_file))
 
         port = _free_port()
         base_url = f"http://{DEFAULT_HOST}:{port}"
         cmd: list[str] = [
             binary,
             "-m",
-            model_path,
+            model_arg,
             "--host",
             DEFAULT_HOST,
             "--port",
@@ -719,15 +763,23 @@ class LlamaCppDriver:
                 f"declared: {args_label}" if external else args_label
             )
         fname = model_file_label(model.identifier)
-        if fname:
+        ss = shard_set_for(Path(model.identifier)) if model.identifier else None
+        if ss is not None:
+            # Exact shard basenames (the existing model_file field). The size
+            # is the sum, and only when every part is on disk — one shard is
+            # not the model.
+            labels["model_file"] = shard_list_label(ss.names)
+            if ss.complete():
+                labels["model_file_bytes"] = ss.total_bytes()
+        elif fname:
             labels["model_file"] = fname
             size = (model.extras or {}).get("size_bytes")
-            if not isinstance(size, int):
+            if not isinstance(size, int) or isinstance(size, bool):
                 try:
                     size = Path(model.identifier).stat().st_size
                 except OSError:
                     size = None
-            if isinstance(size, int):
+            if isinstance(size, int) and not isinstance(size, bool):
                 labels["model_file_bytes"] = size
         return labels
 
