@@ -189,6 +189,41 @@ def public_jwk(pub: Ed25519PublicKey) -> dict[str, str]:
     return {"kty": "OKP", "crv": "Ed25519", "x": _b64url(_public_key_bytes(pub))}
 
 
+def persistent_public_jwk() -> dict[str, str] | None:
+    """Public JWK of the on-disk long-term key, or None.
+
+    Reads `ed25519.key` only when that file is already present. Never creates
+    a key. A missing or unreadable file is None, so a strict-anon check can
+    skip this comparison.
+    """
+    if not KEY_PATH.is_file():
+        return None
+    try:
+        priv = _load_private_key(KEY_PATH)
+    except (OSError, ValueError):
+        return None
+    return public_jwk(priv.public_key())
+
+
+def header_jwk(token: str) -> dict[str, Any] | None:
+    """Public JWK from a compact JWS header, or None when the header is unreadable.
+
+    Does not verify the signature. Callers that trust the payload verify first.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        raw = base64.urlsafe_b64decode(parts[0] + "=" * (-len(parts[0]) % 4))
+        header = json.loads(raw)
+    except (ValueError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(header, dict):
+        return None
+    jwk = header.get("jwk")
+    return jwk if isinstance(jwk, dict) else None
+
+
 # ---------------------------------------------------------------------------
 # Privacy invariant — keep regardless of envelope format.
 # Walks the dict tree and refuses upload if any non-allowlisted string > 256 chars.

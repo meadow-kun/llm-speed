@@ -909,7 +909,21 @@ class Sweep:
         cmd += extra
         streams = _concurrent_streams(c, self.workloads_for(entry, c))
         if streams:
-            cmd = _ensure_parallel(cmd, max(streams))
+            from cli.drivers.llama_cpp import _CTX_OPTS, apply_concurrent_context
+            from cli.workloads.concurrent_decode import OUTPUT_TOKENS, prompt_from_env
+
+            raw = ((c or {}).get("env") or {}).get("LLM_SPEED_CONCURRENT_PROMPT")
+            prompt_tokens = prompt_from_env(None if raw is None else str(raw))
+            user_ctx = any(a in _CTX_OPTS for a in extra)
+            cmd, warn = apply_concurrent_context(
+                cmd,
+                max(streams),
+                prompt_tokens=prompt_tokens,
+                output_tokens=OUTPUT_TOKENS,
+                user_ctx=user_ctx,
+            )
+            if warn:
+                log(f"  {entry.get('id', '')} ctx={c.get('ctx')}: {warn}")
         return cmd
 
     def bench_cmd(self, entry: dict, wl: str, artifact: Path) -> list[str]:
@@ -1174,13 +1188,20 @@ class Sweep:
                 }
                 rec["server_props"]["n_ctx"] = gs.get("n_ctx") or props.get("n_ctx")
                 real = rec["server_props"]["n_ctx"]
-                if isinstance(real, int) and real != c["ctx"]:
+                # A concurrent-decode server may report the whole pool (parallel × ctx)
+                # or the slot (ctx). Only a slot smaller than the step drops workloads.
+                if isinstance(real, int) and real < c["ctx"]:
                     log(
-                        f"  llama-server is running with n_ctx={real}, not the requested {c['ctx']}"
+                        f"  llama-server slot is n_ctx={real}, smaller than the requested {c['ctx']}"
                     )
                     rec.setdefault("flags", []).append(f"server-n-ctx:{real}")
                     wl = self.workloads_for(entry, c, ctx=real)
                     rec["workloads"] = wl
+                elif isinstance(real, int) and real > c["ctx"]:
+                    log(
+                        f"  llama-server KV pool is n_ctx={real} for a {c['ctx']} step "
+                        "(sized so each parallel slot can hold the step)"
+                    )
                 env = dict(
                     os.environ,
                     LLAMA_CPP_SERVER_URL=base,

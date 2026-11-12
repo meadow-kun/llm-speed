@@ -31,6 +31,13 @@ UPLOADED_EXTRAS_KEYS = (
     "llama_cpp_build_source",
     "llama_server_args",
     "server_n_ctx",
+    # 0.0.22 concurrent-decode: the slot the server reported, and whether KV is unified.
+    "n_ctx_slot",
+    "kv_unified",
+    # 0.0.22: chunk-gap decode rate, kept next to the server timings rate,
+    # and which of the two formulas produced decode_tps.
+    "decode_tps_stream",
+    "decode_tps_source",
     "model_file",
     "model_file_bytes",
     # 0.0.10 (cli/sampling.py): settings sent with each request, and requested

@@ -55,7 +55,7 @@ from ..launch_telemetry import (
 from ..registry import register_driver
 from ..sampling import DRIVER_SUPPORT as SAMPLING_DRIVER_SUPPORT
 from ..sampling import split as split_sampling
-from ..timing import now_ms
+from ..timing import now_ms, server_decode_tps
 from ..types import (
     BackendDetection,
     ChatRunOutcome,
@@ -229,6 +229,163 @@ def _find_gguf_files(roots: list[Path]) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
+_CTX_OPTS = ("-c", "--ctx-size")
+_PAR_OPTS = ("--parallel", "-np")
+
+
+def _last_opt(cmd: list[str], names: tuple[str, ...]) -> tuple[int, str] | None:
+    found: tuple[int, str] | None = None
+    i = 0
+    while i < len(cmd):
+        if cmd[i] in names and i + 1 < len(cmd):
+            found = (i, cmd[i + 1])
+            i += 2
+            continue
+        i += 1
+    return found
+
+
+def raise_parallel(cmd: list[str], n: int) -> list[str]:
+    """At least `n` llama-server slots. A higher --parallel already in `cmd` stays."""
+    out: list[str] = []
+    found = False
+    i = 0
+    while i < len(cmd):
+        if cmd[i] in _PAR_OPTS and i + 1 < len(cmd):
+            found = True
+            try:
+                cur = int(cmd[i + 1])
+            except ValueError:
+                cur = 1
+            out += [cmd[i], str(max(cur, n))]
+            i += 2
+            continue
+        out.append(cmd[i])
+        i += 1
+    if not found:
+        out += ["--parallel", str(n)]
+    return out
+
+
+def slot_tokens(ctx: int, parallel: int, *, unified: bool) -> int:
+    """Tokens one sequence can use.
+
+    Build 12157 (fecdc81, tools/server/server.cpp) sets kv_unified only when
+    --parallel is left on auto. An explicit --parallel leaves it off, and each
+    slot then gets ctx/parallel. --kv-unified keeps the whole context as the pool.
+    """
+    if parallel <= 1 or unified:
+        return ctx
+    return ctx // parallel
+
+
+def apply_concurrent_context(
+    cmd: list[str],
+    parallel: int,
+    *,
+    prompt_tokens: int,
+    output_tokens: int,
+    user_ctx: bool,
+) -> tuple[list[str], str | None]:
+    """Size a concurrent-decode llama-server command.
+
+    When this command owns `-c` / `--ctx-size` and does not pass `--kv-unified`,
+    the context becomes parallel × that value so each split slot holds the step.
+    A context the caller already set is left as written. Returns a warning when
+    the resulting slot is smaller than the prompt plus max tokens.
+    """
+    cmd = raise_parallel(list(cmd), parallel)
+    unified = "--kv-unified" in cmd
+    need = prompt_tokens + output_tokens
+    if not user_ctx:
+        hit = _last_opt(cmd, _CTX_OPTS)
+        par = _last_opt(cmd, _PAR_OPTS)
+        if hit is not None:
+            try:
+                ctx = int(hit[1])
+                n = int(par[1]) if par is not None else 1
+            except ValueError:
+                ctx, n = 0, 1
+            if ctx > 0:
+                # Split slots (explicit --parallel, no --kv-unified) get ctx/n.
+                # The pool is at least n times the step, and larger when the
+                # prompt plus max tokens still would not fit in that slot.
+                per_slot = max(ctx, need)
+                sized = per_slot if unified or n <= 1 else per_slot * n
+                cmd = list(cmd)
+                cmd[hit[0] + 1] = str(sized)
+    return cmd, slot_shortfall(cmd, need)
+
+
+def slot_shortfall(cmd: list[str], need: int) -> str | None:
+    """Warning when prompt plus max tokens cannot fit in one slot. None when it fits
+    or the command does not name a context."""
+    hit = _last_opt(cmd, _CTX_OPTS)
+    if hit is None:
+        return None
+    try:
+        ctx = int(hit[1])
+    except ValueError:
+        return None
+    par_hit = _last_opt(cmd, _PAR_OPTS)
+    try:
+        parallel = int(par_hit[1]) if par_hit else 1
+    except ValueError:
+        parallel = 1
+    slot = slot_tokens(ctx, parallel, unified="--kv-unified" in cmd)
+    if need <= slot:
+        return None
+    return (
+        f"context slot is {slot} tokens "
+        f"(ctx {ctx}, parallel {parallel}, kv_unified={'true' if '--kv-unified' in cmd else 'false'}); "
+        f"prompt plus max tokens is {need}"
+    )
+
+
+def _event_timings(evt: dict[str, Any]) -> dict[str, Any] | None:
+    """llama-server `timings` on the SSE event, or nested under `usage`."""
+    timings = evt.get("timings")
+    if isinstance(timings, dict):
+        return timings
+    usage = evt.get("usage")
+    if isinstance(usage, dict) and isinstance(usage.get("timings"), dict):
+        return usage["timings"]
+    return None
+
+
+def slot_limits_from_server(
+    props: Any, slots: Any, log_text: str | None = None
+) -> dict[str, Any]:
+    """n_ctx_slot and kv_unified from /props, /slots, then the server log line."""
+    n_ctx_slot: int | None = None
+    kv: bool | None = None
+
+    def _take_ctx(raw: Any) -> None:
+        nonlocal n_ctx_slot
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            n_ctx_slot = raw
+
+    def _take_kv(obj: Any) -> None:
+        nonlocal kv
+        if isinstance(obj, dict) and isinstance(obj.get("kv_unified"), bool):
+            kv = obj["kv_unified"]
+
+    if isinstance(props, dict):
+        _take_ctx(props.get("n_ctx_slot"))
+        gs = props.get("default_generation_settings")
+        if n_ctx_slot is None and isinstance(gs, dict):
+            _take_ctx(gs.get("n_ctx") or props.get("n_ctx"))
+        _take_kv(props)
+    if isinstance(slots, list) and slots and isinstance(slots[0], dict):
+        _take_ctx(slots[0].get("n_ctx"))
+        _take_kv(slots[0])
+    if kv is None and log_text:
+        match = re.search(r"kv_unified = '(true|false)'", log_text)
+        if match:
+            kv = match.group(1) == "true"
+    return {"n_ctx_slot": n_ctx_slot, "kv_unified": kv}
+
+
 @dataclass
 class _ServerHandle:
     # proc is None when we're reusing an externally-managed llama-server
@@ -287,6 +444,8 @@ class LlamaCppDriver:
         self._version_text: str | None = None
         self._props_build_info: str | None = None
         self._props_n_ctx: int | None = None
+        self._slot_n_ctx: int | None = None
+        self._kv_unified: bool | None = None
         self._props_fetched = False
         self._telemetry: list[dict[str, Any]] = []
         # Make sure we always tear down on interpreter exit.
@@ -531,6 +690,13 @@ class LlamaCppDriver:
                         prompt_tokens = usage.get("prompt_tokens") or prompt_tokens
                         output_tokens = usage.get("completion_tokens") or output_tokens
                         backend_extras["usage"] = usage
+                    rate = server_decode_tps(_event_timings(evt))
+                    if rate is not None:
+                        # Every llama.cpp row. One SSE delta is one chunk, so
+                        # the server timings replace the chunk-gap rate
+                        # whenever they are a real decode rate.
+                        backend_extras["decode_tps"] = rate.tps
+                        backend_extras["decode_tps_source"] = rate.source
 
         except httpx.ReadTimeout as exc:
             return _failed_outcome(
@@ -587,6 +753,11 @@ class LlamaCppDriver:
             text = (choices[0].get("message") or {}).get("content") or ""
 
         usage = data.get("usage") or {}
+        extras: dict[str, Any] = {"usage": usage} if usage else {}
+        rate = server_decode_tps(_event_timings(data))
+        if rate is not None:
+            extras["decode_tps"] = rate.tps
+            extras["decode_tps_source"] = rate.source
         return ChatRunOutcome(
             success=True,
             output_text=text,
@@ -595,7 +766,7 @@ class LlamaCppDriver:
             ttft_ms=None,
             decode_token_times_ms=[],
             wall_ms=wall_ms,
-            backend_extras={"usage": usage} if usage else {},
+            backend_extras=extras,
         )
 
     # ------------------------------------------------------- token counting
@@ -730,6 +901,25 @@ class LlamaCppDriver:
         if extras.get("flash_attn"):
             cmd += ["--flash-attn"]
         cmd += list(self.server_args)
+        # An explicit --parallel splits the context (build 12157 leaves unified KV
+        # off). When this process chose the context and the user did not pass -c,
+        # size the pool so each slot can hold that context plus the decode.
+        par = _last_opt(cmd, _PAR_OPTS)
+        if "n_ctx" in extras and _last_opt(self.server_args, _CTX_OPTS) is None and par:
+            try:
+                n = int(par[1])
+            except ValueError:
+                n = 1
+            if n > 1:
+                cmd, warn = apply_concurrent_context(
+                    cmd,
+                    n,
+                    prompt_tokens=int(extras["n_ctx"]),
+                    output_tokens=256,
+                    user_ctx=False,
+                )
+                if warn:
+                    LOG.warning("%s", warn)
 
         # Keep the server log (local only, never uploaded) so a load / OOM failure
         # is recorded with its reason instead of a bare exit code.
@@ -797,8 +987,35 @@ class LlamaCppDriver:
                 n_ctx = gs.get("n_ctx") or props.get("n_ctx")
                 if isinstance(n_ctx, int) and n_ctx > 0:
                     self._props_n_ctx = n_ctx
+                slots = None
+                try:
+                    sr = httpx.get(f"{base_url}/slots", timeout=5.0)
+                    if sr.status_code == 200:
+                        slots = sr.json()
+                except (httpx.HTTPError, ValueError):
+                    slots = None
+                log_text = None
+                log_path = getattr(getattr(self, "_server", None), "log_path", None)
+                if log_path is not None:
+                    try:
+                        log_text = Path(log_path).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    except OSError:
+                        log_text = None
+                limits = slot_limits_from_server(props, slots, log_text)
+                self._slot_n_ctx = limits["n_ctx_slot"]
+                self._kv_unified = limits["kv_unified"]
+                if self._slot_n_ctx:
+                    self._props_n_ctx = self._slot_n_ctx
         except (httpx.HTTPError, ValueError, AttributeError) as exc:
             LOG.debug("/props probe failed: %s", exc)
+
+    def context_slot(self) -> dict[str, Any] | None:
+        """Slot size and unified-KV flag reported by the running llama-server."""
+        if self._slot_n_ctx is None and self._kv_unified is None:
+            return None
+        return {"n_ctx_slot": self._slot_n_ctx, "kv_unified": self._kv_unified}
 
     def reset_run_telemetry(self) -> None:
         self._telemetry = []

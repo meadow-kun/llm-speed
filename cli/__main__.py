@@ -285,8 +285,9 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Upload runs saved under ~/.cache/llm-speed/runs, or the paths you name. "
             "With no path, lists runs that have not been submitted, uses the same "
-            "consent prompt as bench, then asks once to upload that list. A named "
-            "path is uploaded like bench --resume after the same consent check."
+            "consent prompt as bench (recorded in ~/.config/llm-speed/consent.json), "
+            "then asks once to upload that list. A named path is uploaded like "
+            "bench --resume after the same consent check."
         ),
     )
     p_submit.add_argument(
@@ -308,8 +309,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "no API key, no User-Agent, no credit. A saved run that carries a "
-            "fingerprint hash or a storage block is not posted. Counts as consent "
-            "for the consent gate; the batch confirmation still applies"
+            "fingerprint hash, a storage block, or this machine's long-term key "
+            "is not posted. Counts as consent for the consent gate; the batch "
+            "confirmation still applies"
         ),
     )
     p_submit.add_argument(
@@ -331,7 +333,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "answer yes to 'Upload the N runs listed above?'. Does not grant "
-            "consent: without consent.json a non-TTY submit still uploads nothing"
+            "consent: without ~/.config/llm-speed/consent.json a non-TTY submit "
+            "still uploads nothing"
         ),
     )
 

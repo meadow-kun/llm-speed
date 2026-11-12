@@ -23,6 +23,14 @@ from ..output import get_console, print_error, print_warning
 from ..signing import verify_jws_token
 from .bench import _upload_saved_run
 
+# Batch decline is not a missing consent. Only the consent gate prints "(no consent)".
+_ANSWERED_NO = "Not uploaded: you answered no."
+_NO_TERMINAL = (
+    "Not uploaded: no terminal to confirm; pass --yes to upload the listed runs."
+)
+_NO_CONSENT = "Skipping upload (no consent)."
+_EMPTY_NEXT = "Run `llm-speed bench` to create one."
+
 
 def cmd_submit(args) -> int:
     try:
@@ -45,7 +53,7 @@ def _submit_paths(paths: list[Path], args) -> int:
     """
     if not getattr(args, "strict_anon", False) and not consent.has_consented():
         if not _consent_ok(args, {}):
-            get_console().print(Text("Skipping upload (no consent)."))
+            get_console().print(Text(_NO_CONSENT), soft_wrap=True)
             return 1
     rc = 0
     for path in paths:
@@ -62,7 +70,7 @@ def _submit_unsent(args) -> int:
     console = get_console()
     runs_dir = upload.RUNS_DIR
     if not runs_dir.exists():
-        console.print(Text(f"No saved runs in {runs_dir}."), soft_wrap=True)
+        _print_empty(console, f"No saved runs in {runs_dir}.")
         return 0
     if not runs_dir.is_dir():
         print_error(f"not a directory: {runs_dir}")
@@ -82,7 +90,7 @@ def _submit_unsent(args) -> int:
         if upload.run_already_uploaded(path):
             already += 1
             continue
-        payload, reason = _read_run(path)
+        payload, token, reason = _read_run(path)
         if payload is None:
             print_warning(f"skipping {path.name}: {reason}")
             continue
@@ -90,7 +98,7 @@ def _submit_unsent(args) -> int:
             print_warning(f"skipping {path.name}: saved run carries an agent job field")
             continue
         if getattr(args, "strict_anon", False) and upload.saved_run_is_identified(
-            payload
+            payload, token
         ):
             print_warning(
                 f"skipping {path.name}: saved without --strict-anon; "
@@ -101,9 +109,9 @@ def _submit_unsent(args) -> int:
 
     if not pending:
         if already:
-            console.print(Text(f"No unsent runs in {runs_dir}."), soft_wrap=True)
+            _print_empty(console, f"No unsent runs in {runs_dir}.")
         else:
-            console.print(Text(f"No saved runs in {runs_dir}."), soft_wrap=True)
+            _print_empty(console, f"No saved runs in {runs_dir}.")
         return 0
 
     if already:
@@ -115,8 +123,16 @@ def _submit_unsent(args) -> int:
         )
         console.print(Text(f"    {path}"), soft_wrap=True)
 
-    if not _consent_ok(args, pending[0][1]) or not _confirm_batch(args, len(pending)):
-        console.print(Text("Skipping upload (no consent)."))
+    if not _consent_ok(args, pending[0][1]):
+        console.print(Text(_NO_CONSENT), soft_wrap=True)
+        return 1
+    # Consent already held. A batch decline is not a missing consent.
+    answer = _confirm_batch(args, len(pending))
+    if answer == "no":
+        console.print(Text(_ANSWERED_NO), soft_wrap=True)
+        return 1
+    if answer == "no-tty":
+        console.print(Text(_NO_TERMINAL), soft_wrap=True)
         return 1
 
     # Same one-time credit question bench asks after consent. Never reads stdin
@@ -137,23 +153,31 @@ def _submit_unsent(args) -> int:
     return rc
 
 
-def _confirm_batch(args, n: int) -> bool:
-    """Per-invocation yes for the listed runs. Default No.
+def _print_empty(console, line: str) -> None:
+    """Nothing to upload. The next sentence tells the user how to make a run."""
+    console.print(Text(line), soft_wrap=True)
+    console.print(Text(_EMPTY_NEXT), soft_wrap=True)
+
+
+def _confirm_batch(args, n: int) -> str:
+    """'yes', 'no', or 'no-tty' for the listed runs. Default no.
 
     `--yes` skips only this question. It does not grant consent. A non-TTY
-    without `--yes` is no, including under `--strict-anon`.
+    without `--yes` is 'no-tty', including under `--strict-anon`: the question
+    is not printed. A shown question that is not answered yes is 'no'.
     """
     if getattr(args, "yes", False):
-        return True
+        return "yes"
     if not sys.stdin.isatty():
-        return False
+        return "no-tty"
     word = "run" if n == 1 else "runs"
     sys.stdout.write(f"Upload the {n} {word} listed above? [y/N] ")
     sys.stdout.flush()
     try:
-        return sys.stdin.readline().strip().lower() in ("y", "yes")
+        answer = sys.stdin.readline()
     except KeyboardInterrupt:
-        return False
+        return "no"
+    return "yes" if answer.strip().lower() in ("y", "yes") else "no"
 
 
 def _consent_ok(args, payload: dict) -> bool:
@@ -176,25 +200,25 @@ def _consent_ok(args, payload: dict) -> bool:
     )
 
 
-def _read_run(path: Path) -> tuple[dict | None, str]:
-    """(payload, "") or (None, reason to skip). Does not upload."""
+def _read_run(path: Path) -> tuple[dict | None, str | None, str]:
+    """(payload, token, "") or (None, None, reason to skip). Does not upload."""
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        return None, "corrupt JSON (not utf-8)"
+        return None, None, "corrupt JSON (not utf-8)"
     except OSError as exc:
-        return None, f"unreadable ({exc})"
+        return None, None, f"unreadable ({exc})"
     try:
         saved = json.loads(text)
     except json.JSONDecodeError as exc:
-        return None, f"corrupt JSON ({exc.msg})"
+        return None, None, f"corrupt JSON ({exc.msg})"
     token = saved.get("jws") if isinstance(saved, dict) else None
     if not isinstance(token, str) or not token:
-        return None, "not an llm-speed run (no jws)"
+        return None, None, "not an llm-speed run (no jws)"
     ok, reason, payload = verify_jws_token(token)
     if not ok or not isinstance(payload, dict):
-        return None, f"not a verifiable run ({reason})"
-    return payload, ""
+        return None, None, f"not a verifiable run ({reason})"
+    return payload, token, ""
 
 
 def _describe(payload: dict) -> tuple[str, str, str]:
