@@ -16,7 +16,7 @@ import logging
 
 from .. import SUITE_VERSION
 from ..registry import register_workload
-from ..timing import summarize_decode
+from ..timing import select_decode_tps, summarize_decode
 from ..types import ChatRunOutcome, ModelRef, WorkloadResult
 from .prompts.fixtures import build_prompt_of_chars
 
@@ -43,16 +43,15 @@ def _result_from_outcome(
     backend_version: str | None,
 ) -> WorkloadResult:
     summary = summarize_decode(outcome.decode_token_times_ms)
-
-    decode_tps = summary["decode_tps"]
-    tps_source = "wall_clock" if decode_tps is not None else "none"
-
-    backend_decode_tps = (
-        outcome.backend_extras.get("decode_tps") if outcome.backend_extras else None
+    decode_tps, decode_tps_source = select_decode_tps(
+        summary["decode_tps"], outcome.backend_extras
     )
-    if isinstance(backend_decode_tps, (int, float)) and backend_decode_tps > 0:
-        decode_tps = float(backend_decode_tps)
+    if decode_tps_source in ("server_timings", "server_predicted_n_ms"):
         tps_source = "backend"
+    elif decode_tps_source == "stream_chunks":
+        tps_source = "wall_clock"
+    else:
+        tps_source = "none"
 
     prefill_tps: float | None = None
     backend_prefill_tps = (
@@ -93,6 +92,8 @@ def _result_from_outcome(
         flags=[],
         extras={
             "tps_source": tps_source,
+            "decode_tps_source": decode_tps_source,
+            "decode_tps_stream": summary["decode_tps"],
             "target_prompt_tokens": TARGET_PROMPT_TOKENS,
             "target_output_tokens": OUTPUT_TOKENS,
             "prompt_chars": len(PROMPT),

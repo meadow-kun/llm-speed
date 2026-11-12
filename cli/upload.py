@@ -572,14 +572,29 @@ def upload_or_save(
 # ---------------------------------------------------------------------------
 
 
-def saved_run_is_identified(payload: Any) -> bool:
-    """True when a saved payload was signed outside strict-anon.
+def saved_run_is_identified(payload: Any, token: str | None = None) -> bool:
+    """True when a saved run was signed outside strict-anon.
 
     `to_uploadable_dict` adds `fingerprint_hash`, and may add `storage`, only
     when the run was not strict-anon. A strict-anon save has neither key.
+    Key presence counts, including an empty string.
+
+    An older non-strict save can lack both keys and still carry the persistent
+    long-term key in the JWS header `jwk`. That counts too. The comparison
+    reads the key file only when one is already on disk and never creates one.
     """
     fp = payload.get("fingerprint") if isinstance(payload, dict) else None
-    return isinstance(fp, dict) and ("fingerprint_hash" in fp or "storage" in fp)
+    if isinstance(fp, dict) and ("fingerprint_hash" in fp or "storage" in fp):
+        return True
+    if not isinstance(token, str) or not token:
+        return False
+    # Late import: tests reload `cli.signing` so KEY_PATH follows the fixture.
+    from . import signing
+
+    persistent = signing.persistent_public_jwk()
+    if persistent is None:
+        return False
+    return signing.header_jwk(token) == persistent
 
 
 def upload_saved_payload(
@@ -605,6 +620,8 @@ def upload_saved_payload(
     and is re-signed in memory with a fresh strict-anon key just before the POST, so the
     nonce sits inside the signature and never in the saved file. Without it, a saved
     payload that already carries `agent_job` is refused (a nonce is never reused).
+    `--strict-anon` also refuses an identified save on this path, agent job included.
+    A strict-anon save has no persistent key and no fingerprint hash, so it still posts.
     """
     token = saved.get("jws") if isinstance(saved, dict) else None
     if not isinstance(token, str) or not token:
@@ -621,10 +638,13 @@ def upload_saved_payload(
         raise UploadError(
             "saved payload carries an agent job field; it is not re-uploaded"
         )
-    if strict_anon and agent_job is None and saved_run_is_identified(saved_payload):
+    # Every strict-anon path, including an agent job. Agent children save strict,
+    # so a normal agent upload still posts. An identified save is refused before
+    # any re-sign or POST, and the caller writes no upload marker.
+    if strict_anon and saved_run_is_identified(saved_payload, token):
         raise UploadError(
             "this run was saved without --strict-anon (it carries your persistent key "
-            "and fingerprint hash); --strict-anon cannot post it unchanged. Re-run the "
+            "or a fingerprint hash); --strict-anon cannot post it unchanged. Re-run the "
             "benchmark with --strict-anon, or submit it without --strict-anon"
         )
     if agent_job is not None:

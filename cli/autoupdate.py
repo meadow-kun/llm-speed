@@ -415,13 +415,42 @@ class Install:
     python: str | None = None  # interpreter of the install (to read its version)
 
 
+def _user_tool_dirs() -> tuple[Path, ...]:
+    """Where a login shell keeps pipx and uv.
+
+    The WSL logon task starts with `wsl.exe --exec`, which does not load
+    `~/.profile`, so these directories are absent from PATH while the agent runs.
+    """
+    home = Path.home()
+    return (home / ".local" / "bin", home / ".cargo" / "bin")
+
+
 def _abs_tool(
-    name: str, which: Callable[[str], str | None] = shutil.which
+    name: str,
+    which: Callable[[str], str | None] = shutil.which,
+    extra_dirs: tuple[Path, ...] | None = None,
 ) -> str | None:
+    """Absolute path of `name`. PATH first, then the login-shell bins.
+
+    A relative `which` result is ignored. An extra-dir hit must be an
+    executable file. Never a shell lookup.
+    """
     p = which(name)
-    if not p or not os.path.isabs(p):
-        return None
-    return os.path.realpath(p)
+    if p and os.path.isabs(p):
+        return os.path.realpath(p)
+    dirs = _user_tool_dirs() if extra_dirs is None else extra_dirs
+    candidates = [name]
+    if os.name == "nt":  # pragma: no cover - Windows
+        candidates.append(name + ".exe")
+    for d in dirs:
+        for cand_name in candidates:
+            cand = Path(d) / cand_name
+            try:
+                if cand.is_file() and os.access(cand, os.X_OK):
+                    return os.path.realpath(cand)
+            except OSError:
+                continue
+    return None
 
 
 def _writable(p: Path) -> bool:
@@ -450,6 +479,7 @@ def detect(
     site_dir: Path | None = None,
     which: Callable[[str], str | None] = shutil.which,
     externally_managed: bool | None = None,
+    tool_dirs: tuple[Path, ...] | None = None,
 ) -> Install:
     prefix = prefix or sys.prefix
     base_prefix = base_prefix or sys.base_prefix
@@ -504,9 +534,14 @@ def detect(
         and (rp / "pipx_metadata.json").is_file()
     ):
         manual = f"pipx upgrade {PACKAGE}"
-        pipx = _abs_tool("pipx", which)
+        pipx = _abs_tool("pipx", which, tool_dirs)
         if pipx is None:
-            return Install("pipx", None, manual, "pipx not found on PATH")
+            return Install(
+                "pipx",
+                None,
+                manual,
+                "pipx not found on PATH or in ~/.local/bin or ~/.cargo/bin",
+            )
         if not _writable(rp):
             return Install("pipx", None, manual, "pipx venv is not writable")
         return Install("pipx", [pipx, "upgrade", PACKAGE], manual, python=executable)
@@ -514,9 +549,14 @@ def detect(
     # uv tool: <UV_TOOL_DIR>/llm-speed with uv-receipt.toml
     if rp.name == PACKAGE and (rp / "uv-receipt.toml").is_file():
         manual = f"uv tool upgrade {PACKAGE}"
-        uv = _abs_tool("uv", which)
+        uv = _abs_tool("uv", which, tool_dirs)
         if uv is None:
-            return Install("uv", None, manual, "uv not found on PATH")
+            return Install(
+                "uv",
+                None,
+                manual,
+                "uv not found on PATH or in ~/.local/bin or ~/.cargo/bin",
+            )
         if not _writable(rp):
             return Install("uv", None, manual, "uv tool environment is not writable")
         return Install(

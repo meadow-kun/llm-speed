@@ -19,7 +19,7 @@ from typing import Any
 
 from .. import SUITE_VERSION
 from ..registry import register_workload
-from ..timing import summarize_decode
+from ..timing import select_decode_tps, summarize_decode
 from ..types import ChatRunOutcome, ModelRef, WorkloadResult
 from .prompts.fill import fill_prompt
 
@@ -141,12 +141,9 @@ def _measure_one(
         }
 
     summary = summarize_decode(outcome.decode_token_times_ms)
-    decode_tps = summary["decode_tps"]
-    backend_decode_tps = (
-        outcome.backend_extras.get("decode_tps") if outcome.backend_extras else None
+    decode_tps, decode_tps_source = select_decode_tps(
+        summary["decode_tps"], outcome.backend_extras
     )
-    if isinstance(backend_decode_tps, (int, float)) and backend_decode_tps > 0:
-        decode_tps = float(backend_decode_tps)
 
     prefill_tps: float | None = None
     backend_prefill_tps = (
@@ -168,6 +165,8 @@ def _measure_one(
         "output_tokens": outcome.output_tokens,
         "prefill_tps": prefill_tps,
         "decode_tps": decode_tps,
+        "decode_tps_source": decode_tps_source,
+        "decode_tps_stream": summary["decode_tps"],
         "ttft_ms": outcome.ttft_ms,
         "wall_ms": outcome.wall_ms,
         "p50_ms": summary["p50"],
@@ -280,6 +279,12 @@ class LongContextDecayWorkload:
                 "context_curve": curve,
                 "context_targets": list(CONTEXT_TOKEN_TARGETS),
                 "model_max_ctx": max_ctx,
+                "decode_tps_stream": (
+                    first_point.get("decode_tps_stream") if first_point else None
+                ),
+                "decode_tps_source": (
+                    first_point.get("decode_tps_source") if first_point else None
+                ),
             },
         )
 

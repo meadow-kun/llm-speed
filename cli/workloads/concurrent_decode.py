@@ -23,7 +23,13 @@ from typing import Any
 
 from .. import SUITE_VERSION
 from ..registry import register_workload
-from ..timing import now_ms, percentile, summarize_decode
+from ..timing import (
+    combine_decode_tps_sources,
+    now_ms,
+    percentile,
+    select_decode_tps,
+    summarize_decode,
+)
 from ..types import ChatRunOutcome, ModelRef, WorkloadResult
 from .prompts.fill import fill_prompt
 
@@ -102,6 +108,25 @@ def _streams() -> tuple[int, ...]:
 
 def _prompt_target() -> int:
     return prompt_from_env(os.environ.get("LLM_SPEED_CONCURRENT_PROMPT"))
+
+
+def _slot_extras(slot: dict[str, Any] | None) -> dict[str, Any]:
+    if not slot:
+        return {}
+    return {"n_ctx_slot": slot.get("n_ctx_slot"), "kv_unified": slot.get("kv_unified")}
+
+
+def _context_slot(driver) -> dict[str, Any] | None:
+    """{n_ctx_slot, kv_unified} from a llama-server driver, or None."""
+    fn = getattr(driver, "context_slot", None)
+    if not callable(fn):
+        return None
+    try:
+        info = fn()
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("context slot probe failed: %s", exc)
+        return None
+    return info if isinstance(info, dict) else None
 
 
 def _count_with(driver, model):
@@ -190,6 +215,7 @@ def _measure_batch(
             "skipped": True,
             "error": "all-streams-failed",
             "n_failures": len(failures),
+            "decode_tps_source": None,
         }
 
     earliest_start = min(s for _, s, _ in successes)
@@ -200,12 +226,20 @@ def _measure_batch(
     aggregate_tps = total_output_tokens / wall_s if wall_s > 0 else None
 
     per_stream: list[float] = []
+    stream_rates: list[float] = []
+    sources: list[str] = []
     all_p50: list[float] = []
     all_p95: list[float] = []
     for o, _, _ in successes:
         s = summarize_decode(o.decode_token_times_ms)
-        if s["decode_tps"] is not None:
-            per_stream.append(float(s["decode_tps"]))
+        stream_tps = s["decode_tps"]
+        if stream_tps is not None:
+            stream_rates.append(float(stream_tps))
+        rate, source = select_decode_tps(stream_tps, o.backend_extras)
+        if rate is not None:
+            per_stream.append(rate)
+        if source is not None:
+            sources.append(source)
         if s["p50"] is not None:
             all_p50.append(float(s["p50"]))
         if s["p95"] is not None:
@@ -230,6 +264,10 @@ def _measure_batch(
         "total_output_tokens": total_output_tokens,
         "skipped": False,
         "error": None,
+        "decode_tps_stream": (
+            sum(stream_rates) / len(stream_rates) if stream_rates else None
+        ),
+        "decode_tps_source": combine_decode_tps_sources(sources),
     }
 
 
@@ -267,6 +305,38 @@ class ConcurrentDecodeWorkload:
         prompt, measured = fill_prompt(
             target, _count_with(driver, model), suffix=INSTRUCTION
         )
+        slot = _context_slot(driver)
+        prompt_count = measured if isinstance(measured, int) else target
+        if slot is not None and isinstance(slot.get("n_ctx_slot"), int):
+            need = prompt_count + OUTPUT_TOKENS
+            slot_n = slot["n_ctx_slot"]
+            slot_extra = {
+                "n_ctx_slot": slot_n,
+                "kv_unified": slot.get("kv_unified"),
+                "batch_sizes": list(streams),
+                "target_prompt_tokens": target,
+                "prompt_tokens_actual": measured,
+                "target_output_tokens": OUTPUT_TOKENS,
+            }
+            if need > slot_n:
+                LOG.warning(
+                    "concurrent-decode: prompt plus max tokens (%d) exceeds n_ctx_slot (%d)",
+                    need,
+                    slot_n,
+                )
+                return WorkloadResult(
+                    workload="concurrent-decode",
+                    suite_version=SUITE_VERSION,
+                    backend=backend,
+                    backend_version=None,
+                    model=model,
+                    error=(
+                        f"invalid config: prompt plus max tokens ({need}) "
+                        f"exceeds n_ctx_slot ({slot_n})"
+                    ),
+                    flags=flags,
+                    extras=slot_extra,
+                )
         for bs in streams:
             point = _measure_batch(driver, model, bs, prompt)
             curve.append(point)
@@ -294,6 +364,7 @@ class ConcurrentDecodeWorkload:
                     "batch_sizes": list(streams),
                     "target_prompt_tokens": target,
                     "prompt_tokens_actual": measured,
+                    **_slot_extras(slot),
                 },
             )
 
@@ -329,6 +400,13 @@ class ConcurrentDecodeWorkload:
                 "target_prompt_tokens": target,
                 "prompt_tokens_actual": actual,
                 "target_output_tokens": OUTPUT_TOKENS,
+                "decode_tps_stream": (
+                    first_point.get("decode_tps_stream") if first_point else None
+                ),
+                "decode_tps_source": (
+                    first_point.get("decode_tps_source") if first_point else None
+                ),
+                **_slot_extras(slot),
             },
         )
 
