@@ -30,9 +30,12 @@ def _result_from_outcome(
 ) -> WorkloadResult:
     """Translate a `ChatRunOutcome` into a populated `WorkloadResult`.
 
-    Prefer backend-reported tps over wall-clock-derived numbers when present
-    (Ollama's `eval_count`/`eval_duration`, vLLM's metrics, etc.). Tag the
-    source via `extras['tps_source']` so the upstream knows which to trust.
+    `decode_tps` is llama-server's timings when the driver labeled them
+    (`extras.decode_tps_source` `server_timings` or `server_predicted_n_ms`).
+    When those timings are missing, it is the chunk-gap rate and
+    `decode_tps_source` is `stream_chunks`. `extras.tps_source` stays
+    `backend` or `wall_clock` for that same choice. Other drivers are not
+    read here.
     """
     summary = summarize_decode(outcome.decode_token_times_ms)
     decode_tps, decode_tps_source = select_decode_tps(
