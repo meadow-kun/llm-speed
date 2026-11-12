@@ -21,7 +21,7 @@ from .. import SUITE_VERSION
 from ..registry import register_workload
 from ..timing import summarize_decode
 from ..types import ChatRunOutcome, ModelRef, WorkloadResult
-from .prompts.fixtures import build_prompt_of_chars
+from .prompts.fill import fill_prompt
 
 LOG = logging.getLogger("cli.workloads.long-context-decay")
 
@@ -45,11 +45,40 @@ OUTPUT_TOKENS = 256
 INSTRUCTION = "\n\n---\n\nBriefly summarize the document above in three sentences."
 
 
-def _build_prompt_for_ctx(ctx_tokens: int) -> str:
-    """Build a prompt that approximates `ctx_tokens` tokens via 4 chars/token."""
-    target_chars = ctx_tokens * 4 - len(INSTRUCTION)
-    body = build_prompt_of_chars(max(target_chars, 0))
-    return body + INSTRUCTION
+def _count_with(driver, model):
+    """The driver's tokenizer / tokenize endpoint, or a counter that cannot count."""
+    fn = getattr(driver, "count_prompt_tokens", None) if driver is not None else None
+    if not callable(fn):
+
+        def _unknown(_text: str) -> int | None:
+            return None
+
+        return _unknown
+
+    def _count(text: str) -> int | None:
+        try:
+            n = fn(model, text)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("prompt fill count failed: %s", exc)
+            return None
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            return None
+        return n
+
+    return _count
+
+
+def _build_prompt_for_ctx(
+    ctx_tokens: int, driver=None, model=None
+) -> tuple[str, int | None]:
+    """Prompt whose token count is `ctx_tokens`, within a small tolerance.
+
+    The counter is the model's tokenizer or the server tokenize endpoint when
+    the driver has one. Without a counter the text is the 4-character
+    heuristic and the measured count is None; the result still stores the
+    backend's prompt-token count.
+    """
+    return fill_prompt(ctx_tokens, _count_with(driver, model), suffix=INSTRUCTION)
 
 
 def _model_max_ctx(model: ModelRef) -> int | None:
@@ -71,8 +100,13 @@ def _measure_one(
     ctx_tokens: int,
 ) -> dict[str, Any]:
     """Run one context-size point. Return dict with metrics + status."""
-    prompt = _build_prompt_for_ctx(ctx_tokens)
-    LOG.debug("long-context-decay ctx=%d prompt_chars=%d", ctx_tokens, len(prompt))
+    prompt, measured = _build_prompt_for_ctx(ctx_tokens, driver, model)
+    LOG.debug(
+        "long-context-decay ctx=%d prompt_chars=%d measured=%s",
+        ctx_tokens,
+        len(prompt),
+        measured,
+    )
 
     try:
         outcome: ChatRunOutcome = driver.run_chat(
@@ -85,6 +119,7 @@ def _measure_one(
         LOG.warning("long-context-decay ctx=%d driver raised: %r", ctx_tokens, exc)
         return {
             "ctx": ctx_tokens,
+            "prompt_tokens_actual": measured,
             "prefill_tps": None,
             "decode_tps": None,
             "ttft_ms": None,
@@ -96,6 +131,7 @@ def _measure_one(
     if not outcome.success:
         return {
             "ctx": ctx_tokens,
+            "prompt_tokens_actual": measured,
             "prefill_tps": None,
             "decode_tps": None,
             "ttft_ms": None,
@@ -125,9 +161,10 @@ def _measure_one(
     ):
         prefill_tps = outcome.prompt_tokens / (outcome.ttft_ms / 1000.0)
 
+    actual = outcome.prompt_tokens if outcome.prompt_tokens > 0 else measured
     return {
         "ctx": ctx_tokens,
-        "prompt_tokens_actual": outcome.prompt_tokens,
+        "prompt_tokens_actual": actual,
         "output_tokens": outcome.output_tokens,
         "prefill_tps": prefill_tps,
         "decode_tps": decode_tps,
@@ -252,5 +289,6 @@ register_workload("long-context-decay", lambda: LongContextDecayWorkload())
 
 if __name__ == "__main__":
     for ctx in CONTEXT_TOKEN_TARGETS:
-        p = _build_prompt_for_ctx(ctx)
-        print(f"long-context-decay ctx={ctx}: {len(p)} chars (~{len(p) // 4} tokens)")
+        p, n = _build_prompt_for_ctx(ctx)
+        shown = n if n is not None else len(p) // 4
+        print(f"long-context-decay ctx={ctx}: {len(p)} chars (~{shown} tokens)")

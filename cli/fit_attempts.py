@@ -282,6 +282,7 @@ _STATUS_MAP: dict[str, tuple[str, str | None]] = {
     "cli_read_timeout": ("failed", "timeout"),
     "server_crashed": ("failed", "crash"),
     "bench_failed": ("failed", "bench_failed"),
+    "llama_build_mismatch": ("failed", "llama_build_mismatch"),
     # 0.0.13 ssd_stream: stopped by a free-disk / available-RAM floor, not a fit result
     "disk_below_floor": ("skipped", "insufficient_disk"),
     "ram_below_floor": ("skipped", "insufficient_ram"),

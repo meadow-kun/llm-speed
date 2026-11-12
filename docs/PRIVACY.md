@@ -276,8 +276,11 @@ fingerprint hash, default User-Agent.
 
 - No network call. The result is saved to
   `~/.cache/llm-speed/runs/<isoformat>-<fp_hash>.json`.
-- Re-upload later with `llm-speed bench --resume <path>` (which verifies the
-  signature locally before posting).
+- Re-upload later with `llm-speed submit <path>` or `llm-speed bench --resume <path>`
+  (both verify the signature locally and post the saved file unchanged).
+  `llm-speed submit` with no path lists saved runs that have no local upload
+  marker and uses the same consent prompt. The marker is a local sidecar only;
+  it is not part of the upload, and the saved run is not modified.
 
 ---
 

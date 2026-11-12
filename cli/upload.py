@@ -24,6 +24,9 @@ from .types import RunReport
 log = logging.getLogger("cli.upload")
 
 RUNS_DIR = CACHE_DIR / "runs"
+# Local-only sibling of a saved run (`<file>.json.uploaded`). Existence means a
+# later `llm-speed submit` with no path should skip it. Never read into a POST.
+_MARKER_SUFFIX = ".uploaded"
 
 
 def warn_if_insecure_api_base(
@@ -128,6 +131,57 @@ def save_offline(
         log.debug("could not chmod %s to 0o600", target)
     log.debug("saved offline run to %s", target)
     return target
+
+
+def uploaded_marker_path(run_path: Path) -> Path:
+    """Sidecar that records a successful upload of `run_path`. Local only."""
+    return run_path.with_name(run_path.name + _MARKER_SUFFIX)
+
+
+def run_already_uploaded(run_path: Path) -> bool:
+    """True when this saved run has a local upload marker (a regular file)."""
+    marker = uploaded_marker_path(run_path)
+    try:
+        return marker.is_file() and not marker.is_symlink()
+    except OSError:
+        return False
+
+
+def mark_run_uploaded(run_path: Path) -> None:
+    """Remember, on disk only, that `run_path` was uploaded.
+
+    The run JSON is not modified. The sidecar is not an upload field and is
+    never read back into a request. A failure here is logged; the upload
+    itself has already succeeded.
+    """
+    marker = uploaded_marker_path(run_path)
+    tmp = marker.with_name(marker.name + ".tmp")
+    payload = json.dumps(
+        {"uploaded_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(tmp, flags, 0o600)
+    except OSError as exc:
+        log.warning("could not record upload marker for %s: %s", run_path, exc)
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, marker)
+        try:
+            os.chmod(marker, 0o600)
+        except OSError:
+            log.debug("could not chmod %s to 0o600", marker)
+    except OSError as exc:
+        log.warning("could not record upload marker for %s: %s", run_path, exc)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +572,16 @@ def upload_or_save(
 # ---------------------------------------------------------------------------
 
 
+def saved_run_is_identified(payload: Any) -> bool:
+    """True when a saved payload was signed outside strict-anon.
+
+    `to_uploadable_dict` adds `fingerprint_hash`, and may add `storage`, only
+    when the run was not strict-anon. A strict-anon save has neither key.
+    """
+    fp = payload.get("fingerprint") if isinstance(payload, dict) else None
+    return isinstance(fp, dict) and ("fingerprint_hash" in fp or "storage" in fp)
+
+
 def upload_saved_payload(
     saved: dict[str, Any],
     *,
@@ -556,6 +620,12 @@ def upload_saved_payload(
     if isinstance(saved_payload, dict) and saved_payload.get("agent_job") is not None:
         raise UploadError(
             "saved payload carries an agent job field; it is not re-uploaded"
+        )
+    if strict_anon and agent_job is None and saved_run_is_identified(saved_payload):
+        raise UploadError(
+            "this run was saved without --strict-anon (it carries your persistent key "
+            "and fingerprint hash); --strict-anon cannot post it unchanged. Re-run the "
+            "benchmark with --strict-anon, or submit it without --strict-anon"
         )
     if agent_job is not None:
         if not strict_anon:

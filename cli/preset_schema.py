@@ -119,7 +119,7 @@ def _errors(v: Any, s: dict, root: dict, path: str) -> list[str]:
             errs.append(f"{path}: too short")
         if "maxLength" in s and len(v) > s["maxLength"]:
             errs.append(f"{path}: too long")
-        if "pattern" in s and not re.search(s["pattern"], v):
+        if "pattern" in s and not re.fullmatch(s["pattern"], v):
             errs.append(f"{path}: does not match {s['pattern']}")
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         if "minimum" in s and v < s["minimum"]:
@@ -153,7 +153,7 @@ def _errors(v: Any, s: dict, root: dict, path: str) -> list[str]:
                 matched = True
                 errs += _errors(item, props[k], root, f"{path}.{k}")
             for pat, sub in pats.items():
-                if re.search(pat, k):
+                if re.fullmatch(pat, k):
                     matched = True
                     errs += _errors(item, sub, root, f"{path}.{k}")
             if not matched:
@@ -165,8 +165,58 @@ def _errors(v: Any, s: dict, root: dict, path: str) -> list[str]:
     return errs
 
 
-def _semantic_errors(p: dict) -> list[str]:
+def _concurrent_env_errors(p: dict) -> list[str]:
+    """Streams must be 1-64 and the prompt 1024-1048576. Same numbers as the workload."""
+    from .workloads.concurrent_decode import parse_prompt_target, parse_stream_list
+
     errs: list[str] = []
+
+    def check(env: Any, path: str) -> None:
+        if not isinstance(env, dict):
+            return
+        streams = env.get("LLM_SPEED_CONCURRENT_STREAMS")
+        if isinstance(streams, str) and parse_stream_list(streams) is None:
+            errs.append(
+                f"{path}.LLM_SPEED_CONCURRENT_STREAMS: each stream must be 1-64"
+            )
+        prompt = env.get("LLM_SPEED_CONCURRENT_PROMPT")
+        if isinstance(prompt, str) and parse_prompt_target(prompt) is None:
+            errs.append(f"{path}.LLM_SPEED_CONCURRENT_PROMPT: must be 1024-1048576")
+
+    def steps(value: Any, path: str) -> None:
+        if not isinstance(value, list):
+            return
+        for i, step in enumerate(value):
+            if isinstance(step, dict):
+                check(step.get("env"), f"{path}[{i}].env")
+
+    models = p.get("models")
+    if isinstance(models, dict):
+        for mid, model in models.items():
+            if isinstance(model, dict):
+                steps(model.get("contexts"), f"$.models.{mid}.contexts")
+    profiles = p.get("profiles")
+    if isinstance(profiles, dict):
+        for pid, prof in profiles.items():
+            contexts = prof.get("contexts") if isinstance(prof, dict) else None
+            if not isinstance(contexts, dict):
+                continue
+            for mid, value in contexts.items():
+                steps(value, f"$.profiles.{pid}.contexts.{mid}")
+    return errs
+
+
+def _semantic_errors(p: dict) -> list[str]:
+    from .llama_build import bound_errors
+
+    errs: list[str] = []
+    for problem in bound_errors(
+        exact=p.get("exact_llama_build"),
+        minimum=p.get("min_llama_build"),
+        maximum=p.get("max_llama_build"),
+    ):
+        errs.append(f"$: {problem}")
+    errs += _concurrent_env_errors(p)
     models = p.get("models", {})
     for mid, m in models.items():
         if m.get("backend") == "llama.cpp" and "file" not in m and not m.get("files"):
@@ -255,13 +305,14 @@ def placeholder_markers(p: Any) -> list[str]:
 
     walk(p, "$")
     if isinstance(p, dict):
-        build = p.get("min_llama_build")
-        if (
-            isinstance(build, int)
-            and not isinstance(build, bool)
-            and build >= PLACEHOLDER_LLAMA_BUILD
-        ):
-            out.append(f"$.min_llama_build is the {PLACEHOLDER_LLAMA_BUILD} sentinel")
+        for key in ("min_llama_build", "exact_llama_build", "max_llama_build"):
+            build = p.get(key)
+            if (
+                isinstance(build, int)
+                and not isinstance(build, bool)
+                and build >= PLACEHOLDER_LLAMA_BUILD
+            ):
+                out.append(f"$.{key} is the {PLACEHOLDER_LLAMA_BUILD} sentinel")
         models = p.get("models")
         for k, m in (models if isinstance(models, dict) else {}).items():
             if not isinstance(m, dict):

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://llm-speed.com/schemas/llm-speed-preset-1.schema.json",
   "title": "llm-speed-preset/1",
-  "$comment": "Single schema shared by the Worker (POST /v1/presets/publish) and the CLI (llm-speed agent / bench --preset). Data only: every object is closed (additionalProperties false), so no command, cmd, exec, script or url field can exist. Keywords used are limited to: type, const, enum, pattern, minLength, maxLength, minimum, maximum, items, minItems, maxItems, uniqueItems, minProperties, properties, required, additionalProperties, patternProperties, propertyNames, anyOf, $ref (#/$defs/...). Patterns use the common subset of ECMAScript and Python re. Environment variables are limited to an allowlist (env.LLM_SPEED_DECAY_CTX, digits only). Keys starting with _ are free-text notes. Version-only-goes-up and cross-references (profile entries -> models) are checked by the publisher in code.",
+  "$comment": "Single schema shared by the Worker (POST /v1/presets/publish) and the CLI (llm-speed agent / bench --preset). Data only: every object is closed (additionalProperties false), so no command, cmd, exec, script or url field can exist. Keywords used are limited to: type, const, enum, pattern, minLength, maxLength, minimum, maximum, items, minItems, maxItems, uniqueItems, minProperties, properties, required, additionalProperties, patternProperties, propertyNames, anyOf, $ref (#/$defs/...). Patterns use the common subset of ECMAScript and Python re. Environment variables are limited to an allowlist (env.LLM_SPEED_DECAY_CTX, env.LLM_SPEED_CONCURRENT_STREAMS, env.LLM_SPEED_CONCURRENT_PROMPT). Keys starting with _ are free-text notes. Version-only-goes-up, llama build bounds (exact/min/max) and cross-references (profile entries -> models) are checked by the publisher in code.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -37,6 +37,16 @@
       "minimum": 1,
       "maximum": 1000000
     },
+    "exact_llama_build": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "max_llama_build": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
     "min_llama_build_why": {
       "$ref": "#/$defs/text"
     },
@@ -50,7 +60,7 @@
       },
       "additionalProperties": {
         "type": "string",
-        "pattern": "^(chat-short|chat-long|long-context-decay)(,(chat-short|chat-long|long-context-decay)){0,2}$"
+        "pattern": "^(chat-short|chat-long|long-context-decay|concurrent-decode)(,(chat-short|chat-long|long-context-decay|concurrent-decode)){0,3}$"
       }
     },
     "server_args": {
@@ -442,7 +452,7 @@
             },
             "workloads": {
               "type": "string",
-              "pattern": "^(chat-short|chat-long|long-context-decay)(,(chat-short|chat-long|long-context-decay)){0,2}$"
+              "pattern": "^(chat-short|chat-long|long-context-decay|concurrent-decode)(,(chat-short|chat-long|long-context-decay|concurrent-decode)){0,3}$"
             },
             "min_ram_gb": {
               "type": "number",
@@ -454,6 +464,14 @@
               "additionalProperties": false,
               "properties": {
                 "LLM_SPEED_DECAY_CTX": {
+                  "type": "string",
+                  "pattern": "^[0-9]{3,7}$"
+                },
+                "LLM_SPEED_CONCURRENT_STREAMS": {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]{0,2}(,[1-9][0-9]{0,2}){0,7}$"
+                },
+                "LLM_SPEED_CONCURRENT_PROMPT": {
                   "type": "string",
                   "pattern": "^[0-9]{3,7}$"
                 }

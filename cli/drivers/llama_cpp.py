@@ -598,6 +598,74 @@ class LlamaCppDriver:
             backend_extras={"usage": usage} if usage else {},
         )
 
+    # ------------------------------------------------------- token counting
+
+    def count_prompt_tokens(self, model: ModelRef, prompt: str) -> int | None:
+        """Tokens llama-server will see for this user message, or None.
+
+        Uses `/apply-template` then `/tokenize` on that server. The prompt is
+        not logged and is not sent anywhere else. A failure leaves the caller
+        on the character heuristic; the run still records the server's
+        `prompt_tokens`.
+        """
+        try:
+            self._ensure_server(model.identifier, {})
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("tokenize: server not available: %s", exc)
+            return None
+        if self._client is None or self._server is None:
+            return None
+        base = self._server.base_url.rstrip("/")
+        formatted = self._apply_template(base, prompt)
+        return self._tokenize(base, formatted if formatted is not None else prompt)
+
+    def _apply_template(self, base: str, prompt: str) -> str | None:
+        if getattr(self, "_no_apply_template", False):
+            return None
+        assert self._client is not None
+        try:
+            resp = self._client.post(
+                f"{base}/apply-template",
+                json={"messages": [{"role": "user", "content": prompt}]},
+                timeout=30.0,
+            )
+        except httpx.HTTPError as exc:
+            LOG.debug("apply-template failed: %s", exc)
+            return None
+        if resp.status_code == 404:
+            self._no_apply_template = True
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        formatted = data.get("prompt") if isinstance(data, dict) else None
+        return formatted if isinstance(formatted, str) else None
+
+    def _tokenize(self, base: str, text: str) -> int | None:
+        assert self._client is not None
+        try:
+            resp = self._client.post(
+                f"{base}/tokenize",
+                json={"content": text, "add_special": False, "parse_special": False},
+                timeout=30.0,
+            )
+        except httpx.HTTPError as exc:
+            LOG.debug("tokenize failed: %s", exc)
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        tokens = data.get("tokens") if isinstance(data, dict) else None
+        if isinstance(tokens, list):
+            return len(tokens)
+        return None
+
     # --------------------------------------------------------- server lifecycle
 
     def _ensure_server(self, model_path: str, extras: dict[str, Any]) -> None:
