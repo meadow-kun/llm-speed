@@ -907,6 +907,9 @@ class Sweep:
             extra = [a for a in extra if a not in ssd_stream.FORBIDDEN_SERVER_ARGS]
             extra += ssd_stream.cpu_tensor_args(entry.get("cpu_tensors") or [])
         cmd += extra
+        streams = _concurrent_streams(c, self.workloads_for(entry, c))
+        if streams:
+            cmd = _ensure_parallel(cmd, max(streams))
         return cmd
 
     def bench_cmd(self, entry: dict, wl: str, artifact: Path) -> list[str]:
@@ -978,6 +981,37 @@ class Sweep:
             "attempts": [],
         }
 
+    def record_llama_build_mismatch(self, message: str) -> None:
+        """One failed attempt per live llama.cpp entry. Does not run the model."""
+        if not self.facts:
+            self.facts = machine_facts(self.gpu_index)
+        if not self.machine or self.machine == "auto":
+            self.machine = machine_slug(self.facts)
+        self.launch_dir.mkdir(parents=True, exist_ok=True)
+        live = [
+            e
+            for e in self.entries()
+            if not e.get("skip_status") and e.get("backend", "llama.cpp") == "llama.cpp"
+        ]
+        if not live:
+            return
+        for entry in live:
+            ctxs = self.contexts(entry)
+            rec = self.base_record(
+                entry,
+                ctxs[0] if ctxs else None,
+                "llama_build_mismatch",
+                note=message,
+            )
+            rec["cli_results"] = [
+                {
+                    "workload": "bench",
+                    "error": message,
+                    "failure_kind": "llama_build_mismatch",
+                }
+            ]
+            self.append(rec)
+
     def append(self, rec: dict) -> None:
         data = self.load_results()
         data.setdefault("machines", {})[self.machine] = self.facts
@@ -1042,26 +1076,25 @@ class Sweep:
                 problems.append(f"llama-server not found at {self.server_bin}")
             else:
                 self.llama = llama_version(self.server_bin)
-                mn = self.plan.get("min_llama_build")
-                bn = self.llama.get("build_number")
+                from cli.llama_build import llama_build_error
+
+                err = llama_build_error(
+                    self.llama.get("build_number"),
+                    exact=self.plan.get("exact_llama_build"),
+                    minimum=self.plan.get("min_llama_build"),
+                    maximum=self.plan.get("max_llama_build"),
+                )
                 force = getattr(self.args, "force", False)
-                if mn and bn and bn > 1 and bn < int(mn) and not force:
-                    problems.append(
-                        f"llama.cpp build b{bn} is older than the required b{mn} "
-                        f"(Flint support landed in b{mn}); upgrade llama.cpp"
+                if err:
+                    unreadable = err.startswith("llama-server does not report")
+                    hard = not unreadable and (
+                        self.plan.get("exact_llama_build") is not None
+                        or self.plan.get("max_llama_build") is not None
                     )
-                if mn and (not bn or bn <= 1):
-                    msg = (
-                        f"llama-server reports build '{bn}' (a shallow clone or packaged build hides the number), "
-                        f"commit {self.llama.get('commit')}; cannot confirm it is b{mn} or later"
-                    )
-                    if force:
-                        log("WARNING: " + msg)
+                    if hard or not force:
+                        problems.append(err)
                     else:
-                        problems.append(
-                            msg
-                            + "; use a full clone at the release tag or pass --force"
-                        )
+                        log("WARNING: " + err + "; continuing because --force")
                 # The CLI's backend_version comes from the FIRST llama-server on PATH, so put ours first.
                 os.environ["PATH"] = (
                     str(Path(self.server_bin).resolve().parent)
@@ -1686,6 +1719,20 @@ class Sweep:
         if problems:
             for p in problems:
                 log(f"PREFLIGHT FAIL: {p}")
+            build = next(
+                (
+                    p
+                    for p in problems
+                    if p.startswith("llama.cpp build")
+                    or p.startswith("llama-server does not report")
+                ),
+                None,
+            )
+            if build:
+                try:
+                    self.record_llama_build_mismatch(build)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"could not record llama build mismatch: {exc}")
             return 2
         self.launch_dir.mkdir(parents=True, exist_ok=True)
         lock = (self.launch_dir / ".fit_sweep.lock").open("a")
@@ -1762,6 +1809,8 @@ class Sweep:
                             # 0.0.13 ssd_stream floors: retried on the next run
                             "disk_below_floor",
                             "ram_below_floor",
+                            # wrong llama.cpp build: retried after the binary changes
+                            "llama_build_mismatch",
                         )
                         and not entry.get("control")
                     ):
@@ -2013,6 +2062,44 @@ WORKLOAD_CTX_NEED = {
 }
 
 
+def _concurrent_streams(c: dict | None, workloads: str) -> tuple[int, ...] | None:
+    """Stream counts for a concurrent-decode step, via the workload's parser.
+
+    Unset keeps 1, 4, 8, 16. A value outside 1-64 is None (no `--parallel`
+    change). Preset validation rejects that value before a sweep runs.
+    """
+    if "concurrent-decode" not in workloads.split(","):
+        return None
+    from cli.workloads.concurrent_decode import BATCH_SIZES, parse_stream_list
+
+    raw = ((c or {}).get("env") or {}).get("LLM_SPEED_CONCURRENT_STREAMS")
+    if raw is None or not str(raw).strip():
+        return BATCH_SIZES
+    return parse_stream_list(str(raw))
+
+
+def _ensure_parallel(cmd: list[str], n: int) -> list[str]:
+    """At least `n` llama-server slots. Never lowers a higher --parallel."""
+    out: list[str] = []
+    found = False
+    i = 0
+    while i < len(cmd):
+        if cmd[i] in ("--parallel", "-np") and i + 1 < len(cmd):
+            found = True
+            try:
+                cur = int(cmd[i + 1])
+            except ValueError:
+                cur = 1
+            out += [cmd[i], str(max(cur, n))]
+            i += 2
+            continue
+        out.append(cmd[i])
+        i += 1
+    if not found:
+        out += ["--parallel", str(n)]
+    return out
+
+
 def workload_ctx_need(name: str, c: dict | None = None) -> int:
     if name == "long-context-decay":
         raw = ((c or {}).get("env") or {}).get("LLM_SPEED_DECAY_CTX") or "128000"
@@ -2020,6 +2107,15 @@ def workload_ctx_need(name: str, c: dict | None = None) -> int:
             return max(int(x) for x in str(raw).split(",") if x.strip()) + 512
         except ValueError:
             return 128000 + 512
+    if name == "concurrent-decode":
+        from cli.workloads.concurrent_decode import parse_prompt_target
+
+        raw = ((c or {}).get("env") or {}).get("LLM_SPEED_CONCURRENT_PROMPT")
+        if raw is not None and str(raw).strip():
+            n = parse_prompt_target(str(raw))
+            if n is None:
+                return WORKLOAD_CTX_NEED["concurrent-decode"]
+            return n + 512
     return WORKLOAD_CTX_NEED.get(name, 0)
 
 

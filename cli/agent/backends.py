@@ -73,13 +73,17 @@ def probe(
     settings: Settings,
     min_build: Any = None,
     *,
+    exact: Any = None,
+    maximum: Any = None,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """{"llama.cpp": {"path", "build", "ok"} | None, "mlx": bool}. `env` None = this
     process's environment (what the running service sees)."""
     from ..commands import preset as pr
 
-    path, info, _ = pr.find_llama_server(settings.llama_server, min_build, env)
+    path, info, _ = pr.find_llama_server(
+        settings.llama_server, min_build, env, exact=exact, maximum=maximum
+    )
     llama = None
     if path:
         llama = {
@@ -90,7 +94,9 @@ def probe(
                 if (info or {}).get("build_number")
                 else None
             ),
-            "ok": pr.llama_build_ok(path, info, min_build),
+            "ok": pr.llama_build_ok(
+                path, info, min_build, exact=exact, maximum=maximum
+            ),
         }
     return {"llama.cpp": llama, "mlx": importlib.util.find_spec("mlx_lm") is not None}
 

@@ -116,14 +116,28 @@ def print_run_summary(
         _console.print(settings)
 
     if result_url:
-        _console.print(
-            Text.assemble(("View and share your result: ", "green"), result_url)
-        )
-    elif offline_path:
-        _console.print(f"[yellow]Saved locally:[/yellow] {offline_path}")
-        _console.print(
-            f"  Re-upload later with: [bold]llm-speed bench --resume {offline_path}[/bold]"
-        )
+        print_share_url(result_url)
+    if offline_path:
+        print_saved_locally(offline_path)
+        if not result_url:
+            _console.print(
+                "  Re-upload later with: "
+                f"[bold]llm-speed bench --resume {offline_path}[/bold]"
+            )
+
+
+def print_share_url(result_url: str) -> None:
+    _console.print(
+        Text.assemble(("View and share your result: ", "green"), result_url),
+        soft_wrap=True,
+    )
+
+
+def print_saved_locally(offline_path: Path) -> None:
+    _console.print(
+        Text.assemble(("Saved locally: ", "yellow"), str(offline_path)),
+        soft_wrap=True,
+    )
 
 
 def print_error(msg: str) -> None:

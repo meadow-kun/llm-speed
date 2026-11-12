@@ -5,7 +5,8 @@ Default order (privacy-first reframe):
   2. Save to ~/.cache/llm-speed/runs/<isoformat>-<fp_hash>.json (the local artifact;
      always written unless --dry-run or --json picks a different target).
   3. If consent given AND not --no-upload AND not --dry-run AND not --json: upload.
-  4. Print "Saved locally: <path>" always; print "Submitted: <url>" only on success.
+  4. Print "Saved locally: <path>" whenever a local file exists, including after
+     a successful upload next to "View and share your result: <url>".
 
 Special modes:
   - --resume PATH: skip everything, verify signature on PATH, POST as-is.
@@ -27,6 +28,8 @@ import sys
 import traceback
 from pathlib import Path
 
+from rich.text import Text
+
 from .. import SUITE_VERSION, __version__, ssd_stream
 from .. import sampling as sampling_mod
 from ..config import DEFAULT_API_BASE, DEFAULT_WORKLOADS, QUICK_WORKLOADS
@@ -40,12 +43,20 @@ from ..launch_telemetry import (
     parse_server_args,
     round_mib,
 )
-from ..output import get_console, print_error, print_run_summary, print_warning
+from ..output import (
+    get_console,
+    print_error,
+    print_run_summary,
+    print_saved_locally,
+    print_share_url,
+    print_warning,
+)
 from ..registry import all_driver_names, all_workload_names, get_driver, get_workload
 from ..signing import sign_report_jws as _sign_validate
 from ..types import ModelRef, RunReport, WorkloadResult
 from ..upload import (
     build_upload_payload,
+    mark_run_uploaded,
     save_offline,
     upload_or_save,
     upload_saved_payload,
@@ -257,12 +268,16 @@ def _attach_storage(fp, driver, model) -> None:
         fp.extras = {**(fp.extras or {}), "storage": block}
 
 
-def _handle_resume(args) -> int:
-    """--resume PATH: read a saved offline run, verify, upload."""
+def _upload_saved_run(path: Path, args, *, verb: str = "resume") -> int:
+    """Verify a saved run and POST that JWS. Shared by `bench --resume` and `submit`.
+
+    `verb` is only the word in the error text. `resume` keeps its `Submitted:`
+    line. `submit` prints the share URL. Both print the local path afterwards.
+    The saved file is not rewritten. A local sidecar records the success.
+    """
     console = get_console()
-    path = Path(args.resume)
     if not path.exists():
-        print_error(f"resume path not found: {path}")
+        print_error(f"{verb} path not found: {path}")
         return 1
     try:
         saved = json.loads(path.read_text(encoding="utf-8"))
@@ -299,11 +314,21 @@ def _handle_resume(args) -> int:
             credit=effective_credit(args),
         )
     except Exception as exc:
-        print_error(f"resume upload failed: {exc}")
+        print_error(f"{verb} upload failed: {exc}")
         return 1
 
-    console.print(f"[green]Submitted:[/green] {url}")
+    mark_run_uploaded(path)
+    if verb == "submit":
+        print_share_url(url)
+    else:
+        console.print(Text.assemble(("Submitted: ", "green"), url), soft_wrap=True)
+    print_saved_locally(path)
     return 0
+
+
+def _handle_resume(args) -> int:
+    """--resume PATH: read a saved offline run, verify, upload."""
+    return _upload_saved_run(Path(args.resume), args, verb="resume")
 
 
 def _guard_upload_base(
@@ -738,6 +763,9 @@ def cmd_bench(args) -> int:
                     strict_anon=strict_anon,
                     credit=credit,
                 )
+                if result_url and offline_path is not None:
+                    # Local sidecar only. The saved JSON and the POST are unchanged.
+                    mark_run_uploaded(offline_path)
                 if result_url and credit:
                     console.print(f"Credited to {credit.display} (unverified).")
                 # If upload failed and upload_or_save fell back to a save, prefer

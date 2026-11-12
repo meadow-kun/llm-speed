@@ -716,7 +716,12 @@ class Runner:
         need = backends.needed(preset, self._facts().get("kind"), overrides)
         if not need:
             return False
-        found = backends.job_probe(self.settings, preset.get("min_llama_build"))
+        found = backends.job_probe(
+            self.settings,
+            preset.get("min_llama_build"),
+            exact=preset.get("exact_llama_build"),
+            maximum=preset.get("max_llama_build"),
+        )
         miss = backends.missing(need, found)
         write_status(backends={"found": found, "missing": miss, "at": utcnow()})
         if not backends.blocking(need, miss):

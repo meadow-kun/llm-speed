@@ -229,6 +229,8 @@ def build_plan(
         "mlx_models_dir": str(mlx_dir),
         "llama_server": llama_server or "llama-server",
         "min_llama_build": preset.get("min_llama_build"),
+        "exact_llama_build": preset.get("exact_llama_build"),
+        "max_llama_build": preset.get("max_llama_build"),
         "ngl": 999,
         "health_timeout_s": preset.get("health_timeout_s", 900),
         "bench_timeout_s": preset.get("bench_timeout_s", 3600),
@@ -294,9 +296,12 @@ def find_llama_server(
     explicit: str | None,
     min_build: int | None,
     env: Mapping[str, str] | None = None,
+    *,
+    exact: Any = None,
+    maximum: Any = None,
 ) -> tuple[str | None, dict | None, list[str]]:
-    """First candidate that runs and meets the minimum build (no minimum: the first that
-    runs); else the best found."""
+    """First candidate that runs and meets the build window (no window: the first that
+    runs); else the best found. The caller rejects a best-found that misses the window."""
     tried: list[str] = []
     best: tuple[str, dict] | None = None
     for cand in llama_server_candidates(explicit, env):
@@ -305,7 +310,7 @@ def find_llama_server(
         info = fs.llama_version(cand)
         bn = info.get("build_number")
         tried.append(f"{cand}: build {info.get('build') or bn or 'unknown'}")
-        if llama_build_ok(cand, info, min_build):
+        if llama_build_ok(cand, info, min_build, exact=exact, maximum=maximum):
             return cand, info, tried
         if best is None:
             best = (cand, info)
@@ -314,15 +319,29 @@ def find_llama_server(
     return None, None, tried
 
 
-def llama_build_ok(path: str | None, info: dict | None, min_build: Any) -> bool:
-    """A found llama-server meets the preset: no `min_llama_build` = any build that
-    runs; else its reported build number must be at least the minimum."""
+def llama_build_ok(
+    path: str | None,
+    info: dict | None,
+    min_build: Any,
+    *,
+    exact: Any = None,
+    maximum: Any = None,
+) -> bool:
+    """A found llama-server meets the preset. No bound: any build that runs.
+    Otherwise `cli.llama_build.llama_build_error` is None."""
     if not path:
         return False
-    if not min_build:
-        return True
-    bn = (info or {}).get("build_number")
-    return bool(bn and bn >= int(min_build))
+    from ..llama_build import llama_build_error
+
+    return (
+        llama_build_error(
+            (info or {}).get("build_number"),
+            exact=exact,
+            minimum=min_build,
+            maximum=maximum,
+        )
+        is None
+    )
 
 
 # Pinned known-good llama.cpp release for installs when a preset names no newer
@@ -490,12 +509,38 @@ def mlx_install_hint() -> str:
 
 
 def auto_install_llama(
-    facts: dict[str, Any], min_build: Any, cmd: list[str] | None, text: str
+    facts: dict[str, Any],
+    min_build: Any,
+    cmd: list[str] | None,
+    text: str,
+    *,
+    exact: Any = None,
+    maximum: Any = None,
 ) -> tuple[int | None, str | None, dict | None]:
     """`bench --preset --install-backend` (agent auto-install on), Security Desk R-123:
     only the pinned official prebuilt (cli/llama_prebuilt.py: sha256-checked archives,
-    safe unpack, atomic move), never a version the preset picks. Returns (exit code or
-    None, llama-server full path, its version info)."""
+    safe unpack, atomic move), never a version the preset picks. A window the pin
+    does not satisfy is a failure: the pin is not installed in its place.
+    Returns (exit code or None, llama-server full path, its version info)."""
+    from ..llama_build import llama_build_error
+
+    pin_err = llama_build_error(
+        llama_prebuilt.PINNED_BUILD,
+        exact=exact,
+        minimum=min_build,
+        maximum=maximum,
+    )
+    if pin_err and (
+        exact is not None
+        or maximum is not None
+        or llama_prebuilt.newer_than_pin(min_build)
+    ):
+        say(
+            f"  agent auto-install installs only the pinned llama.cpp "
+            f"{llama_prebuilt.PINNED_TAG}. {pin_err} "
+            "It will not install a different build."
+        )
+        return BACKEND_MISSING_RC, None, None
     if llama_prebuilt.newer_than_pin(min_build):
         say(
             f"  agent auto-install installs only the pinned llama.cpp "
@@ -568,6 +613,39 @@ def results_dir(preset_name: str) -> Path:
     d = CACHE_DIR / "presets" / preset_name
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
     return d
+
+
+def _persist_build_failure(
+    plan: dict, rdir: Path, message: str, facts: dict | None = None
+) -> None:
+    """Write the mismatch as a failed fit result. The run does not continue."""
+    sargs = SimpleNamespace(
+        results=str(rdir / "results.json"),
+        machine=None,
+        force=False,
+        strict_anon=False,
+        cli_prefix=[sys.executable, "-m", "cli"],
+    )
+    sweep = fs.Sweep(None, sargs, plan=plan, launch_dir=rdir)
+    if facts:
+        sweep.facts = facts
+    sweep.record_llama_build_mismatch(message)
+    _attempts, rows = fit_rows(sweep, plan.get("preset") or "preset")
+    if not rows:
+        return
+    fs.atomic_write_json(
+        rdir / "fit_attempts.json",
+        {
+            "schema": "fit-attempts/1",
+            "cli_version": __version__,
+            "preset": plan.get("preset"),
+            "preset_version": None,
+            "preset_sha256": None,
+            "attempts": rows,
+        },
+    )
+    say(summary_table(latest_per_cell(rows)))
+    say(f"\nSaved: {rdir / 'results.json'} and {rdir / 'fit_attempts.json'}")
 
 
 def fit_rows(
@@ -869,25 +947,47 @@ def cmd_preset(args) -> int:
 
     stage(2, total, "Backends")
     min_build = preset.get("min_llama_build")
+    exact_build = preset.get("exact_llama_build")
+    max_build = preset.get("max_llama_build")
     need_llama = any(e.get("backend", "llama.cpp") == "llama.cpp" for e in live)
     if need_llama:
+        from ..llama_build import llama_build_error
+
         path, info, tried = find_llama_server(
-            getattr(args, "llama_server", None), min_build
+            getattr(args, "llama_server", None),
+            min_build,
+            exact=exact_build,
+            maximum=max_build,
         )
         bn = (info or {}).get("build_number")
-        ok = llama_build_ok(path, info, min_build)
-        if path and not ok and not getattr(args, "force", False):
-            why = preset.get("min_llama_build_why", "")
-            if bn and bn > 1:
-                say(
-                    f"  llama-server at {path} is build b{bn}; this preset needs b{min_build} or newer ({why})."
-                )
+        err = (
+            llama_build_error(
+                bn, exact=exact_build, minimum=min_build, maximum=max_build
+            )
+            if path
+            else None
+        )
+        force = getattr(args, "force", False)
+        unreadable = bool(err and err.startswith("llama-server does not report"))
+        hard = (
+            bool(err)
+            and not unreadable
+            and (exact_build is not None or max_build is not None)
+        )
+        if err and hard:
+            say(f"  {err}")
+            say("  This run does not switch to a different llama.cpp build.")
+            _persist_build_failure(plan, rdir, err)
+            return 2
+        if err and not force:
+            say(f"  {err}")
+            if exact_build is None and max_build is None:
+                path = None
             else:
-                say(
-                    f"  llama-server at {path} does not report a build number "
-                    f"(commit {(info or {}).get('commit') or '?'}); cannot confirm b{min_build}+."
-                )
-            path = None
+                _persist_build_failure(plan, rdir, err)
+                return 2
+        elif err and force and unreadable:
+            say(f"  warning: {err}; continuing because --force")
         if not path:
             cmd, text = llama_install_command(facts, llama_install_tag(min_build))
             say(
@@ -895,8 +995,18 @@ def cmd_preset(args) -> int:
             )
             auto = getattr(args, "install_backend", False) is True
             if auto:
-                rc, path, info = auto_install_llama(facts, min_build, cmd, text)
+                rc, path, info = auto_install_llama(
+                    facts, min_build, cmd, text, exact=exact_build, maximum=max_build
+                )
                 if rc is not None:
+                    pin_err = llama_build_error(
+                        llama_prebuilt.PINNED_BUILD,
+                        exact=exact_build,
+                        minimum=min_build,
+                        maximum=max_build,
+                    )
+                    if pin_err and rc == BACKEND_MISSING_RC:
+                        _persist_build_failure(plan, rdir, pin_err, facts)
                     return rc
                 bn = (info or {}).get("build_number")
             elif cmd and ask_yes_no(
@@ -908,13 +1018,26 @@ def cmd_preset(args) -> int:
                     say(f"  install command exited {rc}")
                     return 2
                 path, info, tried = find_llama_server(
-                    getattr(args, "llama_server", None), min_build
+                    getattr(args, "llama_server", None),
+                    min_build,
+                    exact=exact_build,
+                    maximum=max_build,
                 )
                 bn = (info or {}).get("build_number")
-                if not llama_build_ok(path, info, min_build):
-                    say(
-                        "  still no llama-server at the required build; see the command above"
+                if not llama_build_ok(
+                    path, info, min_build, exact=exact_build, maximum=max_build
+                ):
+                    mismatch = (
+                        llama_build_error(
+                            (info or {}).get("build_number"),
+                            exact=exact_build,
+                            minimum=min_build,
+                            maximum=max_build,
+                        )
+                        or "still no llama-server at the required build"
                     )
+                    say(f"  {mismatch}")
+                    _persist_build_failure(plan, rdir, mismatch)
                     return 2
             elif not getattr(args, "force", False):
                 say("  Then rerun this command (or pass --llama-server PATH).")
@@ -975,12 +1098,26 @@ def cmd_preset(args) -> int:
         rc = 130
     if getattr(sweep, "facts", None) is None or sweep.machine == "auto":
         return rc
+    attempts, rows = fit_rows(sweep, name)
     if rc == 2:
         say("Preflight failed; nothing was run.")
+        if rows:
+            fs.atomic_write_json(
+                rdir / "fit_attempts.json",
+                {
+                    "schema": "fit-attempts/1",
+                    "cli_version": __version__,
+                    "preset": name,
+                    "preset_version": preset.get("version"),
+                    "preset_sha256": preset_sha256(preset),
+                    "attempts": rows,
+                },
+            )
+            say(summary_table(latest_per_cell(rows)))
+            say(f"\nSaved: {rdir / 'results.json'} and {rdir / 'fit_attempts.json'}")
         return rc
 
     stage(4, total, "Results")
-    attempts, rows = fit_rows(sweep, name)
     sweep_id = rows[0]["sweep_id"] if rows else f"{name}-{sweep.machine}"
     fs.atomic_write_json(
         rdir / "fit_attempts.json",

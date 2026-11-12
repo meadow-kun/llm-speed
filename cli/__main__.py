@@ -278,6 +278,63 @@ def _build_parser() -> argparse.ArgumentParser:
         help="upload a previously-saved offline run from PATH (no fresh benchmark; verifies signature first)",
     )
 
+    # submit -------------------------------------------------------------
+    p_submit = sub.add_parser(
+        "submit",
+        help="upload saved runs (paths, or unsent runs in the cache)",
+        description=(
+            "Upload runs saved under ~/.cache/llm-speed/runs, or the paths you name. "
+            "With no path, lists runs that have not been submitted, uses the same "
+            "consent prompt as bench, then asks once to upload that list. A named "
+            "path is uploaded like bench --resume after the same consent check."
+        ),
+    )
+    p_submit.add_argument(
+        "paths",
+        nargs="*",
+        metavar="PATH",
+        help="saved run JSON files (default: unsent runs in the cache)",
+    )
+    p_submit.add_argument(
+        "--api-key", default=None, help="bearer token for upload auth"
+    )
+    p_submit.add_argument(
+        "--anon",
+        action="store_true",
+        help="anonymous upload: drop the Authorization bearer token; persistent keypair still ships",
+    )
+    p_submit.add_argument(
+        "--strict-anon",
+        action="store_true",
+        help=(
+            "no API key, no User-Agent, no credit. A saved run that carries a "
+            "fingerprint hash or a storage block is not posted. Counts as consent "
+            "for the consent gate; the batch confirmation still applies"
+        ),
+    )
+    p_submit.add_argument(
+        "--credit",
+        default=None,
+        metavar="HANDLE",
+        help=(
+            "credit this upload to your X (@name) or Reddit (u/name) handle, shown "
+            "publicly as unverified. Not allowed with --strict-anon or --anon"
+        ),
+    )
+    p_submit.add_argument(
+        "--no-credit",
+        action="store_true",
+        help="upload without your saved credit handle",
+    )
+    p_submit.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "answer yes to 'Upload the N runs listed above?'. Does not grant "
+            "consent: without consent.json a non-TTY submit still uploads nothing"
+        ),
+    )
+
     # preset -------------------------------------------------------------
     p_preset = sub.add_parser(
         "preset", help="inspect launch presets (hash for review-then-publish)"
@@ -484,6 +541,10 @@ def _dispatch(args, parser: argparse.ArgumentParser) -> int:
         from .commands.bench import cmd_bench
 
         return cmd_bench(args)
+    if cmd == "submit":
+        from .commands.submit import cmd_submit
+
+        return cmd_submit(args)
     if cmd == "preset":
         from .commands.preset import cmd_preset_tool
 
