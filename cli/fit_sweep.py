@@ -1072,8 +1072,27 @@ class Sweep:
         return rec
 
     # ---- preflight
+    def _too_many_stream_problems(self) -> list[str]:
+        """Refuse a 7th stream count before attempt_llama starts a server."""
+        from cli.workloads.concurrent_decode import stream_list_error
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for entry in self.entries():
+            for step in self.contexts(entry):
+                raw = ((step or {}).get("env") or {}).get(
+                    "LLM_SPEED_CONCURRENT_STREAMS"
+                )
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                err = stream_list_error(raw)
+                if err and err.startswith("at most ") and err not in seen:
+                    seen.add(err)
+                    out.append(err)
+        return out
+
     def preflight(self, need_llama: bool, need_mlx: bool) -> list[str]:
-        problems = []
+        problems = self._too_many_stream_problems()
         self.facts = machine_facts(self.gpu_index)
         if self.machine == "auto":
             self.machine = machine_slug(self.facts)
@@ -1132,6 +1151,15 @@ class Sweep:
 
     # ---- one attempt (llama.cpp)
     def attempt_llama(self, entry: dict, c: dict, adir: Path) -> dict:
+        raw = ((c or {}).get("env") or {}).get("LLM_SPEED_CONCURRENT_STREAMS")
+        if isinstance(raw, str) and raw.strip():
+            from cli.workloads.concurrent_decode import stream_list_error
+
+            err = stream_list_error(raw)
+            if err and err.startswith("at most "):
+                rec = self.base_record(entry, c, "failed", note=err)
+                rec["error"] = err
+                return rec
         port = free_port()
         cmd = self.server_cmd(entry, c, port)
         wl = self.workloads_for(entry, c)
@@ -2195,6 +2223,28 @@ def summarize_result(r: dict) -> dict:
         if isinstance(out.get(k), float):
             out[k] = round(out[k], 2)
     out["model"] = {k: m.get(k) for k in ("identifier", "name", "quant", "digest")}
+    if ex.get("concurrency_curve"):
+        out["concurrency_curve"] = [
+            {
+                k: (round(p[k], 2) if isinstance(p.get(k), float) else p.get(k))
+                for k in (
+                    "batch",
+                    "per_stream_tps",
+                    "aggregate_tps",
+                    "prefill_tps",
+                    "prefill_tps_source",
+                    "ttft_ms",
+                    "ttft_max_ms",
+                    "decode_tps_source",
+                    "prompt_tokens",
+                    "n_success",
+                    "n_failures",
+                    "skipped",
+                    "error",
+                )
+            }
+            for p in ex["concurrency_curve"]
+        ]
     if ex.get("context_curve"):
         out["context_curve"] = [
             {
@@ -2223,6 +2273,11 @@ def summarize_result(r: dict) -> dict:
         "llama_cpp_commit",
         "llama_server_args",
         "server_n_ctx",
+        "n_ctx_slot",
+        "kv_unified",
+        "decode_tps_source",
+        "prefill_tps_source",
+        "row_metrics_basis",
         "model_file",
         "model_file_bytes",
     ):

@@ -55,7 +55,13 @@ from ..launch_telemetry import (
 from ..registry import register_driver
 from ..sampling import DRIVER_SUPPORT as SAMPLING_DRIVER_SUPPORT
 from ..sampling import split as split_sampling
-from ..timing import now_ms, server_decode_tps
+from ..timing import (
+    PREFILL_TPS_SERVER,
+    RECORD_SERVER_PREFILL,
+    now_ms,
+    server_decode_tps,
+    server_prefill_tps,
+)
 from ..types import (
     BackendDetection,
     ChatRunOutcome,
@@ -601,10 +607,13 @@ class LlamaCppDriver:
                 payload[k] = extras[k]
 
         url = f"{self._server.base_url}/v1/chat/completions"
+        # Server prompt tok/s is a concurrent-decode input. Other workloads
+        # keep prompt tokens over client TTFT, the same basis as 0.0.22.
+        record_prefill = bool(extras.get(RECORD_SERVER_PREFILL))
 
         if not stream:
-            return self._run_chat_nonstream(url, payload)
-        return self._run_chat_stream(url, payload)
+            return self._run_chat_nonstream(url, payload, record_prefill)
+        return self._run_chat_stream(url, payload, record_prefill)
 
     # ------------------------------------------------------------- streaming
 
@@ -612,6 +621,7 @@ class LlamaCppDriver:
         self,
         url: str,
         payload: dict[str, Any],
+        record_prefill: bool = False,
     ) -> ChatRunOutcome:
         assert self._client is not None
         out_text_parts: list[str] = []
@@ -690,13 +700,15 @@ class LlamaCppDriver:
                         prompt_tokens = usage.get("prompt_tokens") or prompt_tokens
                         output_tokens = usage.get("completion_tokens") or output_tokens
                         backend_extras["usage"] = usage
-                    rate = server_decode_tps(_event_timings(evt))
+                    timings = _event_timings(evt)
+                    rate = server_decode_tps(timings)
                     if rate is not None:
                         # Every llama.cpp row. One SSE delta is one chunk, so
                         # the server timings replace the chunk-gap rate
                         # whenever they are a real decode rate.
                         backend_extras["decode_tps"] = rate.tps
                         backend_extras["decode_tps_source"] = rate.source
+                    _attach_server_prefill(backend_extras, timings, record_prefill)
 
         except httpx.ReadTimeout as exc:
             return _failed_outcome(
@@ -730,6 +742,7 @@ class LlamaCppDriver:
         self,
         url: str,
         payload: dict[str, Any],
+        record_prefill: bool = False,
     ) -> ChatRunOutcome:
         assert self._client is not None
         t_start = now_ms()
@@ -754,10 +767,12 @@ class LlamaCppDriver:
 
         usage = data.get("usage") or {}
         extras: dict[str, Any] = {"usage": usage} if usage else {}
-        rate = server_decode_tps(_event_timings(data))
+        timings = _event_timings(data)
+        rate = server_decode_tps(timings)
         if rate is not None:
             extras["decode_tps"] = rate.tps
             extras["decode_tps_source"] = rate.source
+        _attach_server_prefill(extras, timings, record_prefill)
         return ChatRunOutcome(
             success=True,
             output_text=text,
@@ -1121,6 +1136,17 @@ class LlamaCppDriver:
             self.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _attach_server_prefill(dest: dict[str, Any], timings: object, record: bool) -> None:
+    """Record llama-server prompt tok/s only when the caller asked for it."""
+    if not record:
+        return
+    prefill = server_prefill_tps(timings)
+    if prefill is None:
+        return
+    dest["prefill_tps"] = prefill
+    dest["prefill_tps_source"] = PREFILL_TPS_SERVER
 
 
 def _failed_outcome(error: str) -> ChatRunOutcome:

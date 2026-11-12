@@ -469,7 +469,7 @@
                 },
                 "LLM_SPEED_CONCURRENT_STREAMS": {
                   "type": "string",
-                  "pattern": "^[1-9][0-9]{0,2}(,[1-9][0-9]{0,2}){0,7}$"
+                  "pattern": "^[1-9][0-9]{0,2}(,[1-9][0-9]{0,2}){0,5}$"
                 },
                 "LLM_SPEED_CONCURRENT_PROMPT": {
                   "type": "string",

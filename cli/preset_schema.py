@@ -166,8 +166,13 @@ def _errors(v: Any, s: dict, root: dict, path: str) -> list[str]:
 
 
 def _concurrent_env_errors(p: dict) -> list[str]:
-    """Streams must be 1-64 and the prompt 1024-1048576. Same numbers as the workload."""
-    from .workloads.concurrent_decode import parse_prompt_target, parse_stream_list
+    """Streams must be 1-64, at most 6 of them, and the prompt 1024-1048576."""
+    from .workloads.concurrent_decode import (
+        MAX_STREAM_COUNTS,
+        parse_prompt_target,
+        parse_stream_list,
+        too_many_streams_message,
+    )
 
     errs: list[str] = []
 
@@ -175,10 +180,17 @@ def _concurrent_env_errors(p: dict) -> list[str]:
         if not isinstance(env, dict):
             return
         streams = env.get("LLM_SPEED_CONCURRENT_STREAMS")
-        if isinstance(streams, str) and parse_stream_list(streams) is None:
-            errs.append(
-                f"{path}.LLM_SPEED_CONCURRENT_STREAMS: each stream must be 1-64"
-            )
+        if isinstance(streams, str):
+            parsed = parse_stream_list(streams)
+            if parsed is None:
+                errs.append(
+                    f"{path}.LLM_SPEED_CONCURRENT_STREAMS: each stream must be 1-64"
+                )
+            elif len(parsed) > MAX_STREAM_COUNTS:
+                errs.append(
+                    f"{path}.LLM_SPEED_CONCURRENT_STREAMS: "
+                    f"{too_many_streams_message(len(parsed))}"
+                )
         prompt = env.get("LLM_SPEED_CONCURRENT_PROMPT")
         if isinstance(prompt, str) and parse_prompt_target(prompt) is None:
             errs.append(f"{path}.LLM_SPEED_CONCURRENT_PROMPT: must be 1024-1048576")
@@ -264,8 +276,13 @@ def _semantic_errors(p: dict) -> list[str]:
 def validate_preset(p: Any) -> None:
     root = load_schema()
     errs = _errors(p, root, root, "$")
-    if not errs and isinstance(p, dict):
-        errs = _semantic_errors(p)
+    if isinstance(p, dict):
+        # A 7th stream count fails the schema pattern first. Still say why,
+        # so the refusal is the same message the CLI prints before a server starts.
+        if errs:
+            errs = _concurrent_env_errors(p) + errs
+        else:
+            errs = _semantic_errors(p)
     if errs:
         raise PresetInvalid("; ".join(errs[:8]))
 

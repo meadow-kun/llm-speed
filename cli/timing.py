@@ -58,6 +58,13 @@ _PREDICTED_MS_FLOOR = 0.001
 DECODE_TPS_SERVER_TIMINGS = "server_timings"
 DECODE_TPS_SERVER_N_MS = "server_predicted_n_ms"
 DECODE_TPS_STREAM_CHUNKS = "stream_chunks"
+# Basis for a concurrent-decode point's prefill_tps.
+PREFILL_TPS_SERVER = "server_prompt_per_second"
+PREFILL_TPS_OVER_TTFT = "prompt_over_ttft"
+# run_chat extra. Only concurrent-decode sets it. Other workloads leave it
+# unset, so a llama.cpp chat or long-context row keeps prompt tokens over
+# the client's time to first token (the 0.0.22 prefill basis).
+RECORD_SERVER_PREFILL = "record_server_prefill"
 _SERVER_DECODE_SOURCES = frozenset({DECODE_TPS_SERVER_TIMINGS, DECODE_TPS_SERVER_N_MS})
 
 
@@ -110,6 +117,21 @@ def server_decode_tps(timings: object) -> ServerDecodeRate | None:
         return ServerDecodeRate(per, DECODE_TPS_SERVER_TIMINGS)
     if n is not None and n >= 2 and ms is not None and ms > _PREDICTED_MS_FLOOR:
         return ServerDecodeRate((n - 1.0) / (ms / 1000.0), DECODE_TPS_SERVER_N_MS)
+    return None
+
+
+def server_prefill_tps(timings: object) -> float | None:
+    """llama-server prompt tok/s (`prompt_per_second`), or None.
+
+    fecdc81 `n_prompt_tps()` is prompt tokens over `t_prompt_ms`
+    (`tools/server/server-common.h:475-477`, published at
+    `server-common.cpp:146-148`). A missing or non-positive value is not a rate.
+    """
+    if not isinstance(timings, dict):
+        return None
+    per = _timing_number(timings.get("prompt_per_second"))
+    if per is not None and per > 0:
+        return per
     return None
 
 

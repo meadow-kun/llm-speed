@@ -377,6 +377,16 @@ def cmd_bench(args) -> int:
     except CreditError as exc:
         print_error(str(exc))
         return 2
+    # A 7th concurrent-decode stream count is refused before a preset, a driver,
+    # or llama-server starts. Six counts (the Launch Lab list) still run.
+    raw_streams = os.environ.get("LLM_SPEED_CONCURRENT_STREAMS")
+    if raw_streams and str(raw_streams).strip():
+        from ..workloads.concurrent_decode import stream_list_error
+
+        stream_err = stream_list_error(str(raw_streams))
+        if stream_err and stream_err.startswith("at most "):
+            print_error(stream_err)
+            return 2
     # Sampling sent with every request (--temperature/--seed/--top-k/--top-p/--min-p).
     # Validated before any work, also for --preset (passed on to each step).
     try:
