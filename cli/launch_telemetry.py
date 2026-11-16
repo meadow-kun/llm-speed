@@ -345,6 +345,9 @@ _STRICT_ARGS: dict[str, object] = {
     "--no-warmup": _NONE,
     "--cont-batching": _NONE,
     "--no-cont-batching": _NONE,
+    # T101c-eos: Launch Lab passes --ignore-eos on llama-server; keep it
+    # in the published llama_server_args label (value-less, existing field).
+    "--ignore-eos": _NONE,
 }
 _ARG_ALLOWLIST |= set(_STRICT_ARGS)
 _INT_RE = re.compile(r"-?[0-9]{1,10}")

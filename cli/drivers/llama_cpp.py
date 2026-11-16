@@ -605,6 +605,12 @@ class LlamaCppDriver:
         for k in ("temperature", "top_p", "top_k", "min_p", "seed", "stop"):
             if k in extras:
                 payload[k] = extras[k]
+        # T101c-eos: chat-short / concurrent-decode ask for a fixed output
+        # length. llama-server honours ignore_eos on /v1/chat/completions;
+        # n_predict matches max_tokens (the workload budget).
+        if extras.get("ignore_eos"):
+            payload["ignore_eos"] = True
+            payload["n_predict"] = max_output_tokens
 
         url = f"{self._server.base_url}/v1/chat/completions"
         # Server prompt tok/s is a concurrent-decode input. Other workloads

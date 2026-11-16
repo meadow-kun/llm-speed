@@ -686,7 +686,7 @@ def _take_lab_session(args) -> int | None:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     # The mode implies strict-anon: ephemeral key, no fingerprint hash, no storage
-    # block, no llm-speed-cli User-Agent, no API key, no credit.
+    # block, no llm-speed User-Agent (httpx default only), no API key, no credit.
     args.strict_anon = True
     return None
 

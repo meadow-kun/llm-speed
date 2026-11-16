@@ -103,17 +103,23 @@ class ChatShortWorkload:
 
     name = "chat-short"
     suite_version = SUITE_VERSION
+    # T101c-eos / R-215: set only in --lab-session (cli/commands/bench.py).
+    fixed_length = False
 
     def run(self, driver, model: ModelRef) -> WorkloadResult:
         prompt = SHORT_USER_MSG
         LOG.debug("chat-short prompt: %d chars", len(prompt))
 
         try:
+            extras = (
+                {"ignore_eos": True} if getattr(self, "fixed_length", False) else None
+            )
             outcome = driver.run_chat(
                 model,
                 prompt,
                 max_output_tokens=OUTPUT_TOKENS,
                 stream=True,
+                extras=extras,
             )
         except Exception as exc:  # noqa: BLE001
             LOG.exception("chat-short driver raised")

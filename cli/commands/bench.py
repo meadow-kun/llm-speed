@@ -407,26 +407,70 @@ def _lab_preflight(args) -> int | None:
     return None
 
 
-def _lab_upload(args, report, api_base: str, console) -> str | None:
+def _lab_save(report, *, want_pins: bool):
+    """Compute the lab pins and write the unsigned local record (R-194, R-195).
+
+    Returns (pins or None, path). On a pin failure the record is still written,
+    without pins, and the reason is printed; the upload is then refused. A run with
+    no measurement is never uploaded, so it is not pinned (no model hash)."""
+    from .. import lab_session
+    from ..signing import build_uploadable_report
+    from ..upload import save_lab_record
+
+    pins = None
+    if not want_pins:
+        record = build_uploadable_report(
+            report, strict_anon=True, include_raw_timings=True
+        )
+        return None, save_lab_record(report, record)
+    try:
+        pins = lab_session.lab_pins(report)
+        record = lab_session.build_lab_payload(report, pins, include_raw_timings=True)
+    except lab_session.LabSessionError as exc:
+        print_error(f"lab upload failed: {exc}")
+        record = build_uploadable_report(
+            report, strict_anon=True, include_raw_timings=True
+        )
+    return pins, save_lab_record(report, record)
+
+
+def _lab_upload(args, report, api_base: str, console, pins) -> str | None:
     """POST a lab run. Returns the result URL, or None after printing why not.
 
     The lab JWS and the token live only inside `upload_lab_report`. Nothing is
-    saved here: the strict-anon local save (with its `lab_session` marker) was
-    written before this call and is not re-written on failure."""
+    saved here: the unsigned local record was written before this call and is not
+    re-written on failure. The close-step line (seq, public_key, jws_sha256) is
+    printed immediately before the POST, so a lost response does not lose it
+    (R-196); run_id follows on success."""
     from .. import lab_session
     from ..upload import UploadError
 
+    if pins is None:
+        return None  # the reason was printed by _lab_save
+
+    def signed(s) -> None:
+        # Not secrets: no token, no JWS, no sid.
+        console.print(
+            Text(
+                f"Lab upload: seq {s.seq}, public_key {s.public_key}, "
+                f"jws_sha256 {s.jws_sha256}"
+            ),
+            soft_wrap=True,
+        )
+
     try:
         res = lab_session.upload_lab_report(
-            report, args.lab_credentials, api_base=api_base
+            report,
+            args.lab_credentials,
+            api_base=api_base,
+            pins=pins,
+            on_signed=signed,
         )
     except (lab_session.LabSessionError, UploadError, ValueError) as exc:
         # LabSessionError is a ValueError; so are the privacy invariant and the
         # API-base checks. None of these messages carries the token.
         print_error(f"lab upload failed: {exc}")
         return None
-    # For the controller's close step (seq, run_id, public_key, jws_sha256). These
-    # are not secrets: no token, no JWS, no sid.
     console.print(
         Text(
             f"Lab upload: seq {res.seq}, run_id {res.run_id or '-'}, "
@@ -694,6 +738,9 @@ def cmd_bench(args) -> int:
         proc_sampler = ssd_stream.start_proc_sampler()
         try:
             wl = get_workload(wname)
+            # T101c-eos / R-215: fixed-length decode is lab-only.
+            if lab:
+                wl.fixed_length = True
             try:
                 res = wl.run(driver, model)
             finally:
@@ -778,6 +825,7 @@ def cmd_bench(args) -> int:
     # 7. Local save + optional upload.
     result_url: str | None = None
     lab_failed = False
+    lab_pins = None
     offline_path: Path | None = None
 
     if dry_run:
@@ -787,10 +835,14 @@ def cmd_bench(args) -> int:
         # Explicit local save target. No upload.
         offline_path = save_offline(report, Path(json_path), strict_anon=strict_anon)
     else:
-        # Default: always save locally. A lab run saves the plain strict-anon JWS
-        # plus a `lab_session` marker; never the claim or the token.
+        # Default: always save locally. A lab run saves an unsigned record that no
+        # CLI can post (R-194); never a JWS, the claim or the token.
         if lab:
-            offline_path = save_offline(report, strict_anon=True, lab_session=True)
+            lab_pins, offline_path = _lab_save(
+                report,
+                want_pins=not no_upload and any(r.error is None for r in results),
+            )
+            lab_failed = lab_pins is None
         else:
             offline_path = save_offline(report, strict_anon=strict_anon)
 
@@ -846,7 +898,7 @@ def cmd_bench(args) -> int:
                 credit = None if anon else effective_credit(args)
                 if lab:
                     credit = None
-                    result_url = _lab_upload(args, report, api_base, console)
+                    result_url = _lab_upload(args, report, api_base, console, lab_pins)
                     fallback_path = None
                     lab_failed = result_url is None
                 else:

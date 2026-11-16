@@ -247,11 +247,15 @@ def _count_with(driver, model):
 
 
 def _run_one(
-    driver, model: ModelRef, prompt: str
+    driver, model: ModelRef, prompt: str, *, fixed_length: bool = False
 ) -> tuple[bool, ChatRunOutcome, float, float]:
     """Run a single request; return (success, outcome, started_ms, finished_ms)."""
     started = now_ms()
     try:
+        extras = {RECORD_SERVER_PREFILL: True}
+        # T101c-eos / R-215: ignore_eos is lab-only (fixed_length).
+        if fixed_length:
+            extras["ignore_eos"] = True
         outcome = driver.run_chat(
             model,
             prompt,
@@ -259,7 +263,7 @@ def _run_one(
             stream=True,
             # Server prompt tok/s stays on this workload. Chat and long-context
             # rows do not set this, so they keep prompt tokens over client TTFT.
-            extras={RECORD_SERVER_PREFILL: True},
+            extras=extras,
         )
     except Exception as exc:  # noqa: BLE001
         LOG.exception("concurrent-decode: stream raised")
@@ -284,18 +288,24 @@ def _run_one(
 
 
 def _measure_batch(
-    driver, model: ModelRef, batch_size: int, prompt: str
+    driver,
+    model: ModelRef,
+    batch_size: int,
+    prompt: str,
+    *,
+    fixed_length: bool = False,
 ) -> dict[str, Any]:
     """Run `batch_size` parallel streams and aggregate metrics."""
     LOG.debug("concurrent-decode batch=%d starting", batch_size)
 
     completions: list[tuple[bool, ChatRunOutcome, float, float]] = []
     if batch_size == 1:
-        completions.append(_run_one(driver, model, prompt))
+        completions.append(_run_one(driver, model, prompt, fixed_length=fixed_length))
     else:
         with ThreadPoolExecutor(max_workers=batch_size) as pool:
             futs = [
-                pool.submit(_run_one, driver, model, prompt) for _ in range(batch_size)
+                pool.submit(_run_one, driver, model, prompt, fixed_length=fixed_length)
+                for _ in range(batch_size)
             ]
             for f in as_completed(futs):
                 completions.append(f.result())
@@ -397,6 +407,8 @@ class ConcurrentDecodeWorkload:
 
     name = "concurrent-decode"
     suite_version = SUITE_VERSION
+    # T101c-eos / R-215: set only in --lab-session (cli/commands/bench.py).
+    fixed_length = False
 
     def run(self, driver, model: ModelRef) -> WorkloadResult:
         flags: list[str] = []
@@ -459,7 +471,13 @@ class ConcurrentDecodeWorkload:
                     extras=slot_extra,
                 )
         for bs in streams:
-            point = _measure_batch(driver, model, bs, prompt)
+            point = _measure_batch(
+                driver,
+                model,
+                bs,
+                prompt,
+                fixed_length=getattr(self, "fixed_length", False),
+            )
             curve.append(point)
             if not point["skipped"]:
                 any_success = True
