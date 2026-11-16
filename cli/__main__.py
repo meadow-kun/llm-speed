@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import traceback
 
@@ -98,6 +99,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--strict-anon",
         action="store_true",
         help="strongest privacy: rotate keypair per run, drop fingerprint_hash, no User-Agent",
+    )
+    p_bench.add_argument(
+        "--lab-session",
+        dest="lab_session",
+        action="store_true",
+        help=(
+            "Launch Lab session: implies --strict-anon, reads one per-run token from "
+            "the inherited pipe named by $LLM_SPEED_LAB_FD (a file descriptor number, "
+            "never a token), and uploads once, only to api.llm-speed.com, with the "
+            "lab_session claim and lab_attestation. Not with --resume, --preset, "
+            "--no-upload, --json, --dry-run, --print-payload, --anon, --api-key, "
+            "--credit, --share-storage-info or --upload-failures"
+        ),
     )
     p_bench.add_argument(
         "--credit",
@@ -647,10 +661,45 @@ def _cmd_mcp(args) -> int:
     return 0
 
 
+def _take_lab_session(args) -> int | None:
+    """`bench --lab-session`: read the per-run token from the pipe in
+    $LLM_SPEED_LAB_FD, close that fd and clear the variable. Runs before the
+    background updater or any other child process starts. Without the flag the
+    variable and the pipe are not touched. Returns an exit code on error."""
+    if not getattr(args, "lab_session", False):
+        return None
+    from . import lab_session
+
+    bad = lab_session.incompatible_flags(args)
+    if bad:
+        # Clear the variable even on a refused combination; the pipe is not read.
+        os.environ.pop(lab_session.LAB_FD_ENV, None)
+        print(
+            f"error: {lab_session.LAB_FLAG} cannot be combined with {', '.join(bad)} "
+            "(one per-run token is one upload of one fresh run)",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        args.lab_credentials = lab_session.take_lab_credentials()
+    except lab_session.LabSessionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # The mode implies strict-anon: ephemeral key, no fingerprint hash, no storage
+    # block, no llm-speed-cli User-Agent, no API key, no credit.
+    args.strict_anon = True
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     _configure_logging(getattr(args, "verbose", False))
+    # rev 3.3 C4: before maybe_start_background (a child process) and before any
+    # driver or llama-server can start.
+    lab_rc = _take_lab_session(args)
+    if lab_rc is not None:
+        return lab_rc
     try:
         from .autoupdate import maybe_start_background
 

@@ -31,6 +31,7 @@ def print_run_summary(
     *,
     result_url: str | None = None,
     offline_path: Path | None = None,
+    lab_session: bool = False,
 ) -> None:
     """Headline + per-workload table + footer."""
     fp = report.fingerprint
@@ -120,10 +121,13 @@ def print_run_summary(
     if offline_path:
         print_saved_locally(offline_path)
         if not result_url:
-            _console.print(
-                "  Re-upload later with: "
-                f"[bold]llm-speed bench --resume {offline_path}[/bold]"
-            )
+            if lab_session:
+                _console.print("  Lab saves cannot be re-uploaded with --resume.")
+            else:
+                _console.print(
+                    "  Re-upload later with: "
+                    f"[bold]llm-speed bench --resume {offline_path}[/bold]"
+                )
 
 
 def print_share_url(result_url: str) -> None:

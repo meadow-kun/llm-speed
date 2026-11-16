@@ -190,6 +190,28 @@ consented for) carry one more field inside the signed run:
 - **On your machine.** Kept in memory for the job only: not in the job log, run files, status
   files or the job result, and never printed.
 
+### Launch Lab session runs only: the lab session fields (0.0.24)
+
+Only `llm-speed bench --lab-session`, started by the Launch Lab controller for one session run,
+adds two fields. Nothing is added to default, `--anon` or plain `--strict-anon` uploads.
+
+| Field | Example | Why |
+|---|---|---|
+| `lab_session` (inside the signed run) | `{"sid": "lss_0123456789abcdef", "ath": "<43 base64url chars>", "seq": 2}` | which lab session and run slot this is; `ath` is the sha256 of the one-time token, not the token |
+| `lab_attestation` (next to the JWS) | `lla_` + 64 hex characters | the one-time token for that slot, so the server can check `ath` |
+
+- **Strict-anon otherwise.** Ephemeral key, no `fingerprint_hash`, no storage block, no
+  API key, no credit, and no `X-LLM-Speed-Anon` header. Lab uploads send httpx's default
+  User-Agent (`python-httpx/<version>`), not `llm-speed-cli/<version>`, the same as the
+  User-Agent table below for `--strict-anon`.
+- **Private (planned, not live until the Worker change (PR #379) ships).** Planned
+  behaviour, once that Worker change is live: the server hashes `lab_attestation` on
+  receipt and discards it. `lab_session` stays inside the private signature and is never
+  shown publicly.
+- **On the machine.** The token arrives through an inherited pipe (`LLM_SPEED_LAB_FD` holds only the
+  pipe's fd number), is kept in memory for that one upload, and is never written to the run
+  file, a log or the terminal. Uploads go only to `api.llm-speed.com`.
+
 ---
 
 ## 2. What we don't collect

@@ -368,7 +368,81 @@ def _guard_upload_base(
     return True, api_key
 
 
+def _lab_preflight(args) -> int | None:
+    """`--lab-session` checks before any work. Returns an exit code on refusal.
+
+    `cli.__main__.main` has already read the per-run token from the pipe, closed it,
+    cleared $LLM_SPEED_LAB_FD and turned strict-anon on. This repeats the flag checks
+    for callers that reach `cmd_bench` directly, and refuses a target other than the
+    issuing host, or an upload that could not happen, before anything runs."""
+    from .. import lab_session
+
+    if getattr(args, "lab_credentials", None) is None:
+        print_error(
+            f"{lab_session.LAB_FLAG}: no lab credentials were read from "
+            f"{lab_session.LAB_FD_ENV}; run it as `llm-speed bench {lab_session.LAB_FLAG}`"
+        )
+        return 2
+    bad = lab_session.incompatible_flags(args)
+    if bad:
+        print_error(
+            f"{lab_session.LAB_FLAG} cannot be combined with {', '.join(bad)} "
+            "(one per-run token is one upload of one fresh run)"
+        )
+        return 2
+    args.strict_anon = True
+    api_base = getattr(args, "api_base", None) or DEFAULT_API_BASE
+    try:
+        lab_session.require_issuing_host(api_base)
+    except (lab_session.LabSessionError, ValueError) as exc:
+        print_error(str(exc))
+        return 2
+    if offline():
+        print_error(f"{lab_session.LAB_FLAG} needs an upload; LLM_SPEED_OFFLINE is set")
+        return 2
+    blocked = upload_block_reason(api_base)
+    if blocked:
+        print_error(f"{lab_session.LAB_FLAG} needs an upload; not uploading: {blocked}")
+        return 2
+    return None
+
+
+def _lab_upload(args, report, api_base: str, console) -> str | None:
+    """POST a lab run. Returns the result URL, or None after printing why not.
+
+    The lab JWS and the token live only inside `upload_lab_report`. Nothing is
+    saved here: the strict-anon local save (with its `lab_session` marker) was
+    written before this call and is not re-written on failure."""
+    from .. import lab_session
+    from ..upload import UploadError
+
+    try:
+        res = lab_session.upload_lab_report(
+            report, args.lab_credentials, api_base=api_base
+        )
+    except (lab_session.LabSessionError, UploadError, ValueError) as exc:
+        # LabSessionError is a ValueError; so are the privacy invariant and the
+        # API-base checks. None of these messages carries the token.
+        print_error(f"lab upload failed: {exc}")
+        return None
+    # For the controller's close step (seq, run_id, public_key, jws_sha256). These
+    # are not secrets: no token, no JWS, no sid.
+    console.print(
+        Text(
+            f"Lab upload: seq {res.seq}, run_id {res.run_id or '-'}, "
+            f"public_key {res.public_key}, jws_sha256 {res.jws_sha256}"
+        ),
+        soft_wrap=True,
+    )
+    return res.url
+
+
 def cmd_bench(args) -> int:
+    lab = bool(getattr(args, "lab_session", False))
+    if lab:
+        lab_rc = _lab_preflight(args)
+        if lab_rc is not None:
+            return lab_rc
     # Contributor credit: reject bad handles / forbidden combos before any work.
     from ..credit import CreditError, check_flags
 
@@ -703,6 +777,7 @@ def cmd_bench(args) -> int:
 
     # 7. Local save + optional upload.
     result_url: str | None = None
+    lab_failed = False
     offline_path: Path | None = None
 
     if dry_run:
@@ -712,8 +787,12 @@ def cmd_bench(args) -> int:
         # Explicit local save target. No upload.
         offline_path = save_offline(report, Path(json_path), strict_anon=strict_anon)
     else:
-        # Default: always save locally.
-        offline_path = save_offline(report, strict_anon=strict_anon)
+        # Default: always save locally. A lab run saves the plain strict-anon JWS
+        # plus a `lab_session` marker; never the claim or the token.
+        if lab:
+            offline_path = save_offline(report, strict_anon=True, lab_session=True)
+        else:
+            offline_path = save_offline(report, strict_anon=strict_anon)
 
         has_measurement = any(r.error is None for r in results)
         # --upload-failures (opt-in): publish a run whose only content is a
@@ -765,14 +844,20 @@ def cmd_bench(args) -> int:
                 ):
                     _attach_storage(report.fingerprint, driver, model)
                 credit = None if anon else effective_credit(args)
-                result_url, fallback_path = upload_or_save(
-                    report,
-                    api_base=api_base,
-                    api_key=api_key,
-                    anon=anon,
-                    strict_anon=strict_anon,
-                    credit=credit,
-                )
+                if lab:
+                    credit = None
+                    result_url = _lab_upload(args, report, api_base, console)
+                    fallback_path = None
+                    lab_failed = result_url is None
+                else:
+                    result_url, fallback_path = upload_or_save(
+                        report,
+                        api_base=api_base,
+                        api_key=api_key,
+                        anon=anon,
+                        strict_anon=strict_anon,
+                        credit=credit,
+                    )
                 if result_url and offline_path is not None:
                     # Local sidecar only. The saved JSON and the POST are unchanged.
                     mark_run_uploaded(offline_path)
@@ -789,7 +874,9 @@ def cmd_bench(args) -> int:
 
     # 8. Pretty-print.
     if not dry_run:
-        print_run_summary(report, result_url=result_url, offline_path=offline_path)
+        print_run_summary(
+            report, result_url=result_url, offline_path=offline_path, lab_session=lab
+        )
     else:
         console.print(
             "[yellow]--dry-run:[/yellow] benchmark complete; nothing saved or uploaded."
@@ -807,7 +894,10 @@ def cmd_bench(args) -> int:
         except Exception as exc:  # noqa: BLE001
             log.debug("share prompt failed: %s", exc)
 
-    # Exit code: 1 if every workload errored, else 0.
+    # Exit code: 1 if every workload errored, else 0. A failed lab upload is 1 too:
+    # the controller must see it (the token cannot be used again).
     if results and all(r.error for r in results):
+        return 1
+    if lab_failed:
         return 1
     return 0
