@@ -84,15 +84,10 @@ def save_offline(
     *,
     strict_anon: bool = False,
     include_raw_timings: bool = True,
-    lab_session: bool = False,
 ) -> Path:
     """Sign with `include_raw_timings=True` (local artifact keeps full data) and write.
 
-    `lab_session=True` (only from `bench --lab-session`, always strict-anon): the JWS
-    is the ordinary strict-anon one, with no lab claim and no token in it. The
-    envelope gets one more top-level key, `"lab_session": true`, so `submit` and
-    `bench --resume` refuse the file and a no-path `submit` skips it. The claim
-    `{sid, ath, seq}` and `lab_attestation` are never written here.
+    A `bench --lab-session` run never comes here; see `save_lab_record`.
 
     Run artifacts are written 0600 inside a 0700 parent directory. The local
     file is a superset of the upload payload (it keeps raw timings the
@@ -101,7 +96,42 @@ def save_offline(
     that ties all of this user's runs together. Tighten the modes
     explicitly so the privacy contract holds at the filesystem boundary.
     """
+    token = sign_report_jws(
+        report,
+        strict_anon=strict_anon,
+        include_raw_timings=include_raw_timings,
+    )
     target = path or default_offline_path(report)
+    _write_private_json(target, {"jws": token})
+    log.debug("saved offline run to %s", target)
+    return target
+
+
+def save_lab_record(report: RunReport, payload: dict[str, Any]) -> Path:
+    """The local save of a `bench --lab-session` run (R-194): unsigned, not postable.
+
+    Called only by `bench --lab-session`. `payload` is the lab payload without the
+    `lab_session` claim (strict-anon fields, raw timings kept, plus the lab pins).
+    There is no `jws`: `submit` and `bench --resume` of every CLI version need a
+    verifiable JWS, so this file can never be posted, as a lab run or as a community
+    run, whatever is added to or removed from it. No signed claim, no JWS and no token is written (rev 3.3: the
+    token is "never stored, logged or saved locally"; nothing signed for the lab
+    upload is written to disk either).
+    """
+    if not isinstance(payload, dict) or "jws" in payload:
+        raise ValueError("a lab record is an unsigned payload")
+    for key in ("lab_session", "lab_attestation"):
+        if key in payload:
+            raise ValueError(f"a lab record never carries `{key}`")
+    target = default_offline_path(report)
+    _write_private_json(target, payload)
+    log.debug("saved lab run record (unsigned, not postable) to %s", target)
+    return target
+
+
+def _write_private_json(target: Path, obj: dict[str, Any]) -> None:
+    """Write `obj` as indented JSON at 0600 inside a 0700 parent directory (the
+    same bytes and modes `save_offline` has always written; see its docstring)."""
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Catch the case where the directory existed pre-fix at 0755.
     try:
@@ -109,16 +139,6 @@ def save_offline(
     except OSError:
         # FUSE / network mounts may refuse chmod; best-effort.
         log.debug("could not chmod %s to 0o700", target.parent)
-    if lab_session and not strict_anon:
-        raise ValueError("a lab-session save is strict-anon only")
-    token = sign_report_jws(
-        report,
-        strict_anon=strict_anon,
-        include_raw_timings=include_raw_timings,
-    )
-    envelope: dict[str, Any] = {"jws": token}
-    if lab_session:
-        envelope["lab_session"] = True
     # Write at 0600 atomically: open with restrictive mode, then write.
     fd = os.open(
         str(target),
@@ -127,7 +147,7 @@ def save_offline(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(envelope, indent=2))
+            f.write(json.dumps(obj, indent=2))
     except Exception:
         # `os.fdopen` takes ownership of fd on success; on failure we close.
         try:
@@ -141,8 +161,6 @@ def save_offline(
         os.chmod(target, 0o600)
     except OSError:
         log.debug("could not chmod %s to 0o600", target)
-    log.debug("saved offline run to %s", target)
-    return target
 
 
 def uploaded_marker_path(run_path: Path) -> Path:
@@ -621,7 +639,9 @@ def saved_run_is_lab(saved: Any, payload: Any = None) -> bool:
     """True when a saved file or its verified payload carries a lab field.
 
     Key presence counts: a top-level `lab_session` or `lab_attestation` in the saved
-    envelope, or `lab_session` inside the signed payload."""
+    envelope, or `lab_session` inside the signed payload. Defence in depth only: it
+    refuses, it never permits. From 0.0.25 a lab save is not a JWS at all (R-194,
+    `save_lab_record`), so whether it can be posted never depends on these keys."""
     if isinstance(saved, dict) and (
         "lab_session" in saved or "lab_attestation" in saved
     ):

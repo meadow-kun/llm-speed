@@ -190,15 +190,18 @@ consented for) carry one more field inside the signed run:
 - **On your machine.** Kept in memory for the job only: not in the job log, run files, status
   files or the job result, and never printed.
 
-### Launch Lab session runs only: the lab session fields (0.0.24)
+### Launch Lab session runs only: the lab session fields (0.0.24; `llama_build`, `gpu_class` and the full model digest since 0.0.25)
 
 Only `llm-speed bench --lab-session`, started by the Launch Lab controller for one session run,
-adds two fields. Nothing is added to default, `--anon` or plain `--strict-anon` uploads.
+adds these fields. Nothing is added to default, `--anon` or plain `--strict-anon` uploads, except the `--ignore-eos` server-flag label.
 
 | Field | Example | Why |
 |---|---|---|
 | `lab_session` (inside the signed run) | `{"sid": "lss_0123456789abcdef", "ath": "<43 base64url chars>", "seq": 2}` | which lab session and run slot this is; `ath` is the sha256 of the one-time token, not the token |
 | `lab_attestation` (next to the JWS) | `lla_` + 64 hex characters | the one-time token for that slot, so the server can check `ath` |
+| `llama_build` (inside the signed run) | `5123` | the llama.cpp build number the run used, to match the session's pin |
+| `gpu_class` (inside the signed run) | `rtx-4090` | the GPU model as a slug (from the GPU name already in the run), to match the session's pin |
+| `results[].model.digest` (inside the signed run) | 64 hex characters | in lab runs only, the sha256 of the whole model file instead of the 16-character prefix digest, to match the session's model pin |
 
 - **Strict-anon otherwise.** Ephemeral key, no `fingerprint_hash`, no storage block, no
   API key, no credit, and no `X-LLM-Speed-Anon` header. Lab uploads send httpx's default
@@ -210,7 +213,10 @@ adds two fields. Nothing is added to default, `--anon` or plain `--strict-anon` 
   shown publicly.
 - **On the machine.** The token arrives through an inherited pipe (`LLM_SPEED_LAB_FD` holds only the
   pipe's fd number), is kept in memory for that one upload, and is never written to the run
-  file, a log or the terminal. Uploads go only to `api.llm-speed.com`.
+  file, a log or the terminal. Uploads go only to `api.llm-speed.com`. The local run file of a
+  lab run is not signed and has no lab claim or token in it, so it cannot be uploaded again.
+  The model-file hash is cached locally (`~/.cache/llm-speed/model_sha256.json`: file path,
+  size, modification time, hash and how long hashing took); that cache is never uploaded.
 
 ---
 

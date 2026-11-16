@@ -13,13 +13,23 @@ What this module does, in order:
    line from it, closes the fd, and keeps the per-run credentials in memory only.
    Without `--lab-session` nothing here runs: the variable and the pipe are not touched.
 2. The bench itself runs in strict-anon mode (ephemeral key, no `fingerprint_hash`, no
-   storage block, no llm-speed-cli User-Agent, no API key, no credit). The local save is the ordinary
-   strict-anon JWS with no lab field inside it, plus a top-level `"lab_session": true`
-   marker so `submit` and `bench --resume` in 0.0.24 refuse it (it is not
-   re-uploaded by this CLI).
-3. `upload_lab_report()` signs the strict-anon payload plus the claim
+   storage block, no llm-speed User-Agent (httpx sends its generic default), no API key,
+   no credit).
+3. `lab_pins()` adds the three pins the Worker's `pinsMatch` checks against the
+   session row minted for this session (rev 3.3 C8 §6 names; R-195): top-level
+   `llama_build` (the llama.cpp build number this run used), top-level `gpu_class`
+   (the site's hardware slug of the signed fingerprint GPU name) and, in every
+   `results[].model.digest`, the full-file 64-hex sha256 of the model file (the value
+   minted into `lab_sessions.model_sha256s[].sha256`). Without `--lab-session` none of
+   this runs and `model.digest` stays the 16-hex prefix digest.
+4. The local save of a lab run is NOT a JWS (R-194). It is the unsigned payload
+   (pins included, no `lab_session` claim, no token), so no CLI of any version can
+   post it: `submit` and `bench --resume` need a verifiable `jws` and there is none.
+   This does not rest on any unsigned marker.
+5. `upload_lab_report()` signs the strict-anon payload plus the pins and the claim
    `lab_session: {sid, ath, seq}` with a fresh ephemeral key, in memory, runs
-   `saved_run_is_identified` on exactly that payload and token, and POSTs
+   `saved_run_is_identified` on exactly that payload and token, reports the
+   close-step values (seq, public_key, jws_sha256) BEFORE the POST (R-196), and POSTs
    `{"jws": ..., "lab_attestation": "lla_<64hex>"}` to the issuing host only, with no
    `X-LLM-Speed-Anon` header. That JWS and the token are never written to disk,
    logged, or printed.
@@ -41,6 +51,8 @@ import json
 import os
 import re
 import stat
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from . import api_host
@@ -247,6 +259,183 @@ def payload_problem(payload: Any) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------- pins (R-195)
+#
+# The Worker (T101a, worker/src/lab-sessions.ts pinsMatch) compares, with strict
+# equality and failing closed:
+#   payload.cli_version                    == lab_sessions.cli_version
+#   payload.llama_build (first of 4 names) == lab_sessions.llama_build (as strings)
+#   payload.gpu_class   (first of 2 names) == lab_sessions.gpu_class
+#   every results[].model.{digest, quant}  == some lab_sessions.model_sha256s[].{sha256, quant}
+# The CLI uses only the rev 3.3 names (C8 §6: `llama_build`, `gpu_class`,
+# `model_sha256s`) and the existing `model.digest` field, at the placement pinsMatch
+# reads first. It never sends `exact_llama_build` or a fingerprint-level copy.
+
+_GPU_CLASS_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)  # Worker GPU_RE
+_QUANT_RE = re.compile(r"[A-Za-z0-9._+-]{1,32}", re.ASCII)  # Worker QUANT_RE
+_LLAMA_BUILD_RE = re.compile(r"b([0-9]{1,9})", re.ASCII)
+
+
+@dataclasses.dataclass(frozen=True)
+class LabPins:
+    """The lab-only pins, computed once per run. Not secrets."""
+
+    llama_build: int
+    gpu_class: str
+    model_sha256s: tuple[str, ...]  # full-file sha256, one per report result, in order
+
+
+def gpu_class_of(gpu_names: list[str]) -> str:
+    """`gpu_class` from the signed fingerprint GPU names.
+
+    The site's hardware slug (`canonicalHardwareSlug` in web/lib/seo.ts, mirrored in
+    cli/mcp/slugs.py) of the one GPU model on the machine: "RTX 4090" -> "rtx-4090",
+    "RTX 3090 Ti" -> "rtx-3090-ti", the same keys `tools/cloud_bench.py` uses for
+    hardware. No GPU, or GPUs of different models, is refused."""
+    from .mcp.slugs import canonical_hardware_slug
+
+    names = [n.strip() for n in gpu_names if isinstance(n, str) and n.strip()]
+    if not names or len(names) != len(gpu_names) or len(set(names)) != 1:
+        raise LabSessionError(
+            "refusing the lab upload before POST: gpu_class needs exactly one GPU "
+            "model in the fingerprint"
+        )
+    slug = canonical_hardware_slug(names[0])
+    if not _GPU_CLASS_RE.fullmatch(slug):
+        raise LabSessionError(
+            "refusing the lab upload before POST: the GPU name does not give a valid "
+            "gpu_class"
+        )
+    return slug
+
+
+def llama_build_of(results) -> int:
+    """`llama_build`: the one llama.cpp build number every result ran on.
+
+    From the `llama_cpp_build` label the llama.cpp driver records for each run
+    (`b<N>`, from llama-server /props or --version). Sent as the integer N, the form
+    preset `exact_llama_build` pins use. Missing or disagreeing builds are refused."""
+    builds: set[int] = set()
+    for r in results:
+        if getattr(r, "backend", None) != "llama.cpp":
+            raise LabSessionError(
+                "refusing the lab upload before POST: lab sessions pin a llama.cpp "
+                "build; every result must be a llama.cpp run"
+            )
+        label = (getattr(r, "extras", None) or {}).get("llama_cpp_build")
+        m = _LLAMA_BUILD_RE.fullmatch(label) if isinstance(label, str) else None
+        if not m:
+            raise LabSessionError(
+                "refusing the lab upload before POST: llama-server did not report its "
+                "build number, so llama_build cannot be pinned"
+            )
+        builds.add(int(m.group(1)))
+    if len(builds) != 1:
+        raise LabSessionError(
+            "refusing the lab upload before POST: the results do not share one "
+            "llama.cpp build"
+        )
+    return builds.pop()
+
+
+def _model_file(model) -> str:
+    from .gguf_split import shard_set_for
+
+    ident = getattr(model, "identifier", None)
+    if not isinstance(ident, str) or not ident:
+        raise LabSessionError(
+            "refusing the lab upload before POST: the model has no local file to pin"
+        )
+    if shard_set_for(Path(ident)) is not None:
+        # rev 3.3 pins one full-file sha256 per model; a split GGUF has no single
+        # file. Not guessed (first shard only would not pin the model). Open item.
+        raise LabSessionError(
+            "refusing the lab upload before POST: a split (multi-file) GGUF has no "
+            "single full-file sha256 to pin"
+        )
+    return ident
+
+
+def lab_pins(report) -> LabPins:
+    """Compute the pins for this run, or raise `LabSessionError` (nothing is posted).
+
+    Hashes each distinct model file once (streamed, cached by path, size and mtime;
+    the duration is logged at info level, see cli/model_hash.py)."""
+    from . import model_hash
+    from .fingerprint import to_uploadable_dict
+
+    results = list(getattr(report, "results", None) or [])
+    if not results:
+        raise LabSessionError("refusing the lab upload before POST: no results")
+    fp = to_uploadable_dict(report.fingerprint, strict_anon=True)
+    gpu = gpu_class_of([g.get("name") for g in fp.get("gpus") or []])
+    build = llama_build_of(results)
+    by_file: dict[str, str] = {}
+    digests: list[str] = []
+    for r in results:
+        quant = getattr(r.model, "quant", None)
+        if not isinstance(quant, str) or not _QUANT_RE.fullmatch(quant):
+            raise LabSessionError(
+                "refusing the lab upload before POST: the model quant is unknown, so "
+                "the model pin cannot match"
+            )
+        path = _model_file(r.model)
+        if path not in by_file:
+            try:
+                fh = model_hash.full_sha256(path)
+            except model_hash.ModelHashError as exc:
+                raise LabSessionError(
+                    f"refusing the lab upload before POST: {exc}"
+                ) from None
+            by_file[path] = fh.sha256
+        digests.append(by_file[path])
+    return LabPins(llama_build=build, gpu_class=gpu, model_sha256s=tuple(digests))
+
+
+def build_lab_payload(
+    report, pins: LabPins, *, include_raw_timings: bool = False
+) -> dict[str, Any]:
+    """The strict-anon payload plus the pins. No `lab_session` claim, no token."""
+    from . import signing
+
+    payload = signing.build_uploadable_report(
+        report, strict_anon=True, include_raw_timings=include_raw_timings
+    )
+    problem = payload_problem(payload)
+    if problem:
+        raise LabSessionError(
+            f"refusing the lab upload before POST: {problem} (a lab upload is "
+            "strict-anon shaped)"
+        )
+    for key in ("lab_session", "llama_build", "gpu_class"):
+        if key in payload:
+            raise LabSessionError(
+                f"refusing the lab upload before POST: `{key}` already set"
+            )
+    rows = payload.get("results")
+    if not isinstance(rows, list) or len(rows) != len(pins.model_sha256s):
+        raise LabSessionError(
+            "refusing the lab upload before POST: results do not line up with the pins"
+        )
+    for row, digest in zip(rows, pins.model_sha256s, strict=True):
+        model = row.get("model")
+        if not isinstance(model, dict):
+            raise LabSessionError("refusing the lab upload before POST: no model")
+        model["digest"] = digest
+    payload["llama_build"] = pins.llama_build
+    payload["gpu_class"] = pins.gpu_class
+    return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class LabSigned:
+    """The close-step values, known before the POST (R-196). No token, no JWS."""
+
+    seq: int
+    public_key: str  # standard base64 of the raw Ed25519 key, as the Worker stores it
+    jws_sha256: str  # sha256 hex of the compact JWS that is about to be posted
+
+
 @dataclasses.dataclass(frozen=True)
 class LabUploadResult:
     """What the controller needs for close: no token, no JWS."""
@@ -263,27 +452,27 @@ def upload_lab_report(
     creds: LabCredentials,
     *,
     api_base: str,
+    pins: LabPins | None = None,
+    on_signed: Callable[[LabSigned], None] | None = None,
     timeout: float = 30.0,
 ) -> LabUploadResult:
-    """Sign the strict-anon payload with the lab claim and POST it to the issuing host.
+    """Sign the strict-anon payload with the pins and the lab claim and POST it to
+    the issuing host.
 
     Every check runs before the POST and raises `UploadError` / `LabSessionError`:
-    issuing host, strict-anon shape (an injected `fingerprint_hash` or `storage` is
-    refused), and `saved_run_is_identified`, which runs unconditionally. One attempt
-    only: the token is single use, and a retry after a lost response would be a 409.
+    issuing host, pins (computed here when not given), strict-anon shape (an injected
+    `fingerprint_hash` or `storage` is refused), and `saved_run_is_identified`, which
+    runs unconditionally. `on_signed` is called with (seq, public_key, jws_sha256)
+    after every check and immediately before the POST, so the controller has the
+    close-step values even when the response is lost (R-196). One attempt only: the
+    token is single use, and a retry after a lost response would be a 409.
     """
     from . import signing, upload
 
     require_issuing_host(api_base)
-    payload = signing.build_uploadable_report(report, strict_anon=True)
-    problem = payload_problem(payload)
-    if problem:
-        raise LabSessionError(
-            f"refusing the lab upload before POST: {problem} (a lab upload is "
-            "strict-anon shaped)"
-        )
-    if "lab_session" in payload:
-        raise LabSessionError("refusing the lab upload before POST: claim already set")
+    if pins is None:
+        pins = lab_pins(report)
+    payload = build_lab_payload(report, pins)
     payload["lab_session"] = creds.claim()
     signing.assert_no_long_strings(payload)
     token = signing.sign_payload_jws(payload, strict_anon=True)
@@ -302,10 +491,14 @@ def upload_lab_report(
     ).decode("ascii")
     jws_sha256 = hashlib.sha256(token.encode("ascii")).hexdigest()
     body = {"jws": token, "lab_attestation": creds.lab_attestation}
-    # Exactly the strict-anon headers: no llm-speed-cli User-Agent (httpx's
+    # Exactly the strict-anon headers: no llm-speed User-Agent (httpx's
     # default is sent), no Authorization, and no X-LLM-Speed-Anon (rev 3.3 C8 §3).
     headers = {"Content-Type": "application/json"}
     url = f"{api_base.rstrip('/')}/v1/results"
+    if on_signed is not None:
+        on_signed(
+            LabSigned(seq=creds.seq, public_key=public_key, jws_sha256=jws_sha256)
+        )
     data = upload._post_with_retries(
         url, body, headers=headers, timeout=timeout, max_retries=1
     )
@@ -325,10 +518,16 @@ __all__ = [
     "LAB_FLAG",
     "LAB_ISSUING_API_BASE",
     "LabCredentials",
+    "LabPins",
     "LabSessionError",
+    "LabSigned",
     "LabUploadResult",
     "ath_of",
+    "build_lab_payload",
+    "gpu_class_of",
     "incompatible_flags",
+    "lab_pins",
+    "llama_build_of",
     "parse_credentials",
     "payload_problem",
     "require_issuing_host",

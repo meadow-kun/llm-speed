@@ -197,6 +197,9 @@ class VllmDriver:
         if extras:
             for key, value in extras.items():
                 body.setdefault(key, value)
+        # T101c-eos: OpenAI-compatible vLLM accepts ignore_eos as a sampling param.
+        if extras and extras.get("ignore_eos"):
+            body["ignore_eos"] = True
 
         if not stream:
             return self._run_http_nonstream(url, headers, body)
@@ -405,6 +408,8 @@ class VllmDriver:
 
         sampling_cls = vllm.SamplingParams
         sent, _ignored = split_sampling(self.sampling, self.sampling_supported(model))
+        if extras and extras.get("ignore_eos"):
+            sent = {**sent, "ignore_eos": True}
         sampling = sampling_cls(max_tokens=max_output_tokens, **sent)
 
         flags: list[str] = []
