@@ -30,6 +30,8 @@ _NO_TERMINAL = (
 )
 _NO_CONSENT = "Skipping upload (no consent)."
 _EMPTY_NEXT = "Run `llm-speed bench` to create one."
+# rev 3.3 C4: a no-path submit lists a lab save as skipped and never posts it.
+_LAB_SKIP = "saved run carries lab_session (a Launch Lab run); not re-uploaded"
 
 
 def cmd_submit(args) -> int:
@@ -212,12 +214,16 @@ def _read_run(path: Path) -> tuple[dict | None, str | None, str]:
         saved = json.loads(text)
     except json.JSONDecodeError as exc:
         return None, None, f"corrupt JSON ({exc.msg})"
+    if upload.saved_run_is_lab(saved):
+        return None, None, _LAB_SKIP
     token = saved.get("jws") if isinstance(saved, dict) else None
     if not isinstance(token, str) or not token:
         return None, None, "not an llm-speed run (no jws)"
     ok, reason, payload = verify_jws_token(token)
     if not ok or not isinstance(payload, dict):
         return None, None, f"not a verifiable run ({reason})"
+    if upload.saved_run_is_lab(saved, payload):
+        return None, None, _LAB_SKIP
     return payload, token, ""
 
 
